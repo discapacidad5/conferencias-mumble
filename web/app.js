@@ -1378,25 +1378,19 @@ async function refrescarEstado() {
 
 let sseTimer = null;
 function abrirEventSource() {
-  if (S.evt) { try { S.evt.close(); } catch {} }
-  if (!S.sala || !S.token || S.saliendo) return;
-  const evt = new EventSource(`/api/salas/${S.sala}/eventos?token=${S.token}`);
-  S.evt = evt;
-  evt.onmessage = (m) => aplicarEstado(JSON.parse(m.data), 'sse');
-  evt.onerror = () => {
-    refrescarEstado();
-    if (evt.readyState === 2 && !S.saliendo) {
-      setTimeout(() => { if (S.evt === evt && !S.saliendo) abrirEventSource(); }, 1500);
-    }
-  };
+  if (S.evt) { try { S.evt.close(); } catch {} S.evt = null; }
+  // En la versión Mumble el estado en tiempo real viaja dentro del mismo
+  // WebSocket (/media -> estado_push), evitando abrir una conexión SSE extra
+  // que en proxies HTTP/2 o Cloudflare produce ERR_HTTP2_PROTOCOL_ERROR.
 }
 function conectarSSE() {
-  abrirEventSource();
+  if (S.evt) { try { S.evt.close(); } catch {} S.evt = null; }
   if (!sseTimer) {
     sseTimer = setInterval(() => {
-      if (S.evt && S.evt.readyState === 2 && !S.saliendo) abrirEventSource();
-      if (Date.now() - S.estadoRecibido > 15000) refrescarEstado();
-    }, 5000);
+      if (!S.saliendo && Date.now() - (S.estadoRecibido || 0) > 25000) {
+        refrescarEstado();
+      }
+    }, 10000);
   }
 }
 

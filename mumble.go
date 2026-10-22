@@ -832,7 +832,13 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		nombre = cl.Name
 	}
 	sv.presentes[cl.Identity] = grupo
+	if cl.RoomAdmin {
+		sv.admins[cl.Identity] = true
+	} else {
+		delete(sv.admins, cl.Identity)
+	}
 	delete(sv.ausente, cl.Identity)
+	estadoInicial, _ := marshalEstadoPara(sv, nil, cl.Identity)
 	sv.mu.Unlock()
 
 	if tcpConn, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
@@ -883,6 +889,11 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		"mumbleHost": direccionMumbleEfectiva(cfgMumble),
 	})
 	c.enviarCtrl(append([]byte{1}, initMsg...))
+	if len(estadoInicial) > 0 {
+		pushMsg := append([]byte(`{"t":"estado_push","d":`), estadoInicial...)
+		pushMsg = append(pushMsg, '}')
+		c.enviarCtrl(append([]byte{1}, pushMsg...))
+	}
 
 	// Goroutine escritora: prioriza siempre audioCh (voz) y ctrlCh (señalización)
 	// sobre videoCh (fotogramas 240p) para que la voz jamás se entrecorte.

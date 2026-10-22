@@ -1466,6 +1466,11 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
 
     async connect(baseUrl, token) {
       await promesaDeteccionOpus;
+      this._closedByClient = false;
+      if (this._reconnectTimer) {
+        clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = null;
+      }
       try {
         const ctx = this._asegurarRxAudioCtx();
         await asegurarWorkletEnCtx(ctx);
@@ -1485,36 +1490,69 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
       const sala = (window.S && window.S.sala) || new URLSearchParams(location.search).get('sala') || '';
       const wsBase = (baseUrl || location.origin).replace(/^http/, 'ws').replace(/\/$/, '');
       const wsUrl = `${wsBase}/api/salas/${encodeURIComponent(sala)}/media?token=${encodeURIComponent(token)}&opus=${SOPORTE_OPUS_RX ? 1 : 0}`;
+      this._wsUrl = wsUrl;
 
-      await new Promise((resolve, reject) => {
+      // Reconexión interna transparente del WebSocket: ante micro-cortes de WiFi
+      // o del túnel Cloudflare, reabre el socket con el mismo token de 24h en
+      // ~400 ms SIN destruir Room, SIN cerrar el micrófono y SIN llamar a /api/obtener-acceso.
+      const programarReconexionInterna = (intento) => {
+        if (this._closedByClient || this._reconnectTimer) return;
+        const espera = Math.min(2500, 350 + intento * 350);
+        this._reconnectTimer = setTimeout(() => {
+          this._reconnectTimer = null;
+          if (this._closedByClient) return;
+          abrirSocket(intento + 1, null, null);
+        }, espera);
+      };
+
+      const abrirSocket = (intento, resolveInicial, rejectInicial) => {
+        if (this._closedByClient) return;
         let conectado = false;
-        const ws = new WebSocket(wsUrl);
+        let ws;
+        try {
+          ws = new WebSocket(wsUrl);
+        } catch (err) {
+          if (resolveInicial) {
+            if (intento < 4) {
+              setTimeout(() => abrirSocket(intento + 1, resolveInicial, rejectInicial), 600);
+            } else {
+              rejectInicial(err);
+            }
+          } else {
+            programarReconexionInterna(intento);
+          }
+          return;
+        }
         ws.binaryType = 'arraybuffer';
         this._ws = ws;
 
         const timeout = setTimeout(() => {
           if (!conectado) {
             try { ws.close(); } catch {}
-            reject(new Error('Tiempo agotado conectando al canal de voz Mumble'));
           }
-        }, 12000);
+        }, 9000);
 
         ws.onopen = () => {
+          if (this._closedByClient) {
+            try { ws.close(); } catch {}
+            return;
+          }
           conectado = true;
           clearTimeout(timeout);
-          this._speakerTimer = setInterval(() => this._actualizarSpeakers(), 300);
+          if (!this._speakerTimer) {
+            this._speakerTimer = setInterval(() => this._actualizarSpeakers(), 300);
+          }
           this._iniciarMonitorRed();
           this._enviarEstadoMedia();
+          // Si teníamos grupo de discusión distinto al del token inicial, resincronizarlo
+          if (window.S && typeof window.S.grupoActual === 'number' && window.S.grupoActual > 0) {
+            try { ws.send(JSON.stringify({ t: 'cambiar_grupo', grupo: window.S.grupoActual })); } catch {}
+          }
           this.emit(RoomEvent.ConnectionStateChanged, 'connected');
-          resolve();
+          if (resolveInicial) resolveInicial();
         };
 
-        ws.onerror = () => {
-          if (!conectado) {
-            clearTimeout(timeout);
-            reject(new Error('No se pudo abrir la conexión WebSocket HTTPS'));
-          }
-        };
+        ws.onerror = () => {};
 
         ws.onmessage = (ev) => {
           if (typeof ev.data === 'string') {
@@ -1526,27 +1564,47 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
 
         ws.onclose = (ev) => {
           clearTimeout(timeout);
-          if (this._speakerTimer) {
-            clearInterval(this._speakerTimer);
-            this._speakerTimer = null;
+          if (this._ws === ws) {
+            this._ws = null;
           }
-          if (this._pingTimer) {
-            clearInterval(this._pingTimer);
-            this._pingTimer = null;
-          }
-          if (!conectado) {
-            reject(new Error('Conexión cerrada antes de iniciar'));
-            return;
-          }
+          if (this._closedByClient) return;
+
           if (ev.code === 4002 || ev.reason === 'DUPLICATE_IDENTITY') {
             this.disconnectReason = DisconnectReason.DUPLICATE_IDENTITY;
+            this.emit(RoomEvent.Disconnected, this.disconnectReason);
+            return;
           }
-          this.emit(RoomEvent.Disconnected, this.disconnectReason);
+          if (ev.code === 4003) {
+            this.disconnectReason = DisconnectReason.PARTICIPANT_REMOVED;
+            this.emit(RoomEvent.Disconnected, this.disconnectReason);
+            return;
+          }
+
+          if (!conectado && resolveInicial) {
+            if (intento < 4) {
+              setTimeout(() => abrirSocket(intento + 1, resolveInicial, rejectInicial), 650);
+            } else {
+              rejectInicial(new Error('No se pudo abrir la conexión WebSocket HTTPS'));
+            }
+            return;
+          }
+
+          // Cierre inesperado de red/túnel: reconectar en silencio manteniendo micro y audio vivos
+          programarReconexionInterna(1);
         };
+      };
+
+      await new Promise((resolve, reject) => {
+        abrirSocket(0, resolve, reject);
       });
     }
 
     async disconnect() {
+      this._closedByClient = true;
+      if (this._reconnectTimer) {
+        clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = null;
+      }
       if (this.localParticipant._micCleanup) this.localParticipant._micCleanup();
       if (this.localParticipant._camCleanup) this.localParticipant._camCleanup();
       if (this.localParticipant._scrCleanup) this.localParticipant._scrCleanup();
