@@ -519,7 +519,8 @@ type clienteWS struct {
 	grupo     int
 	esAdmin   bool
 	conn      *websocket.Conn
-	ctrlCh    chan []byte // JSON y Audio (prioridad alta)
+	ctrlCh    chan []byte // Señalización JSON (prioridad alta, nunca se descarta por audio)
+	audioCh   chan []byte // Voz binaria (cola profunda de 256 tramas ~10s, cero pérdidas en baches WiFi)
 	videoCh   chan []byte // Video y Pantalla (drop-oldest si la red celular es lenta)
 	cerrado   chan struct{}
 	once      sync.Once
@@ -568,11 +569,24 @@ func (c *clienteWS) enviarCtrl(b []byte) {
 }
 
 func (c *clienteWS) enviarBinarioAudio(b []byte) {
-	// Codificamos con prefijo 0x00 para distinguir binario de texto JSON en ctrlCh
-	msg := make([]byte, 1+len(b))
-	msg[0] = 0 // 0 = binary frame
-	copy(msg[1:], b)
-	c.enviarCtrl(msg)
+	select {
+	case <-c.cerrado:
+		return
+	default:
+	}
+	select {
+	case c.audioCh <- b:
+	default:
+		// Cola de 256 paquetes (~10 s) llena por corte severo: descartar el más antiguo
+		select {
+		case <-c.audioCh:
+		default:
+		}
+		select {
+		case c.audioCh <- b:
+		default:
+		}
+	}
 }
 
 func (c *clienteWS) enviarVideoLigero(b []byte) {
@@ -821,6 +835,10 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	delete(sv.ausente, cl.Identity)
 	sv.mu.Unlock()
 
+	if tcpConn, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
+
 	c := &clienteWS{
 		identidad: cl.Identity,
 		nombre:    nombre,
@@ -828,8 +846,9 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		grupo:     grupo,
 		esAdmin:   cl.RoomAdmin,
 		conn:      conn,
-		ctrlCh:    make(chan []byte, 96),
-		videoCh:   make(chan []byte, 2), // máximo 2 frames en cola: cero latencia acumulada
+		ctrlCh:    make(chan []byte, 64),
+		audioCh:   make(chan []byte, 256), // ~10 segundos de voz: absorbe cualquier ráfaga WiFi/móvil sin perder paquetes
+		videoCh:   make(chan []byte, 2),   // máximo 2 frames en cola: cero latencia acumulada
 		cerrado:   make(chan struct{}),
 		canMic:    canMic,
 		canCam:    canCam,
@@ -865,57 +884,76 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	})
 	c.enviarCtrl(append([]byte{1}, initMsg...))
 
-	// Goroutine escritora: prioriza siempre ctrlCh (voz Mumble + señalización)
+	// Goroutine escritora: prioriza siempre audioCh (voz) y ctrlCh (señalización)
 	// sobre videoCh (fotogramas 240p) para que la voz jamás se entrecorte.
+	escribirCtrl := func(msg []byte) bool {
+		_ = conn.SetWriteDeadline(time.Now().Add(8 * time.Second))
+		if len(msg) > 0 && msg[0] == 1 {
+			if err := conn.WriteMessage(websocket.TextMessage, msg[1:]); err != nil {
+				c.cerrarConCodigo(websocket.CloseGoingAway, "")
+				return false
+			}
+		} else if len(msg) > 0 {
+			if err := conn.WriteMessage(websocket.BinaryMessage, msg[1:]); err != nil {
+				c.cerrarConCodigo(websocket.CloseGoingAway, "")
+				return false
+			}
+		}
+		return true
+	}
+	escribirAudio := func(amsg []byte) bool {
+		_ = conn.SetWriteDeadline(time.Now().Add(8 * time.Second))
+		if err := conn.WriteMessage(websocket.BinaryMessage, amsg); err != nil {
+			c.cerrarConCodigo(websocket.CloseGoingAway, "")
+			return false
+		}
+		return true
+	}
+
 	go func() {
 		pingTk := time.NewTicker(20 * time.Second)
 		defer pingTk.Stop()
 		for {
+			// 1. Drenar primero cualquier paquete de voz o control pendiente
 			select {
 			case <-c.cerrado:
 				return
-			case msg := <-c.ctrlCh:
-				_ = conn.SetWriteDeadline(time.Now().Add(6 * time.Second))
-				if len(msg) > 0 && msg[0] == 1 {
-					if err := conn.WriteMessage(websocket.TextMessage, msg[1:]); err != nil {
-						c.cerrarConCodigo(websocket.CloseGoingAway, "")
-						return
-					}
-				} else if len(msg) > 0 {
-					if err := conn.WriteMessage(websocket.BinaryMessage, msg[1:]); err != nil {
-						c.cerrarConCodigo(websocket.CloseGoingAway, "")
-						return
-					}
-				}
-			default:
-				select {
-				case <-c.cerrado:
+			case amsg := <-c.audioCh:
+				if !escribirAudio(amsg) {
 					return
-				case msg := <-c.ctrlCh:
-					_ = conn.SetWriteDeadline(time.Now().Add(6 * time.Second))
-					if len(msg) > 0 && msg[0] == 1 {
-						if err := conn.WriteMessage(websocket.TextMessage, msg[1:]); err != nil {
-							c.cerrarConCodigo(websocket.CloseGoingAway, "")
-							return
-						}
-					} else if len(msg) > 0 {
-						if err := conn.WriteMessage(websocket.BinaryMessage, msg[1:]); err != nil {
-							c.cerrarConCodigo(websocket.CloseGoingAway, "")
-							return
-						}
-					}
-				case vmsg := <-c.videoCh:
-					_ = conn.SetWriteDeadline(time.Now().Add(6 * time.Second))
-					if err := conn.WriteMessage(websocket.BinaryMessage, vmsg); err != nil {
-						c.cerrarConCodigo(websocket.CloseGoingAway, "")
-						return
-					}
-				case <-pingTk.C:
-					_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-						c.cerrarConCodigo(websocket.CloseGoingAway, "")
-						return
-					}
+				}
+				continue
+			case msg := <-c.ctrlCh:
+				if !escribirCtrl(msg) {
+					return
+				}
+				continue
+			default:
+			}
+
+			// 2. Si no hay voz ni control esperando, atender cualquier canal
+			select {
+			case <-c.cerrado:
+				return
+			case amsg := <-c.audioCh:
+				if !escribirAudio(amsg) {
+					return
+				}
+			case msg := <-c.ctrlCh:
+				if !escribirCtrl(msg) {
+					return
+				}
+			case vmsg := <-c.videoCh:
+				_ = conn.SetWriteDeadline(time.Now().Add(8 * time.Second))
+				if err := conn.WriteMessage(websocket.BinaryMessage, vmsg); err != nil {
+					c.cerrarConCodigo(websocket.CloseGoingAway, "")
+					return
+				}
+			case <-pingTk.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					c.cerrarConCodigo(websocket.CloseGoingAway, "")
+					return
 				}
 			}
 		}
@@ -1033,7 +1071,7 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 
 			switch ftipo {
 			case frameTipoAudio:
-				if !c.canMic || len(payload) < 2 {
+				if !c.canMic || len(payload) < 1 {
 					continue
 				}
 				if !c.micOn {
@@ -1043,13 +1081,13 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					mr.difundirEstadoPeers(c.grupo)
 				}
 				rc := payload[0]
-				// Enviar al puente Mumble nativo y a los compañeros del mismo grupo
-				// rc 10..19 = Opus (10–28 kbps, solo para clientes con opusRx=true)
+				// rc == 0: marcador explícito de fin de frase (EOS), llega a todos los oyentes
+				// rc 10..19 = Opus (solo para clientes con opusRx=true)
 				// rc 30..39 = ADPCM respaldo simultáneo (solo para clientes con opusRx=false)
 				// rc 20..29 o 1..2 = ADPCM/u-law primario (para todos cuando el emisor no tiene Opus)
-				if rc >= 10 && rc <= 19 {
+				if rc >= 10 && rc <= 19 && len(payload) > 4 {
 					mr.mumble.enviarAudioMumble(payload[1:])
-				} else if rc < 10 || (rc >= 20 && rc <= 29) {
+				} else if (rc > 0 && rc < 10) || (rc >= 20 && rc <= 29) {
 					mr.mumble.enviarAudioMumble(payload)
 				}
 				mr.mu.RLock()

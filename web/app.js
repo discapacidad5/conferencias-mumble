@@ -904,6 +904,15 @@ function ajustarSalida(sid) {
   const g = s.musica
     ? Math.min(3, Math.max(0, S.volMaster * S.volMusica * S.musicaBase * (S.volPor[s.id] || 1)))
     : volEfectivo(s.id);
+  // Si la pista viene del motor Mumble, ya tiene su propio GainNode directo
+  // en el AudioContext nativo de recepción: ajustarlo directo evita cruzar un
+  // MediaStream entre dos AudioContext distintos (que causa cortes y ruido).
+  if (s.track && typeof s.track.setDirectOutput === 'function') {
+    if (s.src) { try { s.src.disconnect(); s.gain.disconnect(); } catch {} s.src = s.gain = null; }
+    s.el.muted = true;
+    s.track.setDirectOutput(g, S.dev.spk || '');
+    return;
+  }
   if (!usarWebAudio()) {
     if (s.src) { try { s.src.disconnect(); s.gain.disconnect(); } catch {} s.src = s.gain = null; }
     s.el.muted = false;
@@ -3676,7 +3685,11 @@ async function construirMicTrack() {
   S.audio.gain = gain;
   S.audio.rawStream = stream;
   const outTrack = dest.stream.getAudioTracks()[0];
-  if (outTrack) outTrack._rawStream = stream;
+  if (outTrack) {
+    outTrack._rawStream = stream;
+    outTrack._sharedCtx = ctx;
+    outTrack._sharedNode = an;
+  }
   return outTrack;
 }
 

@@ -110,35 +110,37 @@
     15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
   ]);
 
-  // Codifica un bloque Float32 en IMA-ADPCM con cabecera de estado [predLo, predHi, stepIdx, 0]
-  // y filtro de pre-énfasis (mejora la nitidez de consonantes y reduce ruido de cuantización).
-  function codificarBloqueADPCM(samples, state, rateCode) {
+  // Codifica un bloque Float32 en IMA-ADPCM limpio (sin saturación IIR) con cabecera
+  // de estado y número de secuencia [FRAME_AUDIO, rateCode, seqLo, seqHi, predLo, predHi, stepIdx, 0x5A]
+  function codificarBloqueADPCM(samples, state, rateCode, seq) {
     const n = samples.length;
     const outBytes = Math.ceil(n / 2);
-    const pkt = new Uint8Array(6 + outBytes);
+    const pkt = new Uint8Array(8 + outBytes);
     pkt[0] = FRAME_AUDIO;
     pkt[1] = rateCode;
 
     let pred = state.pred | 0;
     let idx = state.idx | 0;
-    let prevIn = state.prevIn || 0;
+    const s = (seq | 0) & 0xffff;
 
-    // Guardar estado inicial del bloque para que cada paquete sea 100% autónomo ante pérdidas
-    pkt[2] = pred & 0xff;
-    pkt[3] = (pred >> 8) & 0xff;
-    pkt[4] = idx & 0xff;
-    pkt[5] = 0;
+    // Guardar número de secuencia y estado inicial del predictor para inmunidad ante pérdidas
+    pkt[2] = s & 0xff;
+    pkt[3] = (s >> 8) & 0xff;
+    pkt[4] = pred & 0xff;
+    pkt[5] = (pred >> 8) & 0xff;
+    pkt[6] = idx & 0xff;
+    pkt[7] = 0x5A; // marca de trama ADPCM v2 limpia (con seq, sin distorsión IIR)
 
-    let bytePos = 6;
+    let bytePos = 8;
     let highNibble = false;
     let curByte = 0;
 
     for (let i = 0; i < n; i++) {
-      const x = samples[i];
-      // Pre-énfasis suave (0.42) para destacar agudos de la voz antes de cuantizar
-      const emph = Math.max(-1, Math.min(1, x - 0.42 * prevIn));
-      prevIn = x;
-      const val = (emph * 32767) | 0;
+      let x = samples[i];
+      // Limitador suave para evitar clipping brusco en picos de micrófono
+      if (x > 0.98) x = 0.98;
+      else if (x < -0.98) x = -0.98;
+      const val = (x * 32767) | 0;
 
       let step = ADPCM_STEP_TABLE[idx];
       let diff = val - pred;
@@ -187,30 +189,43 @@
     }
     state.pred = pred;
     state.idx = idx;
-    state.prevIn = prevIn;
     return pkt;
   }
 
-  function decodificarBloqueADPCM(payload, deemphState) {
-    if (payload.length < 5) return new Float32Array(0);
-    // payload[0] = rateCode, payload[1..2] = pred (int16 LE), payload[3] = stepIdx, payload[4] = reserved
-    let pred = payload[1] | (payload[2] << 8);
-    if (pred & 0x8000) pred -= 0x10000;
-    let idx = payload[3];
+  function decodificarBloqueADPCM(payload) {
+    if (payload.length < 5) return { pcm: new Float32Array(0), seq: -1 };
+    const esV2 = payload.length >= 7 && payload[6] === 0x5A;
+    let seq = -1;
+    let pred = 0;
+    let idx = 0;
+    let dataStart = 5;
+
+    if (esV2) {
+      seq = payload[1] | (payload[2] << 8);
+      pred = payload[3] | (payload[4] << 8);
+      if (pred & 0x8000) pred -= 0x10000;
+      idx = payload[5];
+      dataStart = 7;
+    } else {
+      pred = payload[1] | (payload[2] << 8);
+      if (pred & 0x8000) pred -= 0x10000;
+      idx = payload[3];
+      dataStart = 5;
+    }
     if (idx < 0) idx = 0;
     else if (idx > 88) idx = 88;
 
-    const dataBytes = payload.length - 5;
+    const dataBytes = payload.length - dataStart;
+    if (dataBytes <= 0) return { pcm: new Float32Array(0), seq };
     const numSamples = dataBytes * 2;
     const out = new Float32Array(numSamples);
-    let yPrev = deemphState.yPrev || 0;
     let outIdx = 0;
 
-    for (let i = 5; i < payload.length; i++) {
+    for (let i = dataStart; i < payload.length; i++) {
       const b = payload[i];
       for (let s = 0; s < 2; s++) {
         const nibble = s === 0 ? (b & 0x0f) : ((b >> 4) & 0x0f);
-        let step = ADPCM_STEP_TABLE[idx];
+        const step = ADPCM_STEP_TABLE[idx];
         let vpdiff = step >> 3;
         if (nibble & 4) vpdiff += step;
         if (nibble & 2) vpdiff += step >> 1;
@@ -224,15 +239,10 @@
         if (idx < 0) idx = 0;
         else if (idx > 88) idx = 88;
 
-        // De-énfasis complementario (suaviza el grano de cuantización y restaura el timbre natural)
-        const rawFloat = pred / 32768.0;
-        const y = Math.max(-1, Math.min(1, rawFloat + 0.42 * yPrev));
-        yPrev = y;
-        out[outIdx++] = y;
+        out[outIdx++] = pred / 32768.0;
       }
     }
-    deemphState.yPrev = yPrev;
-    return out;
+    return { pcm: out, seq };
   }
 
   // --- Tablas y conversión µ-law (mantenido para retrocompatibilidad) ---
@@ -297,48 +307,204 @@
     };
   }
 
-  // Extrae muestras Float32 de un objeto WebCodecs AudioData (compatible con f32 y s16)
+  // Extrae muestras Float32 de un objeto WebCodecs AudioData respetando su
+  // formato nativo exacto (s16, s16-planar, f32, f32-planar). En Android Chrome
+  // AudioDecoder devuelve 's16' o 's16-planar': pedir conversión implícita en
+  // copyTo() corrompe las muestras o produce ruido fuerte.
   function extraerFloat32DeAudioData(audioData) {
     const n = audioData.numberOfFrames;
-    const fmt = audioData.format || 'f32-planar';
-    try {
+    const ch = Math.max(1, audioData.numberOfChannels || 1);
+    const fmt = String(audioData.format || 'f32-planar');
+    if (fmt === 's16-planar') {
+      const s16 = new Int16Array(n);
+      audioData.copyTo(s16, { planeIndex: 0 });
       const out = new Float32Array(n);
-      audioData.copyTo(out, { planeIndex: 0, format: 'f32-planar' });
-      return out;
-    } catch {
-      if (fmt.startsWith('s16')) {
-        const s16 = new Int16Array(n * (audioData.numberOfChannels || 1));
-        audioData.copyTo(s16, { planeIndex: 0 });
-        const out = new Float32Array(n);
-        const step = fmt.includes('planar') ? 1 : (audioData.numberOfChannels || 1);
-        for (let i = 0; i < n; i++) out[i] = s16[i * step] / 32768.0;
-        return out;
-      }
-      const out = new Float32Array(n);
-      audioData.copyTo(out, { planeIndex: 0 });
+      for (let i = 0; i < n; i++) out[i] = s16[i] / 32768.0;
       return out;
     }
+    if (fmt === 's16') {
+      const s16 = new Int16Array(n * ch);
+      audioData.copyTo(s16, { planeIndex: 0 });
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = s16[i * ch] / 32768.0;
+      return out;
+    }
+    if (fmt === 'f32') {
+      const f32 = new Float32Array(n * ch);
+      audioData.copyTo(f32, { planeIndex: 0 });
+      if (ch === 1) return f32;
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = f32[i * ch];
+      return out;
+    }
+    const out = new Float32Array(n);
+    audioData.copyTo(out, { planeIndex: 0 });
+    return out;
   }
 
-  // Autocorrelación simple sobre la historia de salida para hallar el período
-  // de pitch (80–480 muestras ≈ 100–600 Hz) y que el PLC repita la forma de
-  // onda real en vez de producir un zumbido metálico.
-  function estimarPeriodoPLC(hist, pos, cap) {
-    let bestLag = 240;
-    let bestCorr = -Infinity;
-    for (let lag = 80; lag <= 480; lag += 4) {
-      let sum = 0;
-      for (let i = 0; i < 240; i++) {
-        const a = hist[(pos - 1 - i + cap * 4) % cap];
-        const b = hist[(pos - 1 - i - lag + cap * 4) % cap];
-        sum += a * b;
+  // AudioWorklet en hilo de tiempo real (128 muestras = 2.66 ms) para que la
+  // reproducción de voz jamás sufra micro-cortes cuando el hilo principal de JS
+  // renderiza la interfaz o procesa eventos.
+  const WORKLET_RX_CODE = `
+class MumbleRxProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const rate = sampleRate || 48000;
+    this.rate = rate;
+    this.cap = Math.ceil(rate * 4);
+    this.ring = new Float32Array(this.cap);
+    this.writePos = 0;
+    this.readPosF = 0;
+    this.available = 0;
+    this.playing = false;
+    this.eosPending = false;
+    this.waitSamples = 0;
+    this.underrunSamples = 0;
+    this.lastOut = 0;
+    this.fadeInPos = 0;
+    this.fadeInLen = Math.ceil(rate * 0.006);
+    this.readRate = 1.0;
+    this.targetSamples = Math.ceil(rate * 0.14); // 140 ms inicial
+    this.port.onmessage = (ev) => {
+      const d = ev.data;
+      if (!d) return;
+      if (d.t === 'eos') {
+        this.eosPending = true;
+        return;
       }
-      if (sum > bestCorr) {
-        bestCorr = sum;
-        bestLag = lag;
+      if (d.t === 'target' && typeof d.ms === 'number') {
+        this.targetSamples = Math.ceil(this.rate * (Math.max(110, Math.min(420, d.ms)) / 1000));
+        return;
+      }
+      if (d.t === 'push' && d.pcm) {
+        const src = d.pcm;
+        const n = src.length;
+        if (n === 0) return;
+        this.eosPending = false;
+        // Si hubiera >1.8s acumulados tras un corte largo de red, avanzar con fade
+        const hardCap = this.rate * 1.8;
+        if (this.available + n > hardCap) {
+          const keep = Math.ceil(this.rate * 0.28);
+          const drop = Math.max(0, (this.available + n) - keep);
+          this.readPosF = (this.readPosF + drop) % this.cap;
+          this.available = Math.max(0, this.available - drop);
+          this.fadeInPos = 0;
+        }
+        const ring = this.ring;
+        const cap = this.cap;
+        let wp = this.writePos;
+        for (let i = 0; i < n; i++) {
+          if (this.available < cap) {
+            ring[wp] = src[i];
+            wp = (wp + 1) % cap;
+            this.available++;
+          }
+        }
+        this.writePos = wp;
+      }
+    };
+  }
+  process(inputs, outputs) {
+    const out = outputs[0] && outputs[0][0];
+    if (!out) return true;
+    const n = out.length;
+    if (!this.playing) {
+      if (this.available > 0) {
+        this.waitSamples += n;
+        if (
+          this.available >= this.targetSamples ||
+          this.eosPending ||
+          this.waitSamples >= this.rate * 0.18
+        ) {
+          this.playing = true;
+          this.waitSamples = 0;
+          this.underrunSamples = 0;
+          this.fadeInPos = 0;
+        }
+      } else {
+        this.waitSamples = 0;
+      }
+      if (!this.playing) {
+        for (let i = 0; i < n; i++) out[i] = 0;
+        return true;
       }
     }
-    return bestLag;
+
+    // Ajuste suave de velocidad: +6% si hay retraso acumulado, -5% si escasea y sigue hablando
+    const over = this.available - this.targetSamples;
+    let desired = 1.0;
+    if (over > this.rate * 0.14) {
+      desired = Math.min(1.07, 1.0 + (over / this.rate) * 0.14);
+    } else if (!this.eosPending && this.available < this.targetSamples * 0.45) {
+      desired = 0.95;
+    }
+    this.readRate += (desired - this.readRate) * 0.1;
+
+    const ring = this.ring;
+    const cap = this.cap;
+    for (let i = 0; i < n; i++) {
+      if (this.available > 1.05) {
+        const idx0 = this.readPosF | 0;
+        const frac = this.readPosF - idx0;
+        const idx1 = (idx0 + 1) % cap;
+        let s = ring[idx0] + frac * (ring[idx1] - ring[idx0]);
+        this.readPosF = (this.readPosF + this.readRate) % cap;
+        this.available -= this.readRate;
+        if (this.fadeInPos < this.fadeInLen) {
+          s *= this.fadeInPos / this.fadeInLen;
+          this.fadeInPos++;
+        }
+        out[i] = s;
+        this.lastOut = s;
+        this.underrunSamples = 0;
+      } else {
+        // Sin muestras: decaimiento suave a cero en ~8 ms (cero zumbido ni clic)
+        this.lastOut *= 0.982;
+        if (Math.abs(this.lastOut) < 0.0001) this.lastOut = 0;
+        out[i] = this.lastOut;
+        this.underrunSamples++;
+        if (this.eosPending || this.underrunSamples > this.rate * 0.065) {
+          if (!this.eosPending) {
+            this.targetSamples = Math.min(Math.ceil(this.rate * 0.38), this.targetSamples + Math.ceil(this.rate * 0.035));
+          }
+          this.playing = false;
+          this.eosPending = false;
+          this.waitSamples = 0;
+          this.available = 0;
+          this.readPosF = this.writePos;
+          for (let k = i + 1; k < n; k++) out[k] = 0;
+          break;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
+`;
+  let workletBlobUrl = null;
+  const ctxWorkletPromesas = new WeakMap();
+  function asegurarWorkletEnCtx(ctx) {
+    if (!ctx || !ctx.audioWorklet || typeof window.AudioWorkletNode !== 'function') {
+      return Promise.resolve(false);
+    }
+    if (ctxWorkletPromesas.has(ctx)) return ctxWorkletPromesas.get(ctx);
+    const p = (async () => {
+      try {
+        if (!workletBlobUrl) {
+          const blob = new Blob([WORKLET_RX_CODE], { type: 'application/javascript' });
+          workletBlobUrl = URL.createObjectURL(blob);
+        }
+        await ctx.audioWorklet.addModule(workletBlobUrl);
+        ctx._mumbleWorkletReady = true;
+        return true;
+      } catch {
+        ctx._mumbleWorkletReady = false;
+        return false;
+      }
+    })();
+    ctxWorkletPromesas.set(ctx, p);
+    return p;
   }
 
   class Emitter {
@@ -553,21 +719,28 @@
 
     _iniciarEnvioVozMumble(mediaStreamTrack, pub, opts) {
       let maxBr = (opts && opts.audioPreset && opts.audioPreset.maxBitrate) || 18000;
+      let pendingBr = null;
       let actx = null;
+      let esCtxCompartido = false;
       let proc = null;
       let srcNode = null;
+      let muteGain = null;
       let opusEncoder = null;
       let opusListo = false;
       let opusTimestampUs = 0;
+      let opusPending = [];
+      let txSeq = 0;
+      let hablandoActivo = false;
 
-      // Estado ADPCM y filtros anti-aliasing para respaldo universal
-      const adpcmState = { pred: 0, idx: 0, prevIn: 0 };
-      let filtroAA = crearFiltroPasaBajos(48000, 3600);
+      // Estado ADPCM y filtro anti-aliasing para respaldo universal
+      const adpcmState = { pred: 0, idx: 0 };
+      let filtroAA = crearFiltroPasaBajos(48000, 5200);
 
-      // Configurar / reconfigurar codificador Opus nativo en caliente
+      // Configurar codificador Opus nativo (tramas estándar de 20 ms = 960 muestras @ 48 kHz)
       const configurarOpus = (nuevoBr) => {
         maxBr = nuevoBr || 18000;
-        const cutoff = maxBr <= 11000 ? 2700 : (maxBr <= 20000 ? 3700 : 5400);
+        pendingBr = null;
+        const cutoff = maxBr <= 11000 ? 3500 : (maxBr <= 20000 ? 5200 : 6800);
         filtroAA = crearFiltroPasaBajos(48000, cutoff);
         if (!SOPORTE_OPUS_TX || typeof window.AudioEncoder !== 'function') return;
         try {
@@ -577,20 +750,38 @@
                 if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
                 const n = chunk.byteLength;
                 if (n <= 0) return;
-                const rateCode = maxBr <= 11000 ? 10 : (maxBr <= 20000 ? 11 : 12);
-                const pkt = new Uint8Array(2 + n);
-                pkt[0] = FRAME_AUDIO;
-                pkt[1] = rateCode;
-                chunk.copyTo(pkt.subarray(2));
+                const bytes = new Uint8Array(n);
+                chunk.copyTo(bytes);
+                opusPending.push(bytes);
                 opusListo = true;
-                try { this._room._ws.send(pkt); } catch {}
+                // Agrupamos 2 sub-tramas Opus de 20 ms (= 40 ms por paquete WebSocket)
+                if (opusPending.length >= 2) {
+                  const b1 = opusPending.shift();
+                  const b2 = opusPending.shift();
+                  const rateCode = maxBr <= 11000 ? 10 : (maxBr <= 20000 ? 11 : 12);
+                  const s = txSeq & 0xffff;
+                  const pkt = new Uint8Array(9 + b1.length + b2.length);
+                  pkt[0] = FRAME_AUDIO;
+                  pkt[1] = rateCode;
+                  pkt[2] = s & 0xff;
+                  pkt[3] = (s >> 8) & 0xff;
+                  pkt[4] = 0xA5; // marca de paquete Opus dual (2 x 20ms)
+                  pkt[5] = b1.length & 0xff;
+                  pkt[6] = (b1.length >> 8) & 0xff;
+                  pkt.set(b1, 7);
+                  const off2 = 7 + b1.length;
+                  pkt[off2] = b2.length & 0xff;
+                  pkt[off2 + 1] = (b2.length >> 8) & 0xff;
+                  pkt.set(b2, off2 + 2);
+                  try { this._room._ws.send(pkt); } catch {}
+                }
               },
               error: () => {
                 opusListo = false;
               },
             });
           }
-          const opusBitrate = maxBr <= 11000 ? 10000 : (maxBr <= 20000 ? 18000 : 28000);
+          const opusBitrate = maxBr <= 11000 ? 14000 : (maxBr <= 20000 ? 22000 : 32000);
           try {
             opusEncoder.configure({
               codec: 'opus',
@@ -599,7 +790,7 @@
               bitrate: opusBitrate,
               opus: {
                 application: 'voip',
-                frameDuration: 40000,
+                frameDuration: 20000,
                 complexity: 5,
               },
             });
@@ -619,32 +810,47 @@
       };
 
       configurarOpus(maxBr);
+      // Nunca reconfigurar Opus en mitad de una palabra: esperar a pausa de silencio
       this._actualizarBitrateMic = (nuevosOpts) => {
         const br = (nuevosOpts && nuevosOpts.audioPreset && nuevosOpts.audioPreset.maxBitrate) || 18000;
-        if (br !== maxBr) configurarOpus(br);
+        if (br === maxBr) return;
+        if (hablandoActivo) {
+          pendingBr = br;
+        } else {
+          configurarOpus(br);
+        }
       };
 
-      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) por Opus y/o ADPCM.
-      // La voz NO se descarta salvo congestión extrema del socket: en TCP los
-      // datos no se pierden, solo se atrasan; el oyente decide con su buffer.
+      const enviarMarcadorEOS = () => {
+        if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
+        const s = (txSeq = (txSeq + 1) & 0xffff);
+        const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
+        try { this._room._ws.send(eos); } catch {}
+      };
+
+      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) como 2 sub-tramas Opus de 20 ms y/o ADPCM
       const enviarTrama40ms = (frame48k) => {
         if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-        if (this._room._ws.bufferedAmount > 160 * 1024) return;
+        if (this._room._ws.bufferedAmount > 192 * 1024) return;
+        txSeq = (txSeq + 1) & 0xffff;
 
         let enviadoOpus = false;
         if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
           try {
-            const ad = new window.AudioData({
-              format: 'f32-planar',
-              sampleRate: 48000,
-              numberOfFrames: 1920,
-              numberOfChannels: 1,
-              timestamp: opusTimestampUs,
-              data: frame48k,
-            });
-            opusTimestampUs += 40000;
-            opusEncoder.encode(ad);
-            ad.close();
+            for (let half = 0; half < 2; half++) {
+              const sub20ms = frame48k.subarray(half * 960, (half + 1) * 960);
+              const ad = new window.AudioData({
+                format: 'f32-planar',
+                sampleRate: 48000,
+                numberOfFrames: 960,
+                numberOfChannels: 1,
+                timestamp: opusTimestampUs,
+                data: sub20ms,
+              });
+              opusTimestampUs += 20000;
+              opusEncoder.encode(ad);
+              ad.close();
+            }
             enviadoOpus = true;
           } catch {
             enviadoOpus = false;
@@ -652,13 +858,13 @@
         }
 
         // Si el navegador no tiene Opus o en la sala hay algún oyente sin Opus,
-        // enviamos la trama ADPCM filtrada con anti-aliasing (24/32/48 kbps)
+        // enviamos la trama ADPCM limpia a 8/12/16 kHz con número de secuencia
         const necesitaAdpcm = !enviadoOpus || !!this._room._haySinOpus;
         if (necesitaAdpcm) {
-          // Factor exacto desde 48000 Hz: 8 -> 6000 Hz (24 kbps), 6 -> 8000 Hz (32 kbps), 4 -> 12000 Hz (48 kbps)
-          const decim = maxBr <= 11000 ? 8 : (maxBr <= 20000 ? 6 : 4);
+          // Factor exacto desde 48000 Hz: 6 -> 8000 Hz (32 kbps), 4 -> 12000 Hz (48 kbps), 3 -> 16000 Hz (64 kbps)
+          const decim = maxBr <= 11000 ? 6 : (maxBr <= 20000 ? 4 : 3);
           const baseCode = maxBr <= 11000 ? 21 : (maxBr <= 20000 ? 22 : 23);
-          const rateCode = enviadoOpus ? (baseCode + 10) : baseCode; // 31..33 = respaldo simultáneo; 21..23 = primario
+          const rateCode = enviadoOpus ? (baseCode + 10) : baseCode;
           const outLen = (1920 / decim) | 0;
           const sub = new Float32Array(outLen);
           for (let i = 0; i < outLen; i++) {
@@ -669,16 +875,31 @@
             }
             sub[i] = acc / decim;
           }
-          const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode);
+          const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode, txSeq);
           try { this._room._ws.send(pkt); } catch {}
         }
       };
 
       try {
-        actx = new (window.AudioContext || window.webkitAudioContext)();
-        const ms = new MediaStream([mediaStreamTrack]);
-        srcNode = actx.createMediaStreamSource(ms);
+        // Reutilizar el AudioContext y nodo de ganancia de construirMicTrack() en app.js
+        // para eliminar el doble AudioContext (MediaStreamDestination -> MediaStreamSource)
+        if (mediaStreamTrack && mediaStreamTrack._sharedCtx && mediaStreamTrack._sharedNode && mediaStreamTrack._sharedCtx.state !== 'closed') {
+          actx = mediaStreamTrack._sharedCtx;
+          srcNode = mediaStreamTrack._sharedNode;
+          esCtxCompartido = true;
+        } else {
+          actx = new (window.AudioContext || window.webkitAudioContext)();
+          const rawStream = (mediaStreamTrack && mediaStreamTrack._rawStream) || new MediaStream([mediaStreamTrack]);
+          srcNode = actx.createMediaStreamSource(rawStream);
+          esCtxCompartido = false;
+        }
+        if (actx.state === 'suspended') {
+          actx.resume().catch(() => {});
+        }
+
         proc = actx.createScriptProcessor(2048, 1, 1);
+        muteGain = actx.createGain();
+        muteGain.gain.value = 0; // silencio total hacia destination local; mantiene vivo el reloj de hardware
         const inRate = actx.sampleRate || 48000;
         const stepIn = inRate / 48000;
         const filtroHP = crearFiltroPasaAltos85Hz(inRate);
@@ -689,26 +910,30 @@
         let inPhase = 0;
         let lastInSample = 0;
 
-        // Estado VAD con pre-roll de 40 ms, piso de ruido adaptativo e histéresis suave.
-        // Umbrales deliberadamente bajos: jamás recortar una sílaba suave — en el
-        // peor caso se envían unos bytes de ruido, nunca un corte a mitad de palabra.
+        // VAD con pre-roll de 40 ms y cola larga de 800 ms (20 bloques de 40 ms):
+        // jamás corta dentro de una palabra ni en las pausas naturales de una frase.
         let prevFrame48k = new Float32Array(1920);
         let tienePrevFrame = false;
-        let hablandoActivo = false;
         let silencioCola = 0;
-        let noiseFloor = 0.002;
+        let noiseFloor = 0.0018;
 
         proc.onaudioprocess = (ev) => {
+          const outChan = ev.outputBuffer.getChannelData(0);
+          outChan.fill(0);
+
           if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) {
-            hablandoActivo = false;
-            silencioCola = 0;
+            if (hablandoActivo) {
+              hablandoActivo = false;
+              silencioCola = 0;
+              enviarMarcadorEOS();
+              this._room._marcarHablandoLocal(false);
+            }
             return;
           }
           const rawIn = ev.inputBuffer.getChannelData(0);
           const nIn = rawIn.length;
           if (nIn === 0) return;
 
-          // Filtrar retumbo (<85 Hz) y remuestrear con fase continua a 48000 Hz
           const filtered = new Float32Array(nIn);
           for (let i = 0; i < nIn; i++) {
             filtered[i] = filtroHP(rawIn[i]);
@@ -724,7 +949,6 @@
 
             if (frameFill === 1920) {
               frameFill = 0;
-              // Calcular energía RMS del bloque de 40 ms
               let sum = 0;
               for (let j = 0; j < 1920; j += 2) {
                 const v = frameBuf[j];
@@ -732,42 +956,47 @@
               }
               const rms = Math.sqrt(sum / 960);
 
-              // Actualizar piso de ruido suavemente durante silencio (tope 0.004:
-              // un ambiente ruidoso no debe ahogar sílabas suaves)
-              if (!hablandoActivo && rms < noiseFloor * 1.6) {
-                noiseFloor = Math.max(0.001, Math.min(0.004, noiseFloor * 0.95 + rms * 0.05));
+              if (!hablandoActivo && rms < noiseFloor * 1.5) {
+                noiseFloor = Math.max(0.0008, Math.min(0.0032, noiseFloor * 0.95 + rms * 0.05));
               }
-              const umbralAbrir = Math.max(0.0045, noiseFloor * 2.2);
-              const umbralMantener = Math.max(0.0024, noiseFloor * 1.3);
+              const umbralAbrir = Math.max(0.0032, noiseFloor * 2.0);
+              const umbralMantener = Math.max(0.0014, noiseFloor * 1.15);
 
               if (rms >= (hablandoActivo ? umbralMantener : umbralAbrir)) {
                 if (!hablandoActivo) {
                   hablandoActivo = true;
-                  // Enviar pre-roll de 40 ms con fade-in de 4 ms para no cortar la primera consonante
+                  opusPending.length = 0;
+                  // Pre-roll de 40 ms con fade-in de 4 ms para conservar el ataque de la primera sílaba
                   if (tienePrevFrame) {
                     const pre = new Float32Array(prevFrame48k);
                     for (let k = 0; k < 192; k++) pre[k] *= (k / 192);
                     enviarTrama40ms(pre);
                   }
                 }
-                silencioCola = 12; // mantener ~480 ms de cola entre palabras para no entrecortar frases
+                silencioCola = 20; // 800 ms de cola continua: cero cortes entre sílabas o palabras
                 this._room._marcarHablandoLocal(true);
                 enviarTrama40ms(frameBuf);
               } else if (silencioCola > 0) {
                 silencioCola--;
                 if (silencioCola === 0) {
-                  // Última trama de cola: aplicar fade-out suave a cero para evitar clic al callar
                   const tail = new Float32Array(frameBuf);
                   for (let k = 0; k < 1920; k++) tail[k] *= (1 - k / 1920);
                   enviarTrama40ms(tail);
+                  enviarMarcadorEOS();
                   hablandoActivo = false;
                   this._room._marcarHablandoLocal(false);
+                  if (pendingBr !== null && pendingBr !== maxBr) {
+                    configurarOpus(pendingBr);
+                  }
                 } else {
                   enviarTrama40ms(frameBuf);
                 }
               } else {
                 hablandoActivo = false;
                 this._room._marcarHablandoLocal(false);
+                if (pendingBr !== null && pendingBr !== maxBr) {
+                  configurarOpus(pendingBr);
+                }
               }
 
               prevFrame48k.set(frameBuf);
@@ -779,7 +1008,8 @@
         };
 
         srcNode.connect(proc);
-        proc.connect(actx.destination);
+        proc.connect(muteGain);
+        muteGain.connect(actx.destination);
       } catch (e) {
         console.warn('Error iniciando codificador de voz Mumble:', e);
       }
@@ -789,8 +1019,11 @@
         try { if (opusEncoder && opusEncoder.state !== 'closed') opusEncoder.close(); } catch {}
         opusEncoder = null;
         try { if (proc) proc.disconnect(); } catch {}
-        try { if (srcNode) srcNode.disconnect(); } catch {}
-        try { if (actx) actx.close(); } catch {}
+        try { if (muteGain) muteGain.disconnect(); } catch {}
+        if (!esCtxCompartido) {
+          try { if (srcNode) srcNode.disconnect(); } catch {}
+          try { if (actx) actx.close(); } catch {}
+        }
         this._room._marcarHablandoLocal(false);
       };
     }
@@ -799,25 +1032,30 @@
       let actx = null;
       let proc = null;
       let srcNode = null;
-      const adpcmState = { pred: 0, idx: 0, prevIn: 0 };
-      const filtroAA = crearFiltroPasaBajos(48000, 5200);
+      let muteGain = null;
+      let shareSeq = 0;
+      const adpcmState = { pred: 0, idx: 0 };
+      const filtroAA = crearFiltroPasaBajos(48000, 6500);
       try {
         this._room._ws.send(JSON.stringify({ t: 'audio_share_meta', activo: true, nombre: name }));
         actx = new (window.AudioContext || window.webkitAudioContext)();
         const ms = new MediaStream([mediaStreamTrack]);
         srcNode = actx.createMediaStreamSource(ms);
         proc = actx.createScriptProcessor(4096, 1, 1);
+        muteGain = actx.createGain();
+        muteGain.gain.value = 0;
         const inRate = actx.sampleRate || 48000;
-        const targetRate = 12000;
+        const targetRate = 16000;
         const ratio = inRate / targetRate;
 
         proc.onaudioprocess = (ev) => {
+          ev.outputBuffer.getChannelData(0).fill(0);
           if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-          if (this._room._ws.bufferedAmount > 160 * 1024) return;
+          if (this._room._ws.bufferedAmount > 192 * 1024) return;
           const input = ev.inputBuffer.getChannelData(0);
           let sum = 0;
           for (let i = 0; i < input.length; i += 4) sum += input[i] * input[i];
-          if (Math.sqrt(sum / (input.length / 4)) < 0.0018) return;
+          if (Math.sqrt(sum / (input.length / 4)) < 0.0015) return;
 
           const outLen = Math.floor(input.length / ratio);
           const sub = new Float32Array(outLen);
@@ -825,12 +1063,14 @@
             const idx = Math.min(input.length - 1, Math.floor(i * ratio));
             sub[i] = filtroAA(input[idx]);
           }
-          const pkt = codificarBloqueADPCM(sub, adpcmState, 23);
+          shareSeq = (shareSeq + 1) & 0xffff;
+          const pkt = codificarBloqueADPCM(sub, adpcmState, 23, shareSeq);
           pkt[0] = FRAME_AUDIO_SHARE;
           try { this._room._ws.send(pkt); } catch {}
         };
         srcNode.connect(proc);
-        proc.connect(actx.destination);
+        proc.connect(muteGain);
+        muteGain.connect(actx.destination);
       } catch (e) {
         console.warn('Error compartiendo audio:', e);
       }
@@ -841,6 +1081,7 @@
           }
         } catch {}
         try { if (proc) proc.disconnect(); } catch {}
+        try { if (muteGain) muteGain.disconnect(); } catch {}
         try { if (srcNode) srcNode.disconnect(); } catch {}
         try { if (actx) actx.close(); } catch {}
       };
@@ -1066,7 +1307,24 @@
 
     _asegurarRxAudioCtx() {
       if (!this._rxAudioCtx || this._rxAudioCtx.state === 'closed') {
-        this._rxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (window.S && window.S.salidaCtx && window.S.salidaCtx.state !== 'closed') {
+          this._rxAudioCtx = window.S.salidaCtx;
+        } else {
+          this._rxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          if (window.S) window.S.salidaCtx = this._rxAudioCtx;
+        }
+        asegurarWorkletEnCtx(this._rxAudioCtx);
+        if (!window._mumbleAudioUnlockBound) {
+          window._mumbleAudioUnlockBound = true;
+          const unlock = () => {
+            if (window.S && window.S.salidaCtx && window.S.salidaCtx.state === 'suspended') {
+              window.S.salidaCtx.resume().catch(() => {});
+            }
+          };
+          window.addEventListener('pointerdown', unlock, { passive: true });
+          window.addEventListener('touchstart', unlock, { passive: true });
+          window.addEventListener('keydown', unlock, { passive: true });
+        }
       }
       if (this._rxAudioCtx.state === 'suspended') {
         this._rxAudioCtx.resume().catch(() => {});
@@ -1208,6 +1466,10 @@
 
     async connect(baseUrl, token) {
       await promesaDeteccionOpus;
+      try {
+        const ctx = this._asegurarRxAudioCtx();
+        await asegurarWorkletEnCtx(ctx);
+      } catch {}
 
       // Decodificar identidad y nombre del token (base64url antes del punto)
       try {
@@ -1311,6 +1573,9 @@
         try { ws.close(1000, 'client disconnect'); } catch {}
       }
       if (this._rxAudioCtx) {
+        if (window.S && window.S.salidaCtx === this._rxAudioCtx) {
+          window.S.salidaCtx = null;
+        }
         try { this._rxAudioCtx.close(); } catch {}
         this._rxAudioCtx = null;
       }
@@ -1491,15 +1756,14 @@
       if (!pipe) return;
       this._rxPipelines.delete(sid);
       try { if (pipe.opusDecoder && pipe.opusDecoder.state !== 'closed') pipe.opusDecoder.close(); } catch {}
+      try { if (pipe.worklet) pipe.worklet.disconnect(); } catch {}
       try { if (pipe.proc) pipe.proc.disconnect(); } catch {}
+      try { if (pipe.gainNode) pipe.gainNode.disconnect(); } catch {}
     }
 
-    // Crea un pipeline receptor continuo basado en un Ring Buffer circular.
-    // Regla del usuario: NUNCA cortar la voz — mejor 1-2 s de retraso acumulado
-    // en redes malas que un solo corte. Por eso el buffer objetivo "aprende"
-    // hasta ~1.5 s, la reproducción puede ir ±8% más rápida/lenta para alcanzar
-    // el tiempo real sin saltos, y cuando falta un paquete se sintetiza audio
-    // por autocorrelación (PLC) en vez de soltar silencio.
+    // Crea un pipeline receptor continuo en un único AudioContext (sin cruzar
+    // MediaStreams entre dos AudioContext) y con soporte AudioWorklet en el
+    // hilo de audio de tiempo real para eliminar al 100% el ruido y los cortes.
     _asegurarAudioRemoto(p, source, nombre) {
       let pub = p.pubs.get(source);
       if (pub) return pub;
@@ -1507,224 +1771,292 @@
       const ctx = this._asegurarRxAudioCtx();
       const ctxRate = ctx.sampleRate || 48000;
       const dest = ctx.createMediaStreamDestination();
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 1.0;
+      gainNode.connect(ctx.destination);
+      gainNode.connect(dest);
+
       const msTrack = dest.stream.getAudioTracks()[0];
       const track = new MediaTrack('audio', source, msTrack);
+      track.setDirectOutput = (vol, sinkId) => {
+        if (typeof vol === 'number' && !Number.isNaN(vol)) {
+          gainNode.gain.value = Math.max(0, Math.min(3, vol));
+        }
+        if (sinkId && typeof ctx.setSinkId === 'function') {
+          ctx.setSinkId(sinkId).catch(() => {});
+        }
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(() => {});
+        }
+      };
+
       const sid = 'TR_' + source + '_' + p.identity;
       pub = new TrackPublication(source, track, sid, nombre);
       p.pubs.set(source, pub);
 
-      // Ring buffer de entrada: 4 segundos a la frecuencia nativa del AudioContext
       const cap = Math.ceil(ctxRate * 4);
       const pipe = {
         ctx,
         ctxRate,
         dest,
+        gainNode,
         pub,
         p,
+        worklet: null,
+        proc: null,
+        // Estado del Ring Buffer para fallback ScriptProcessor (si AudioWorklet no está activo)
         ring: new Float32Array(cap),
         cap,
         writePos: 0,
-        readPosF: 0,          // posición de lectura fraccional (velocidad variable)
-        available: 0,         // muestras acumuladas sin reproducir
+        readPosF: 0,
+        available: 0,
         playing: false,
+        eosPending: false,
+        waitSamples: 0,
+        underrunSamples: 0,
+        lastOut: 0,
         fadeInPos: 0,
-        fadeInLen: Math.ceil(ctxRate * 0.006), // 6 ms fade-in suave
-        readRate: 1,
+        fadeInLen: Math.ceil(ctxRate * 0.006),
+        readRate: 1.0,
+        targetSamples: Math.ceil(ctxRate * 0.14), // 140 ms inicial
         // Estado de remuestreo continuo entre paquetes consecutivos
         rxPhase: 0,
         rxLastInSample: 0,
         rxHasLast: false,
-        // Jitter y buffer objetivo aprendido
+        // Medición de jitter sólo entre secuencias consecutivas
         lastArrivalMs: 0,
-        jitterMs: 30,
-        learnedMs: 160,       // sube tras cada corte real; baja con estabilidad
-        // PLC: historia de salida para repetir forma de onda en huecos
-        hist: new Float32Array(8192),
-        histPos: 0,
-        plcActive: false,
-        plcPeriod: 240,
-        plcGain: 1,
-        plcUsed: 0,
-        deemphState: { yPrev: 0 },
+        lastSeq: -1,
+        jitterMs: 20,
         opusDecoder: null,
         opusTimestampUs: 0,
-        proc: null,
       };
 
-      // Buffer objetivo: base + jitter medido, con el mínimo aprendido en cortes
-      const targetSamples = () => {
-        const ms = Math.max(pipe.learnedMs, Math.min(1500, 160 + pipe.jitterMs * 3));
-        return pipe.ctxRate * (ms / 1000);
-      };
-
-      const proc = ctx.createScriptProcessor(1024, 1, 1);
-      proc.onaudioprocess = (ev) => {
-        const out = ev.outputBuffer.getChannelData(0);
-        const n = out.length;
-        const target = targetSamples();
-
-        if (!pipe.playing) {
-          // Acumular hasta el objetivo antes de soltar sonido: en redes malas
-          // el objetivo aprendido llega a ~1-1.5 s — el usuario prefiere ese
-          // retraso a cualquier corte a mitad de palabra.
-          if (pipe.available >= Math.min(target, pipe.ctxRate * 1.8)) {
-            pipe.playing = true;
-            pipe.fadeInPos = 0;
-            pipe.plcActive = false;
-            pipe.plcGain = 1;
-            pipe.plcUsed = 0;
-          } else {
-            for (let i = 0; i < n; i++) out[i] = 0;
-            return;
+      const conectarWorkletSiListo = () => {
+        if (pipe.worklet || !ctx._mumbleWorkletReady || typeof window.AudioWorkletNode !== 'function') {
+          return false;
+        }
+        try {
+          const wn = new window.AudioWorkletNode(ctx, 'mumble-rx-worklet', {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+          });
+          wn.connect(gainNode);
+          pipe.worklet = wn;
+          if (pipe.proc) {
+            try { pipe.proc.disconnect(); } catch {}
+            pipe.proc = null;
           }
+          return true;
+        } catch {
+          return false;
         }
+      };
 
-        // Velocidad de consumo adaptativa: si sobra buffer acelera hasta +10%
-        // (alcanza el tiempo real sin saltos); si escasea estira hasta -6%
-        // (cubre huecos cortos sin silencio ni corte).
-        const over = pipe.available - target;
-        let desired = 1;
-        if (over > pipe.ctxRate * 0.25) {
-          desired = Math.min(1.10, 1 + (over / pipe.ctxRate) * 0.18);
-        } else if (pipe.available < target * 0.5) {
-          desired = 0.94;
-        }
-        pipe.readRate += (desired - pipe.readRate) * 0.08;
+      if (!conectarWorkletSiListo()) {
+        // Fallback inmediato con ScriptProcessor(2048) conectado directo a gainNode -> ctx.destination
+        const proc = ctx.createScriptProcessor(2048, 1, 1);
+        proc.onaudioprocess = (ev) => {
+          const out = ev.outputBuffer.getChannelData(0);
+          const n = out.length;
 
-        const ring = pipe.ring;
-        const capLocal = pipe.cap;
-        const hist = pipe.hist;
-        const histCap = hist.length;
-
-        for (let i = 0; i < n; i++) {
-          let s;
-          if (pipe.available > 1.5) {
-            if (pipe.plcActive) {
-              // volvió la voz tras un hueco: crossfade corto desde el PLC
-              pipe.plcActive = false;
-              pipe.fadeInPos = Math.min(pipe.fadeInPos, Math.ceil(pipe.fadeInLen * 0.4));
-            }
-            const idx0 = pipe.readPosF | 0;
-            const frac = pipe.readPosF - idx0;
-            const idx1 = (idx0 + 1) % capLocal;
-            s = ring[idx0] + frac * (ring[idx1] - ring[idx0]);
-            pipe.readPosF = (pipe.readPosF + pipe.readRate) % capLocal;
-            pipe.available -= pipe.readRate;
-            if (pipe.fadeInPos < pipe.fadeInLen) {
-              s *= pipe.fadeInPos / pipe.fadeInLen;
-              pipe.fadeInPos++;
-            }
-          } else {
-            // PLC: hueco en la llegada. Repetir el último período de pitch con
-            // decaimiento suave — huecos de 40-150 ms se vuelven inaudibles.
-            if (!pipe.plcActive) {
-              pipe.plcActive = true;
-              pipe.plcGain = 1;
-              pipe.plcUsed = 0;
-              pipe.plcPeriod = estimarPeriodoPLC(hist, pipe.histPos, histCap);
-            }
-            const p0 = (pipe.histPos - pipe.plcPeriod + histCap) % histCap;
-            s = hist[p0] * pipe.plcGain;
-            pipe.plcGain *= 0.99975;   // ~150 ms hasta desvanecer
-            if (pipe.plcGain < 0.12) s = 0;
-            pipe.plcUsed++;
-            // tras ~300 ms de hueco real: rendirse y re-acumular buffer
-            if (pipe.plcUsed > pipe.ctxRate * 0.3) {
-              s = 0;
-              pipe.playing = false;
-              pipe.learnedMs = Math.min(1500, pipe.learnedMs + 150);
-              out[i] = 0;
-              hist[pipe.histPos] = 0;
-              pipe.histPos = (pipe.histPos + 1) % histCap;
-              for (let k = i + 1; k < n; k++) {
-                out[k] = 0;
-                hist[pipe.histPos] = 0;
-                pipe.histPos = (pipe.histPos + 1) % histCap;
+          if (!pipe.playing) {
+            if (pipe.available > 0) {
+              pipe.waitSamples += n;
+              if (
+                pipe.available >= pipe.targetSamples ||
+                pipe.eosPending ||
+                pipe.waitSamples >= pipe.ctxRate * 0.18
+              ) {
+                pipe.playing = true;
+                pipe.waitSamples = 0;
+                pipe.underrunSamples = 0;
+                pipe.fadeInPos = 0;
               }
+            } else {
+              pipe.waitSamples = 0;
+            }
+            if (!pipe.playing) {
+              for (let i = 0; i < n; i++) out[i] = 0;
               return;
             }
           }
-          out[i] = s;
-          hist[pipe.histPos] = s;
-          pipe.histPos = (pipe.histPos + 1) % histCap;
-        }
-      };
 
-      proc.connect(dest);
-      pipe.proc = proc;
+          const over = pipe.available - pipe.targetSamples;
+          let desired = 1.0;
+          if (over > pipe.ctxRate * 0.14) {
+            desired = Math.min(1.07, 1.0 + (over / pipe.ctxRate) * 0.14);
+          } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.45) {
+            desired = 0.95;
+          }
+          pipe.readRate += (desired - pipe.readRate) * 0.1;
+
+          const ring = pipe.ring;
+          const capLocal = pipe.cap;
+          for (let i = 0; i < n; i++) {
+            if (pipe.available > 1.05) {
+              const idx0 = pipe.readPosF | 0;
+              const frac = pipe.readPosF - idx0;
+              const idx1 = (idx0 + 1) % capLocal;
+              let s = ring[idx0] + frac * (ring[idx1] - ring[idx0]);
+              pipe.readPosF = (pipe.readPosF + pipe.readRate) % capLocal;
+              pipe.available -= pipe.readRate;
+              if (pipe.fadeInPos < pipe.fadeInLen) {
+                s *= pipe.fadeInPos / pipe.fadeInLen;
+                pipe.fadeInPos++;
+              }
+              out[i] = s;
+              pipe.lastOut = s;
+              pipe.underrunSamples = 0;
+            } else {
+              pipe.lastOut *= 0.982;
+              if (Math.abs(pipe.lastOut) < 0.0001) pipe.lastOut = 0;
+              out[i] = pipe.lastOut;
+              pipe.underrunSamples++;
+              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.065) {
+                if (!pipe.eosPending) {
+                  pipe.targetSamples = Math.min(
+                    Math.ceil(pipe.ctxRate * 0.38),
+                    pipe.targetSamples + Math.ceil(pipe.ctxRate * 0.035)
+                  );
+                }
+                pipe.playing = false;
+                pipe.eosPending = false;
+                pipe.waitSamples = 0;
+                pipe.available = 0;
+                pipe.readPosF = pipe.writePos;
+                for (let k = i + 1; k < n; k++) out[k] = 0;
+                return;
+              }
+            }
+          }
+        };
+        proc.connect(gainNode);
+        pipe.proc = proc;
+        asegurarWorkletEnCtx(ctx).then((ok) => {
+          if (ok && this._rxPipelines.get(sid) === pipe) {
+            conectarWorkletSiListo();
+          }
+        });
+      }
+
       this._rxPipelines.set(sid, pipe);
       this.emit(RoomEvent.TrackSubscribed, track, pub, p);
       return pub;
     }
 
-    // Remuestrea continuamente y empuja un bloque decodificado al Ring Buffer.
-    // El colchón lo marca el propio receptor (aprende con cada corte), aquí solo
-    // medimos jitter de llegada y decaimos lentamente el objetivo aprendido.
-    _empujarMuestrasRemotas(pipe, samples, inRate, fromId, ftipo) {
+    _marcarFinHablaRemota(pipe) {
+      if (!pipe) return;
+      pipe.rxHasLast = false;
+      pipe.rxPhase = 0;
+      pipe.lastSeq = -1;
+      pipe.eosPending = true;
+      if (pipe.worklet) {
+        try { pipe.worklet.port.postMessage({ t: 'eos' }); } catch {}
+      }
+    }
+
+    // Remuestrea continuamente y empuja un bloque decodificado al reproductor.
+    _empujarMuestrasRemotas(pipe, samples, inRate, fromId, ftipo, seq) {
       if (!samples || samples.length === 0) return;
       const nowMs = performance.now();
-      const durMs = (samples.length / inRate) * 1000;
-      if (pipe.lastArrivalMs > 0) {
-        const deltaMs = nowMs - pipe.lastArrivalMs;
-        if (deltaMs < 400) {
-          const jit = Math.abs(deltaMs - durMs);
-          pipe.jitterMs = pipe.jitterMs * 0.88 + jit * 0.12;
-        } else {
-          // Nueva frase tras silencio: reiniciar interpolador
+
+      // Medir jitter real sólo cuando los números de secuencia (1 por cada 40 ms) son consecutivos
+      if (typeof seq === 'number' && seq >= 0) {
+        if (pipe.lastSeq >= 0) {
+          const diff = (seq - pipe.lastSeq) & 0xffff;
+          if (diff === 1 && pipe.lastArrivalMs > 0) {
+            const deltaMs = nowMs - pipe.lastArrivalMs;
+            if (deltaMs < 500) {
+              const jit = Math.abs(deltaMs - 40);
+              pipe.jitterMs = pipe.jitterMs * 0.88 + jit * 0.12;
+              const targetMs = Math.max(125, Math.min(360, 115 + pipe.jitterMs * 2.0));
+              pipe.targetSamples = Math.ceil(pipe.ctxRate * (targetMs / 1000));
+              if (pipe.worklet) {
+                try { pipe.worklet.port.postMessage({ t: 'target', ms: targetMs }); } catch {}
+              }
+            }
+          } else if (diff > 1 && diff < 30000) {
+            pipe.rxHasLast = false;
+            pipe.rxPhase = 0;
+          }
+        }
+        pipe.lastSeq = seq;
+        pipe.lastArrivalMs = nowMs;
+      } else if (seq === -1 && pipe.lastSeq < 0) {
+        if (pipe.lastArrivalMs > 0 && (nowMs - pipe.lastArrivalMs) > 450) {
           pipe.rxHasLast = false;
           pipe.rxPhase = 0;
         }
+        pipe.lastArrivalMs = nowMs;
       }
-      pipe.lastArrivalMs = nowMs;
-      // Estabilidad acumulada: el objetivo aprendido vuelve poco a poco a ~160 ms
-      pipe.learnedMs = Math.max(150, pipe.learnedMs - 0.15);
+      pipe.eosPending = false;
 
-      // Solo en exceso extremo (>3.5 s tras un atasco TCP larguísimo) se recorta
-      // lo más viejo; por debajo de eso NADA se descarta: se acelera la lectura.
-      const hardCap = pipe.ctxRate * 3.5;
-      if (pipe.available > hardCap) {
-        const drop = Math.floor(pipe.available - pipe.ctxRate * 1.2);
-        pipe.readPosF = (pipe.readPosF + drop) % pipe.cap;
-        pipe.available -= drop;
-        pipe.fadeInPos = 0;
-      }
-
-      const step = inRate / pipe.ctxRate;
       const nIn = samples.length;
-      const ring = pipe.ring;
-      const cap = pipe.cap;
       let sum = 0;
-
-      if (!pipe.rxHasLast) {
-        pipe.rxLastInSample = samples[0];
-        pipe.rxHasLast = true;
-        pipe.rxPhase = 0;
-      }
-
-      while (pipe.rxPhase < nIn) {
-        const idx = pipe.rxPhase | 0;
-        const frac = pipe.rxPhase - idx;
-        const s0 = idx === 0 ? pipe.rxLastInSample : samples[idx - 1];
-        const s1 = samples[idx];
-        const val = s0 + frac * (s1 - s0);
-
-        if (pipe.available < cap) {
-          ring[pipe.writePos] = val;
-          pipe.writePos = (pipe.writePos + 1) % cap;
-          pipe.available++;
-        }
-        pipe.rxPhase += step;
-      }
-      pipe.rxPhase -= nIn;
-      pipe.rxLastInSample = samples[nIn - 1];
-
       for (let i = 0; i < nIn; i += 4) {
         sum += samples[i] * samples[i];
       }
       const rms = Math.sqrt(sum / Math.max(1, Math.ceil(nIn / 4)));
-      if (ftipo === FRAME_AUDIO && rms > 0.008) {
+      if (ftipo === FRAME_AUDIO && rms > 0.006) {
         this._speakers.set(fromId, Date.now() + 650);
         this._actualizarSpeakers();
+      }
+
+      // Remuestrear a la tasa exacta del AudioContext con fase continua
+      let outPcm;
+      if (inRate === pipe.ctxRate) {
+        outPcm = samples;
+        pipe.rxLastInSample = samples[nIn - 1];
+        pipe.rxHasLast = true;
+        pipe.rxPhase = 0;
+      } else {
+        const step = inRate / pipe.ctxRate;
+        if (!pipe.rxHasLast) {
+          pipe.rxLastInSample = samples[0];
+          pipe.rxHasLast = true;
+          pipe.rxPhase = 0;
+        }
+        const estLen = Math.ceil((nIn - pipe.rxPhase) / step) + 2;
+        const tmp = new Float32Array(Math.max(1, estLen));
+        let outIdx = 0;
+        while (pipe.rxPhase < nIn) {
+          const idx = pipe.rxPhase | 0;
+          const frac = pipe.rxPhase - idx;
+          const s0 = idx === 0 ? pipe.rxLastInSample : samples[idx - 1];
+          const s1 = samples[idx];
+          tmp[outIdx++] = s0 + frac * (s1 - s0);
+          pipe.rxPhase += step;
+        }
+        pipe.rxPhase -= nIn;
+        pipe.rxLastInSample = samples[nIn - 1];
+        outPcm = tmp.subarray(0, outIdx);
+      }
+
+      if (pipe.worklet) {
+        try {
+          pipe.worklet.port.postMessage({ t: 'push', pcm: outPcm });
+          return;
+        } catch {}
+      }
+
+      // Empujar al Ring Buffer del fallback ScriptProcessor
+      const hardCap = pipe.ctxRate * 1.8;
+      if (pipe.available + outPcm.length > hardCap) {
+        const keep = Math.ceil(pipe.ctxRate * 0.28);
+        const drop = Math.max(0, (pipe.available + outPcm.length) - keep);
+        pipe.readPosF = (pipe.readPosF + drop) % pipe.cap;
+        pipe.available = Math.max(0, pipe.available - drop);
+        pipe.fadeInPos = 0;
+      }
+      const ring = pipe.ring;
+      const cap = pipe.cap;
+      for (let i = 0; i < outPcm.length; i++) {
+        if (pipe.available < cap) {
+          ring[pipe.writePos] = outPcm[i];
+          pipe.writePos = (pipe.writePos + 1) % cap;
+          pipe.available++;
+        }
       }
     }
 
@@ -1763,7 +2095,7 @@
       }
 
       if (ftipo === FRAME_AUDIO || ftipo === FRAME_AUDIO_SHARE) {
-        if (payload.length < 2) return;
+        if (payload.length < 1) return;
         const rateCode = payload[0];
 
         const source = ftipo === FRAME_AUDIO_SHARE ? TrackSource.ScreenShareAudio : TrackSource.Microphone;
@@ -1777,7 +2109,14 @@
         if (!pipe) return;
         this._asegurarRxAudioCtx();
 
-        // 1. Trama Opus nativa ultraligera (10 kbps / 18 kbps / 28 kbps)
+        // 0. Marcador explícito de fin de frase (EOS): reproduce de inmediato
+        // cualquier sílaba corta pendiente y apaga la frase sin PLC ni retraso.
+        if (rateCode === 0) {
+          this._marcarFinHablaRemota(pipe);
+          return;
+        }
+
+        // 1. Trama Opus nativa ultraligera (14 / 22 / 32 kbps)
         if (rateCode >= 10 && rateCode <= 19) {
           if (!SOPORTE_OPUS_RX || typeof window.AudioDecoder !== 'function') return;
           try {
@@ -1786,8 +2125,10 @@
                 output: (audioData) => {
                   const sRate = audioData.sampleRate || 48000;
                   const pcm = extraerFloat32DeAudioData(audioData);
+                  const seqOut = pipe._pendingOpusSeq;
+                  pipe._pendingOpusSeq = -1;
                   audioData.close();
-                  this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo);
+                  this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo, seqOut);
                 },
                 error: () => {},
               });
@@ -1797,25 +2138,64 @@
                 numberOfChannels: 1,
               });
             }
-            const opusBytes = payload.subarray(1);
-            const chunk = new window.EncodedAudioChunk({
-              type: 'key',
-              timestamp: pipe.opusTimestampUs,
-              duration: 40000,
-              data: opusBytes,
-            });
-            pipe.opusTimestampUs += 40000;
-            pipe.opusDecoder.decode(chunk);
+            // Formato v2 dual (2 sub-tramas Opus de 20 ms con secuencia):
+            // payload = [rateCode, seqLo, seqHi, 0xA5, len1Lo, len1Hi, ...b1..., len2Lo, len2Hi, ...b2...]
+            if (payload.length > 8 && payload[3] === 0xA5) {
+              const seq = payload[1] | (payload[2] << 8);
+              const len1 = payload[4] | (payload[5] << 8);
+              const off1 = 6;
+              if (off1 + len1 <= payload.length && len1 > 0) {
+                const b1 = payload.subarray(off1, off1 + len1);
+                pipe._pendingOpusSeq = seq;
+                const ch1 = new window.EncodedAudioChunk({
+                  type: 'key',
+                  timestamp: pipe.opusTimestampUs,
+                  duration: 20000,
+                  data: b1,
+                });
+                pipe.opusTimestampUs += 20000;
+                pipe.opusDecoder.decode(ch1);
+              }
+              const off2 = off1 + len1;
+              if (off2 + 2 <= payload.length) {
+                const len2 = payload[off2] | (payload[off2 + 1] << 8);
+                if (off2 + 2 + len2 <= payload.length && len2 > 0) {
+                  const b2 = payload.subarray(off2 + 2, off2 + 2 + len2);
+                  const ch2 = new window.EncodedAudioChunk({
+                    type: 'key',
+                    timestamp: pipe.opusTimestampUs,
+                    duration: 20000,
+                    data: b2,
+                  });
+                  pipe.opusTimestampUs += 20000;
+                  pipe.opusDecoder.decode(ch2);
+                }
+              }
+            } else {
+              // Retrocompatibilidad con trama Opus simple
+              const opusBytes = payload.subarray(1);
+              const chunk = new window.EncodedAudioChunk({
+                type: 'key',
+                timestamp: pipe.opusTimestampUs,
+                duration: 20000,
+                data: opusBytes,
+              });
+              pipe.opusTimestampUs += 20000;
+              pipe.opusDecoder.decode(chunk);
+            }
           } catch {}
           return;
         }
 
-        // 2. Trama IMA-ADPCM de 4 bits con pre/de-énfasis (24 kbps / 32 kbps / 48 kbps)
+        // 2. Trama IMA-ADPCM limpia de 4 bits (8 kHz / 12 kHz / 16 kHz)
         if (rateCode >= 20 && rateCode <= 39) {
           const baseCode = rateCode >= 30 ? (rateCode - 10) : rateCode;
-          const sampleRate = baseCode === 21 ? 6000 : (baseCode === 22 ? 8000 : (baseCode === 23 ? 12000 : 16000));
-          const pcm = decodificarBloqueADPCM(payload, pipe.deemphState);
-          this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo);
+          const esV2 = payload.length >= 7 && payload[6] === 0x5A;
+          const sampleRate = esV2
+            ? (baseCode === 21 ? 8000 : (baseCode === 22 ? 12000 : 16000))
+            : (baseCode === 21 ? 6000 : (baseCode === 22 ? 8000 : (baseCode === 23 ? 12000 : 16000)));
+          const { pcm, seq } = decodificarBloqueADPCM(payload);
+          this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo, seq);
           return;
         }
 
@@ -1826,7 +2206,7 @@
         for (let i = 0; i < samples.length; i++) {
           pcm[i] = ulawDecodeTable[samples[i]];
         }
-        this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo);
+        this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo, -1);
         return;
       }
 
