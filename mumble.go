@@ -530,6 +530,7 @@ type clienteWS struct {
 	canMic     bool
 	canCam     bool
 	canPan     bool
+	opusRx     bool
 	ultimoHabl int64
 }
 
@@ -672,13 +673,18 @@ func (mh *MediaHub) listarTodos(sala string) []*clienteWS {
 }
 
 // difundirEstadoPeers envía a todos los miembros del grupo la lista actualizada
-// de participantes presentes y quién tiene micro/cámara/pantalla encendidos.
+// de participantes presentes y quién tiene micro/cámara/pantalla encendidos,
+// además de indicar si hay algún oyente sin decodificador Opus nativo.
 func (r *mediaRoom) difundirEstadoPeers(grupo int) {
 	r.mu.RLock()
 	peers := []map[string]any{}
 	destinos := []*clienteWS{}
+	haySinOpus := false
 	for _, c := range r.clientes {
 		if c.grupo == grupo {
+			if !c.opusRx {
+				haySinOpus = true
+			}
 			peers = append(peers, map[string]any{
 				"identidad": c.identidad,
 				"nombre":    c.nombre,
@@ -695,8 +701,9 @@ func (r *mediaRoom) difundirEstadoPeers(grupo int) {
 	r.mu.RUnlock()
 
 	msg, _ := json.Marshal(map[string]any{
-		"t":     "peers",
-		"peers": peers,
+		"t":          "peers",
+		"peers":      peers,
+		"haySinOpus": haySinOpus,
 	})
 	raw := append([]byte{1}, msg...) // 1 = text JSON frame
 	for _, d := range destinos {
@@ -821,12 +828,13 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		grupo:     grupo,
 		esAdmin:   cl.RoomAdmin,
 		conn:      conn,
-		ctrlCh:    make(chan []byte, 48),
+		ctrlCh:    make(chan []byte, 96),
 		videoCh:   make(chan []byte, 2), // máximo 2 frames en cola: cero latencia acumulada
 		cerrado:   make(chan struct{}),
 		canMic:    canMic,
 		canCam:    canCam,
 		canPan:    canPan,
+		opusRx:    r.URL.Query().Get("opus") == "1",
 	}
 
 	mr := media.room(sala)
@@ -935,8 +943,16 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			}
 			tipo, _ := m["t"].(string)
 			switch tipo {
+			case "ping_net":
+				// Medición de RTT y jitter del cliente para ajuste automático de bitrate (8–28 kbps)
+				pong, _ := json.Marshal(map[string]any{
+					"t":  "pong_net",
+					"ts": m["ts"],
+				})
+				c.enviarCtrl(append([]byte{1}, pong...))
+
 			case "estado_media":
-				// El cliente informa si encendió/apagó su micro, cámara o pantalla
+				// El cliente informa si encendió/apagó su micro, cámara o pantalla y su soporte Opus
 				mr.mu.Lock()
 				if v, ok := m["mic"].(bool); ok {
 					c.micOn = v && c.canMic
@@ -946,6 +962,9 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				}
 				if v, ok := m["pan"].(bool); ok {
 					c.panOn = v && c.canPan
+				}
+				if v, ok := m["opusRx"].(bool); ok {
+					c.opusRx = v
 				}
 				gActual := c.grupo
 				mr.mu.Unlock()
@@ -1014,7 +1033,7 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 
 			switch ftipo {
 			case frameTipoAudio:
-				if !c.canMic {
+				if !c.canMic || len(payload) < 2 {
 					continue
 				}
 				if !c.micOn {
@@ -1023,13 +1042,28 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					mr.mu.Unlock()
 					mr.difundirEstadoPeers(c.grupo)
 				}
+				rc := payload[0]
 				// Enviar al puente Mumble nativo y a los compañeros del mismo grupo
-				mr.mumble.enviarAudioMumble(payload)
+				// rc 10..19 = Opus (10–28 kbps, solo para clientes con opusRx=true)
+				// rc 30..39 = ADPCM respaldo simultáneo (solo para clientes con opusRx=false)
+				// rc 20..29 o 1..2 = ADPCM/u-law primario (para todos cuando el emisor no tiene Opus)
+				if rc >= 10 && rc <= 19 {
+					mr.mumble.enviarAudioMumble(payload[1:])
+				} else if rc < 10 || (rc >= 20 && rc <= 29) {
+					mr.mumble.enviarAudioMumble(payload)
+				}
 				mr.mu.RLock()
 				for _, otro := range mr.clientes {
-					if otro != c && otro.grupo == c.grupo {
-						otro.enviarBinarioAudio(out)
+					if otro == c || otro.grupo != c.grupo {
+						continue
 					}
+					if rc >= 10 && rc <= 19 && !otro.opusRx {
+						continue
+					}
+					if rc >= 30 && rc <= 39 && otro.opusRx {
+						continue
+					}
+					otro.enviarBinarioAudio(out)
 				}
 				mr.mu.RUnlock()
 
@@ -1071,11 +1105,22 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				mr.mu.RUnlock()
 
 			case frameTipoAudioSh:
+				if len(payload) < 2 {
+					continue
+				}
+				rc := payload[0]
 				mr.mu.RLock()
 				for _, otro := range mr.clientes {
-					if otro != c && otro.grupo == c.grupo {
-						otro.enviarBinarioAudio(out)
+					if otro == c || otro.grupo != c.grupo {
+						continue
 					}
+					if rc >= 10 && rc <= 19 && !otro.opusRx {
+						continue
+					}
+					if rc >= 30 && rc <= 39 && otro.opusRx {
+						continue
+					}
+					otro.enviarBinarioAudio(out)
 				}
 				mr.mu.RUnlock()
 			}

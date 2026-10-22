@@ -1238,7 +1238,7 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 
 	case "audio_perfil":
 		switch req.Extra {
-		case "telefono", "voz", "musica":
+		case "auto", "telefono", "voz", "musica":
 			e.AudioPerfil = req.Extra
 		default:
 			errStr = "perfil de audio desconocido"

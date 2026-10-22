@@ -34,6 +34,7 @@ const S = {
   audio: { pub: null, ctx: null, ganancia: esIOS ? 2 : 1, ns: true, ec: true, agc: !esIOS, on: false },
   prefAudio: localStorage.getItem('lk_audio_pref') || 'auto', // auto | telefono | voz | musica
   calidadMala: false,        // última lectura de ConnectionQuality del propio cliente
+  calidadRed: 'media',       // 'mala' (~10 kbps) | 'media' (~18 kbps) | 'buena' (~28 kbps)
   previewStream: null, micCtx: null, micStream: null, micAnalyser: null,
   votos: { aFavor: 0, enContra: 0, mi: 0 }, _sentado: false, _palabra: false,
   // salida de audio: volumen general y por persona — solo amplificación
@@ -1335,10 +1336,9 @@ function aplicarEstado(d, fuente = 'http') {
   if (!S._palabra && ahoraPalabra) S.audio.autoPalabra = true;
   if (S._palabra && !ahoraPalabra) S.audio.autoPalabra = false;
   S._sentado = ahoraSentado; S._palabra = ahoraPalabra;
-  // perfil de sala cambió: solo republica en modo automático (el que fijó
-  // su propia calidad mantiene su preferencia)
-  if (prevPerfil && d.estado.audioPerfil !== prevPerfil && S.audio.pub && S.prefAudio === 'auto')
-    reconstruirMic();
+  // perfil de sala cambió: ajusta en caliente sin cortar el micrófono
+  if (prevPerfil && d.estado.audioPerfil !== prevPerfil && S.audio.pub)
+    actualizarCalidadAudioEnVivo();
   S.estado.manos = S.estado.manos || [];
   S.estado.cola = S.estado.cola || [];
   S.estado.moderadores = S.estado.moderadores || [];
@@ -1897,10 +1897,12 @@ function cablearRoom(room) {
   room.on(LC.RoomEvent.ConnectionQualityChanged, (q, p) => {
     if (!p || !p.isLocal) return;
     const mala = q === LC.ConnectionQuality.Poor || q === LC.ConnectionQuality.Lost;
-    if (mala === S.calidadMala) return;
+    const nivel = mala ? 'mala' : (q === LC.ConnectionQuality.Excellent ? 'buena' : 'media');
+    if (nivel === S.calidadRed && mala === S.calidadMala) return;
     S.calidadMala = mala;
-    // en modo automático republica el micro con el preset acorde a la conexión
-    if (S.prefAudio === 'auto' && S.audio.pub) reconstruirMic();
+    S.calidadRed = nivel;
+    // en modo automático ajusta el bitrate en caliente acorde a la conexión real
+    if (S.prefAudio === 'auto' && S.audio.pub) actualizarCalidadAudioEnVivo();
   });
   room.on(LC.RoomEvent.ActiveSpeakersChanged, (speakers) => {
     const nuevo = speakers.length ? speakers[0].identity : null;
@@ -2909,7 +2911,7 @@ function renderListas() {
     if ($('#mod-chat-off')) $('#mod-chat-off').classList.toggle('on', !S.estado.chatOff);
     // ON (por defecto) = la audiencia solo ve la vista sincronizada
     if ($('#mod-vista-fija')) $('#mod-vista-fija').classList.toggle('on', !!S.estado.vistaFija);
-    if ($('#mod-audio')) $('#mod-audio').value = S.estado.audioPerfil || 'voz';
+    if ($('#mod-audio')) $('#mod-audio').value = S.estado.audioPerfil || 'auto';
     if ($('#mod-acceso')) $('#mod-acceso').value = S.accesoSala || 'abierto';
     // sala de espera: quién espera admisión + botón por persona
     const lw = $('#mod-lobby-wrap');
@@ -3510,7 +3512,7 @@ function cablearAjustes() {
   $('#aj-calidad').onchange = async (e) => {
     S.prefAudio = e.target.value;
     localStorage.setItem('lk_audio_pref', S.prefAudio);
-    try { await reconstruirMic(); } catch (x) { toast(x.message); }
+    try { actualizarCalidadAudioEnVivo(); } catch (x) { toast(x.message); }
   };
 }
 
@@ -3689,14 +3691,21 @@ function cerrarPipeline() {
   detenerMedidor(); // el medidor del prejoin también captura: hay que soltarlo
 }
 
-// preset Opus según el perfil de sala; dtx recorta en silencio y red:false
-// quita el paquete redundante (casi duplica el bitrate si está activo)
+// preset Opus/ADPCM según el perfil de sala y la velocidad de conexión detectada
 const AUDIO_PRESETS = { telefono: 'telephone', voz: 'speech', musica: 'musicStereo' };
 function perfilAudioEfectivo() {
   const pref = S.prefAudio || 'auto';
-  if (pref !== 'auto') return pref;
-  // automático: conexión mala → teléfono; si va bien → el perfil que fijó la sala
-  return S.calidadMala ? 'telefono' : ((S.estado && S.estado.audioPerfil) || 'voz');
+  const salaPerfil = (S.estado && S.estado.audioPerfil) || 'auto';
+  if (pref !== 'auto') {
+    if (salaPerfil === 'telefono') return 'telefono';
+    return pref;
+  }
+  // automático: adapta dinámicamente según la conexión medida del propio usuario
+  // ('mala' -> ~10 kbps, 'media' -> ~18 kbps, 'buena' -> ~28 kbps)
+  const segRed = S.calidadRed === 'mala' ? 'telefono' : (S.calidadRed === 'buena' ? 'musica' : 'voz');
+  if (salaPerfil === 'telefono') return 'telefono';
+  if (salaPerfil === 'voz' && segRed === 'musica') return 'voz';
+  return segRed;
 }
 function opcionesAudio() {
   return {
@@ -3704,6 +3713,13 @@ function opcionesAudio() {
     audioPreset: LC.AudioPresets[AUDIO_PRESETS[perfilAudioEfectivo()] || 'speech'],
     dtx: true, red: false,
   };
+}
+function actualizarCalidadAudioEnVivo() {
+  if (!S.audio.pub || !S.room || !S.room.localParticipant) return;
+  if (typeof S.room.localParticipant.actualizarPresetAudio === 'function') {
+    if (S.room.localParticipant.actualizarPresetAudio(opcionesAudio())) return;
+  }
+  reconstruirMic().catch(() => {});
 }
 
 async function retirarMic() {

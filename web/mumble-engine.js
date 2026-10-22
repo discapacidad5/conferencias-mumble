@@ -54,12 +54,188 @@
   };
 
   const AudioPresets = {
-    telephone: { maxBitrate: 12000 },
-    speech: { maxBitrate: 20000 },
-    musicStereo: { maxBitrate: 32000 },
+    telephone: { maxBitrate: 10000, tier: 'telefono' }, // ~10 kbps Opus / 24 kbps ADPCM (ahorro extremo 2G/3G y salas de +500 personas)
+    speech: { maxBitrate: 18000, tier: 'voz' },         // ~18 kbps Opus / 32 kbps ADPCM (voz nítida equilibrada)
+    musicStereo: { maxBitrate: 28000, tier: 'musica' }, // ~28 kbps Opus / 48 kbps ADPCM (alta nitidez HD en buena conexión)
   };
 
-  // --- Tablas y conversión µ-law (G.711 u-law, 8 bits por muestra) ---
+  // --- Detección de soporte nativo WebCodecs Opus (Chrome/Android/Edge/Firefox/Safari moderno) ---
+  let SOPORTE_OPUS_RX = false;
+  let SOPORTE_OPUS_TX = false;
+  const promesaDeteccionOpus = (async function detectarOpus() {
+    try {
+      if (typeof window.AudioDecoder === 'function' && typeof window.EncodedAudioChunk === 'function') {
+        const resRx = await window.AudioDecoder.isConfigSupported({
+          codec: 'opus',
+          sampleRate: 48000,
+          numberOfChannels: 1,
+        });
+        if (resRx && resRx.supported) {
+          const dec = new window.AudioDecoder({ output: () => {}, error: () => {} });
+          dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+          dec.close();
+          SOPORTE_OPUS_RX = true;
+        }
+      }
+    } catch {}
+    try {
+      if (typeof window.AudioEncoder === 'function' && typeof window.AudioData === 'function') {
+        const resTx = await window.AudioEncoder.isConfigSupported({
+          codec: 'opus',
+          sampleRate: 48000,
+          numberOfChannels: 1,
+          bitrate: 18000,
+        });
+        if (resTx && resTx.supported) {
+          SOPORTE_OPUS_TX = true;
+        }
+      }
+    } catch {}
+  })();
+
+  // --- Tablas IMA-ADPCM (4 bits por muestra + pre-énfasis de voz) ---
+  const ADPCM_INDEX_TABLE = new Int8Array([
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8,
+  ]);
+  const ADPCM_STEP_TABLE = new Int16Array([
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+  ]);
+
+  // Codifica un bloque Float32 en IMA-ADPCM con cabecera de estado [predLo, predHi, stepIdx, 0]
+  // y filtro de pre-énfasis (mejora la nitidez de consonantes y reduce ruido de cuantización).
+  function codificarBloqueADPCM(samples, state, rateCode) {
+    const n = samples.length;
+    const outBytes = Math.ceil(n / 2);
+    const pkt = new Uint8Array(6 + outBytes);
+    pkt[0] = FRAME_AUDIO;
+    pkt[1] = rateCode;
+
+    let pred = state.pred | 0;
+    let idx = state.idx | 0;
+    let prevIn = state.prevIn || 0;
+
+    // Guardar estado inicial del bloque para que cada paquete sea 100% autónomo ante pérdidas
+    pkt[2] = pred & 0xff;
+    pkt[3] = (pred >> 8) & 0xff;
+    pkt[4] = idx & 0xff;
+    pkt[5] = 0;
+
+    let bytePos = 6;
+    let highNibble = false;
+    let curByte = 0;
+
+    for (let i = 0; i < n; i++) {
+      const x = samples[i];
+      // Pre-énfasis suave (0.42) para destacar agudos de la voz antes de cuantizar
+      const emph = Math.max(-1, Math.min(1, x - 0.42 * prevIn));
+      prevIn = x;
+      const val = (emph * 32767) | 0;
+
+      let step = ADPCM_STEP_TABLE[idx];
+      let diff = val - pred;
+      let nibble = 0;
+      if (diff < 0) {
+        nibble = 8;
+        diff = -diff;
+      }
+      let vpdiff = step >> 3;
+      if (diff >= step) {
+        nibble |= 4;
+        diff -= step;
+        vpdiff += step;
+      }
+      step >>= 1;
+      if (diff >= step) {
+        nibble |= 2;
+        diff -= step;
+        vpdiff += step;
+      }
+      step >>= 1;
+      if (diff >= step) {
+        nibble |= 1;
+        vpdiff += step;
+      }
+
+      if (nibble & 8) pred -= vpdiff;
+      else pred += vpdiff;
+      if (pred > 32767) pred = 32767;
+      else if (pred < -32768) pred = -32768;
+
+      idx += ADPCM_INDEX_TABLE[nibble];
+      if (idx < 0) idx = 0;
+      else if (idx > 88) idx = 88;
+
+      if (!highNibble) {
+        curByte = nibble & 0x0f;
+        highNibble = true;
+      } else {
+        pkt[bytePos++] = curByte | ((nibble & 0x0f) << 4);
+        highNibble = false;
+      }
+    }
+    if (highNibble) {
+      pkt[bytePos++] = curByte;
+    }
+    state.pred = pred;
+    state.idx = idx;
+    state.prevIn = prevIn;
+    return pkt;
+  }
+
+  function decodificarBloqueADPCM(payload, deemphState) {
+    if (payload.length < 5) return new Float32Array(0);
+    // payload[0] = rateCode, payload[1..2] = pred (int16 LE), payload[3] = stepIdx, payload[4] = reserved
+    let pred = payload[1] | (payload[2] << 8);
+    if (pred & 0x8000) pred -= 0x10000;
+    let idx = payload[3];
+    if (idx < 0) idx = 0;
+    else if (idx > 88) idx = 88;
+
+    const dataBytes = payload.length - 5;
+    const numSamples = dataBytes * 2;
+    const out = new Float32Array(numSamples);
+    let yPrev = deemphState.yPrev || 0;
+    let outIdx = 0;
+
+    for (let i = 5; i < payload.length; i++) {
+      const b = payload[i];
+      for (let s = 0; s < 2; s++) {
+        const nibble = s === 0 ? (b & 0x0f) : ((b >> 4) & 0x0f);
+        let step = ADPCM_STEP_TABLE[idx];
+        let vpdiff = step >> 3;
+        if (nibble & 4) vpdiff += step;
+        if (nibble & 2) vpdiff += step >> 1;
+        if (nibble & 1) vpdiff += step >> 2;
+        if (nibble & 8) pred -= vpdiff;
+        else pred += vpdiff;
+        if (pred > 32767) pred = 32767;
+        else if (pred < -32768) pred = -32768;
+
+        idx += ADPCM_INDEX_TABLE[nibble];
+        if (idx < 0) idx = 0;
+        else if (idx > 88) idx = 88;
+
+        // De-énfasis complementario (suaviza el grano de cuantización y restaura el timbre natural)
+        const rawFloat = pred / 32768.0;
+        const y = Math.max(-1, Math.min(1, rawFloat + 0.42 * yPrev));
+        yPrev = y;
+        out[outIdx++] = y;
+      }
+    }
+    deemphState.yPrev = yPrev;
+    return out;
+  }
+
+  // --- Tablas y conversión µ-law (mantenido para retrocompatibilidad) ---
   const ulawDecodeTable = new Float32Array(256);
   (function initUlaw() {
     for (let i = 0; i < 256; i++) {
@@ -84,6 +260,64 @@
     for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
     let mantissa = (pcm >> (exponent + 3)) & 0x0f;
     return ~(sign | (exponent << 4) | mantissa) & 0xff;
+  }
+
+  // Filtro Biquad Butterworth pasa-bajos de 2º orden para eliminar aliasing ("basurita")
+  function crearFiltroPasaBajos(sampleRate, cutoffHz) {
+    const w0 = (2 * Math.PI * cutoffHz) / sampleRate;
+    const cosw0 = Math.cos(w0);
+    const sinw0 = Math.sin(w0);
+    const alpha = sinw0 / (2 * Math.SQRT1_2);
+    const a0 = 1 + alpha;
+    const b0 = ((1 - cosw0) / 2) / a0;
+    const b1 = (1 - cosw0) / a0;
+    const b2 = ((1 - cosw0) / 2) / a0;
+    const a1 = (-2 * cosw0) / a0;
+    const a2 = (1 - alpha) / a0;
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    return function filtrar(x) {
+      const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = x;
+      y2 = y1; y1 = y;
+      return y;
+    };
+  }
+
+  // Filtro pasa-altos de 1er orden a 85 Hz para quitar retumbo/viento/DC del micrófono
+  function crearFiltroPasaAltos85Hz(sampleRate) {
+    const rc = 1.0 / (2 * Math.PI * 85);
+    const dt = 1.0 / sampleRate;
+    const alpha = rc / (rc + dt);
+    let xPrev = 0, yPrev = 0;
+    return function filtrarHP(x) {
+      const y = alpha * (yPrev + x - xPrev);
+      xPrev = x;
+      yPrev = y;
+      return y;
+    };
+  }
+
+  // Extrae muestras Float32 de un objeto WebCodecs AudioData (compatible con f32 y s16)
+  function extraerFloat32DeAudioData(audioData) {
+    const n = audioData.numberOfFrames;
+    const fmt = audioData.format || 'f32-planar';
+    try {
+      const out = new Float32Array(n);
+      audioData.copyTo(out, { planeIndex: 0, format: 'f32-planar' });
+      return out;
+    } catch {
+      if (fmt.startsWith('s16')) {
+        const s16 = new Int16Array(n * (audioData.numberOfChannels || 1));
+        audioData.copyTo(s16, { planeIndex: 0 });
+        const out = new Float32Array(n);
+        const step = fmt.includes('planar') ? 1 : (audioData.numberOfChannels || 1);
+        for (let i = 0; i < n; i++) out[i] = s16[i * step] / 32768.0;
+        return out;
+      }
+      const out = new Float32Array(n);
+      audioData.copyTo(out, { planeIndex: 0 });
+      return out;
+    }
   }
 
   class Emitter {
@@ -286,14 +520,137 @@
       }
     }
 
+    // Permite cambiar en caliente el bitrate/perfil de voz (10 kbps <-> 18 kbps <-> 28 kbps)
+    // según la velocidad de conexión detectada SIN cerrar el micrófono ni cortar la voz.
+    actualizarPresetAudio(opts) {
+      if (typeof this._actualizarBitrateMic === 'function') {
+        this._actualizarBitrateMic(opts);
+        return true;
+      }
+      return false;
+    }
+
     _iniciarEnvioVozMumble(mediaStreamTrack, pub, opts) {
-      // Frecuencia de muestreo: 8000 Hz en perfil teléfono (~8 KB/s) o 12000 Hz en voz
-      const maxBr = (opts && opts.audioPreset && opts.audioPreset.maxBitrate) || 16000;
-      const targetRate = maxBr <= 12000 ? 8000 : 12000;
+      let maxBr = (opts && opts.audioPreset && opts.audioPreset.maxBitrate) || 18000;
       let actx = null;
       let proc = null;
       let srcNode = null;
-      let silencioCola = 0;
+      let opusEncoder = null;
+      let opusListo = false;
+      let opusTimestampUs = 0;
+
+      // Estado ADPCM y filtros anti-aliasing para respaldo universal
+      const adpcmState = { pred: 0, idx: 0, prevIn: 0 };
+      let filtroAA = crearFiltroPasaBajos(48000, 3600);
+
+      // Configurar / reconfigurar codificador Opus nativo en caliente
+      const configurarOpus = (nuevoBr) => {
+        maxBr = nuevoBr || 18000;
+        const cutoff = maxBr <= 11000 ? 2700 : (maxBr <= 20000 ? 3700 : 5400);
+        filtroAA = crearFiltroPasaBajos(48000, cutoff);
+        if (!SOPORTE_OPUS_TX || typeof window.AudioEncoder !== 'function') return;
+        try {
+          if (!opusEncoder || opusEncoder.state === 'closed') {
+            opusEncoder = new window.AudioEncoder({
+              output: (chunk) => {
+                if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
+                const n = chunk.byteLength;
+                if (n <= 0) return;
+                const rateCode = maxBr <= 11000 ? 10 : (maxBr <= 20000 ? 11 : 12);
+                const pkt = new Uint8Array(2 + n);
+                pkt[0] = FRAME_AUDIO;
+                pkt[1] = rateCode;
+                chunk.copyTo(pkt.subarray(2));
+                opusListo = true;
+                try { this._room._ws.send(pkt); } catch {}
+              },
+              error: () => {
+                opusListo = false;
+              },
+            });
+          }
+          const opusBitrate = maxBr <= 11000 ? 10000 : (maxBr <= 20000 ? 18000 : 28000);
+          try {
+            opusEncoder.configure({
+              codec: 'opus',
+              sampleRate: 48000,
+              numberOfChannels: 1,
+              bitrate: opusBitrate,
+              opus: {
+                application: 'voip',
+                frameDuration: 40000,
+                complexity: 5,
+                useinbandfec: true,
+              },
+            });
+            opusListo = true;
+          } catch {
+            opusEncoder.configure({
+              codec: 'opus',
+              sampleRate: 48000,
+              numberOfChannels: 1,
+              bitrate: opusBitrate,
+            });
+            opusListo = true;
+          }
+        } catch {
+          opusListo = false;
+        }
+      };
+
+      configurarOpus(maxBr);
+      this._actualizarBitrateMic = (nuevosOpts) => {
+        const br = (nuevosOpts && nuevosOpts.audioPreset && nuevosOpts.audioPreset.maxBitrate) || 18000;
+        if (br !== maxBr) configurarOpus(br);
+      };
+
+      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) por Opus y/o ADPCM
+      const enviarTrama40ms = (frame48k) => {
+        if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
+        if (this._room._ws.bufferedAmount > 36 * 1024) return;
+
+        let enviadoOpus = false;
+        if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
+          try {
+            const ad = new window.AudioData({
+              format: 'f32-planar',
+              sampleRate: 48000,
+              numberOfFrames: 1920,
+              numberOfChannels: 1,
+              timestamp: opusTimestampUs,
+              data: frame48k,
+            });
+            opusTimestampUs += 40000;
+            opusEncoder.encode(ad);
+            ad.close();
+            enviadoOpus = true;
+          } catch {
+            enviadoOpus = false;
+          }
+        }
+
+        // Si el navegador no tiene Opus o en la sala hay algún oyente sin Opus,
+        // enviamos la trama ADPCM filtrada con anti-aliasing (24/32/48 kbps)
+        const necesitaAdpcm = !enviadoOpus || !!this._room._haySinOpus;
+        if (necesitaAdpcm) {
+          // Factor exacto desde 48000 Hz: 8 -> 6000 Hz (24 kbps), 6 -> 8000 Hz (32 kbps), 4 -> 12000 Hz (48 kbps)
+          const decim = maxBr <= 11000 ? 8 : (maxBr <= 20000 ? 6 : 4);
+          const baseCode = maxBr <= 11000 ? 21 : (maxBr <= 20000 ? 22 : 23);
+          const rateCode = enviadoOpus ? (baseCode + 10) : baseCode; // 31..33 = respaldo simultáneo; 21..23 = primario
+          const outLen = (1920 / decim) | 0;
+          const sub = new Float32Array(outLen);
+          for (let i = 0; i < outLen; i++) {
+            let acc = 0;
+            const base = i * decim;
+            for (let k = 0; k < decim; k++) {
+              acc += filtroAA(frame48k[base + k]);
+            }
+            sub[i] = acc / decim;
+          }
+          const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode);
+          try { this._room._ws.send(pkt); } catch {}
+        }
+      };
 
       try {
         actx = new (window.AudioContext || window.webkitAudioContext)();
@@ -301,39 +658,99 @@
         srcNode = actx.createMediaStreamSource(ms);
         proc = actx.createScriptProcessor(2048, 1, 1);
         const inRate = actx.sampleRate || 48000;
-        const ratio = inRate / targetRate;
+        const stepIn = inRate / 48000;
+        const filtroHP = crearFiltroPasaAltos85Hz(inRate);
+
+        // Acumulador de 40 ms exactos (1920 muestras @ 48 kHz) con interpolación lineal continua
+        const frameBuf = new Float32Array(1920);
+        let frameFill = 0;
+        let inPhase = 0;
+        let lastInSample = 0;
+
+        // Estado VAD con pre-roll de 40 ms, piso de ruido adaptativo e histéresis suave
+        let prevFrame48k = new Float32Array(1920);
+        let tienePrevFrame = false;
+        let hablandoActivo = false;
+        let silencioCola = 0;
+        let noiseFloor = 0.0025;
 
         proc.onaudioprocess = (ev) => {
-          if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-          if (this._room._ws.bufferedAmount > 48 * 1024) return;
-          const input = ev.inputBuffer.getChannelData(0);
-
-          // Calcular energía RMS para Detector de Actividad de Voz (VAD)
-          let sum = 0;
-          for (let i = 0; i < input.length; i += 2) {
-            sum += input[i] * input[i];
+          if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) {
+            hablandoActivo = false;
+            silencioCola = 0;
+            return;
           }
-          const rms = Math.sqrt(sum / (input.length / 2));
-          if (rms > 0.012) {
-            silencioCola = 6; // mantener cola de ~250ms al terminar de hablar
-            this._room._marcarHablandoLocal(true);
-          } else if (silencioCola > 0) {
-            silencioCola--;
-          } else {
-            this._room._marcarHablandoLocal(false);
-            return; // En silencio no gastamos ni un byte de red móvil
+          const rawIn = ev.inputBuffer.getChannelData(0);
+          const nIn = rawIn.length;
+          if (nIn === 0) return;
+
+          // Filtrar retumbo (<85 Hz) y remuestrear con fase continua a 48000 Hz
+          const filtered = new Float32Array(nIn);
+          for (let i = 0; i < nIn; i++) {
+            filtered[i] = filtroHP(rawIn[i]);
           }
 
-          const outLen = Math.floor(input.length / ratio);
-          // Trama: [FRAME_AUDIO (1B)][código sampleRate: 1=8kHz, 2=12kHz (1B)][muestras µ-law]
-          const pkt = new Uint8Array(2 + outLen);
-          pkt[0] = FRAME_AUDIO;
-          pkt[1] = targetRate === 8000 ? 1 : 2;
-          for (let i = 0; i < outLen; i++) {
-            const idx = Math.min(input.length - 1, Math.floor(i * ratio));
-            pkt[2 + i] = linearToUlaw(input[idx]);
+          while (inPhase < nIn) {
+            const idx = inPhase | 0;
+            const frac = inPhase - idx;
+            const s0 = idx === 0 ? lastInSample : filtered[idx - 1];
+            const s1 = filtered[idx];
+            frameBuf[frameFill++] = s0 + frac * (s1 - s0);
+            inPhase += stepIn;
+
+            if (frameFill === 1920) {
+              frameFill = 0;
+              // Calcular energía RMS del bloque de 40 ms
+              let sum = 0;
+              for (let j = 0; j < 1920; j += 2) {
+                const v = frameBuf[j];
+                sum += v * v;
+              }
+              const rms = Math.sqrt(sum / 960);
+
+              // Actualizar piso de ruido suavemente durante silencio
+              if (!hablandoActivo && rms < noiseFloor * 1.8) {
+                noiseFloor = Math.max(0.0012, Math.min(0.0055, noiseFloor * 0.95 + rms * 0.05));
+              }
+              const umbralAbrir = Math.max(0.0055, noiseFloor * 2.5);
+              const umbralMantener = Math.max(0.0032, noiseFloor * 1.55);
+
+              if (rms >= (hablandoActivo ? umbralMantener : umbralAbrir)) {
+                if (!hablandoActivo) {
+                  hablandoActivo = true;
+                  // Enviar pre-roll de 40 ms con fade-in de 4 ms para no cortar la primera consonante
+                  if (tienePrevFrame) {
+                    const pre = new Float32Array(prevFrame48k);
+                    for (let k = 0; k < 192; k++) pre[k] *= (k / 192);
+                    enviarTrama40ms(pre);
+                  }
+                }
+                silencioCola = 10; // mantener 400 ms de cola entre palabras para no entrecortar frases
+                this._room._marcarHablandoLocal(true);
+                enviarTrama40ms(frameBuf);
+              } else if (silencioCola > 0) {
+                silencioCola--;
+                if (silencioCola === 0) {
+                  // Última trama de cola: aplicar fade-out suave a cero para evitar clic al callar
+                  const tail = new Float32Array(frameBuf);
+                  for (let k = 0; k < 1920; k++) tail[k] *= (1 - k / 1920);
+                  enviarTrama40ms(tail);
+                  hablandoActivo = false;
+                  this._room._marcarHablandoLocal(false);
+                } else {
+                  enviarTrama40ms(frameBuf);
+                }
+              } else {
+                hablandoActivo = false;
+                this._room._marcarHablandoLocal(false);
+              }
+
+              prevFrame48k.set(frameBuf);
+              tienePrevFrame = true;
+            }
           }
-          try { this._room._ws.send(pkt); } catch {}
+          inPhase -= nIn;
+          lastInSample = filtered[nIn - 1];
         };
 
         srcNode.connect(proc);
@@ -343,6 +760,9 @@
       }
 
       this._micCleanup = () => {
+        this._actualizarBitrateMic = null;
+        try { if (opusEncoder && opusEncoder.state !== 'closed') opusEncoder.close(); } catch {}
+        opusEncoder = null;
         try { if (proc) proc.disconnect(); } catch {}
         try { if (srcNode) srcNode.disconnect(); } catch {}
         try { if (actx) actx.close(); } catch {}
@@ -354,6 +774,8 @@
       let actx = null;
       let proc = null;
       let srcNode = null;
+      const adpcmState = { pred: 0, idx: 0, prevIn: 0 };
+      const filtroAA = crearFiltroPasaBajos(48000, 5200);
       try {
         this._room._ws.send(JSON.stringify({ t: 'audio_share_meta', activo: true, nombre: name }));
         actx = new (window.AudioContext || window.webkitAudioContext)();
@@ -370,15 +792,16 @@
           const input = ev.inputBuffer.getChannelData(0);
           let sum = 0;
           for (let i = 0; i < input.length; i += 4) sum += input[i] * input[i];
-          if (Math.sqrt(sum / (input.length / 4)) < 0.002) return;
+          if (Math.sqrt(sum / (input.length / 4)) < 0.0018) return;
 
           const outLen = Math.floor(input.length / ratio);
-          const pkt = new Uint8Array(2 + outLen);
-          pkt[0] = FRAME_AUDIO_SHARE;
-          pkt[1] = 2; // 12kHz
+          const sub = new Float32Array(outLen);
           for (let i = 0; i < outLen; i++) {
-            pkt[2 + i] = linearToUlaw(input[Math.min(input.length - 1, Math.floor(i * ratio))]);
+            const idx = Math.min(input.length - 1, Math.floor(i * ratio));
+            sub[i] = filtroAA(input[idx]);
           }
+          const pkt = codificarBloqueADPCM(sub, adpcmState, 23);
+          pkt[0] = FRAME_AUDIO_SHARE;
           try { this._room._ws.send(pkt); } catch {}
         };
         srcNode.connect(proc);
@@ -604,10 +1027,16 @@
       this._canMic = false;
       this._canCam = false;
       this._canPan = false;
+      this._haySinOpus = false;
       this._rxAudioCtx = null;
-      this._rxPipelines = new Map(); // key -> { ctx, dest, nextTime, pub, participant }
+      this._rxPipelines = new Map(); // sid -> pipeline continuo con ring buffer
       this._speakers = new Map();    // identity -> expireTs
       this._speakerTimer = null;
+      this._pingTimer = null;
+      this._rttMs = 90;
+      this._jitterMs = 15;
+      this._calidadActual = ConnectionQuality.Good;
+      this._buenasSeguidas = 0;
     }
 
     _asegurarRxAudioCtx() {
@@ -661,11 +1090,100 @@
           mic: this.localParticipant.isMicrophoneEnabled,
           cam: this.localParticipant.isCameraEnabled,
           pan: this.localParticipant.isScreenShareEnabled,
+          opusRx: SOPORTE_OPUS_RX,
         }));
       } catch {}
     }
 
+    // Evalúa en tiempo real la conexión del usuario (RTT, Jitter, cola del WebSocket
+    // y API NetworkInformation del celular) y emite ConnectionQualityChanged para
+    // auto-ajustar entre ~10 kbps (2G/lenta), ~18 kbps (normal) y ~28 kbps (buena).
+    _evaluarCalidadRed(rttMedido) {
+      if (typeof rttMedido === 'number' && rttMedido > 0 && rttMedido < 15000) {
+        const delta = Math.abs(rttMedido - this._rttMs);
+        this._jitterMs = this._jitterMs * 0.75 + delta * 0.25;
+        this._rttMs = this._rttMs * 0.7 + rttMedido * 0.3;
+      }
+
+      const navConn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+      const effType = navConn && navConn.effectiveType ? String(navConn.effectiveType) : '';
+      const downlink = navConn && typeof navConn.downlink === 'number' ? navConn.downlink : 10;
+      const saveData = !!(navConn && navConn.saveData);
+      const buf = (this._ws && this._ws.bufferedAmount) || 0;
+
+      let candidata = ConnectionQuality.Excellent;
+      if (
+        saveData ||
+        effType === 'slow-2g' ||
+        effType === '2g' ||
+        downlink < 0.35 ||
+        this._rttMs > 340 ||
+        this._jitterMs > 100 ||
+        buf > 16384
+      ) {
+        candidata = ConnectionQuality.Poor;
+      } else if (
+        effType === '3g' ||
+        downlink < 1.4 ||
+        this._rttMs > 145 ||
+        this._jitterMs > 40 ||
+        buf > 4096
+      ) {
+        candidata = ConnectionQuality.Good;
+      }
+
+      const orden = {
+        [ConnectionQuality.Poor]: 1,
+        [ConnectionQuality.Good]: 2,
+        [ConnectionQuality.Excellent]: 3,
+      };
+
+      if (orden[candidata] < orden[this._calidadActual]) {
+        // Si la red empeora, bajar de inmediato para que la voz jamás se corte
+        this._buenasSeguidas = 0;
+        this._calidadActual = candidata;
+        this.emit(RoomEvent.ConnectionQualityChanged, this._calidadActual, this.localParticipant);
+      } else if (orden[candidata] > orden[this._calidadActual]) {
+        // Si la red mejora, esperar 3 mediciones estables (~9 s) antes de subir el bitrate
+        this._buenasSeguidas++;
+        if (this._buenasSeguidas >= 3) {
+          this._buenasSeguidas = 0;
+          this._calidadActual = candidata;
+          this.emit(RoomEvent.ConnectionQualityChanged, this._calidadActual, this.localParticipant);
+        }
+      } else {
+        this._buenasSeguidas = 0;
+      }
+    }
+
+    _iniciarMonitorRed() {
+      if (this._pingTimer) clearInterval(this._pingTimer);
+      // Evaluación inicial inmediata según el tipo de red móvil reportado por el navegador
+      this._evaluarCalidadRed();
+      this.emit(RoomEvent.ConnectionQualityChanged, this._calidadActual, this.localParticipant);
+
+      const enviarPing = () => {
+        if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+        if (this._ws.bufferedAmount > 16384) {
+          this._evaluarCalidadRed(420);
+        }
+        try {
+          this._ws.send(JSON.stringify({ t: 'ping_net', ts: Math.round(performance.now()) }));
+        } catch {}
+      };
+      setTimeout(enviarPing, 600);
+      this._pingTimer = setInterval(enviarPing, 3200);
+
+      const navConn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+      if (navConn && typeof navConn.addEventListener === 'function') {
+        this._onNetChange = () => this._evaluarCalidadRed();
+        navConn.addEventListener('change', this._onNetChange);
+      }
+    }
+
     async connect(baseUrl, token) {
+      await promesaDeteccionOpus;
+
       // Decodificar identidad y nombre del token (base64url antes del punto)
       try {
         const b64 = token.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
@@ -679,7 +1197,7 @@
 
       const sala = (window.S && window.S.sala) || new URLSearchParams(location.search).get('sala') || '';
       const wsBase = (baseUrl || location.origin).replace(/^http/, 'ws').replace(/\/$/, '');
-      const wsUrl = `${wsBase}/api/salas/${encodeURIComponent(sala)}/media?token=${encodeURIComponent(token)}`;
+      const wsUrl = `${wsBase}/api/salas/${encodeURIComponent(sala)}/media?token=${encodeURIComponent(token)}&opus=${SOPORTE_OPUS_RX ? 1 : 0}`;
 
       await new Promise((resolve, reject) => {
         let conectado = false;
@@ -698,6 +1216,8 @@
           conectado = true;
           clearTimeout(timeout);
           this._speakerTimer = setInterval(() => this._actualizarSpeakers(), 300);
+          this._iniciarMonitorRed();
+          this._enviarEstadoMedia();
           this.emit(RoomEvent.ConnectionStateChanged, 'connected');
           resolve();
         };
@@ -723,6 +1243,10 @@
             clearInterval(this._speakerTimer);
             this._speakerTimer = null;
           }
+          if (this._pingTimer) {
+            clearInterval(this._pingTimer);
+            this._pingTimer = null;
+          }
           if (!conectado) {
             reject(new Error('Conexión cerrada antes de iniciar'));
             return;
@@ -744,6 +1268,18 @@
         clearInterval(this._speakerTimer);
         this._speakerTimer = null;
       }
+      if (this._pingTimer) {
+        clearInterval(this._pingTimer);
+        this._pingTimer = null;
+      }
+      const navConn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+      if (navConn && this._onNetChange && typeof navConn.removeEventListener === 'function') {
+        navConn.removeEventListener('change', this._onNetChange);
+        this._onNetChange = null;
+      }
+      for (const sid of [...this._rxPipelines.keys()]) {
+        this._limpiarPipelineRemoto(sid);
+      }
       if (this._ws) {
         const ws = this._ws;
         this._ws = null;
@@ -759,6 +1295,13 @@
       let m;
       try { m = JSON.parse(raw); } catch { return; }
       switch (m.t) {
+        case 'pong_net':
+          if (typeof m.ts === 'number') {
+            const rtt = performance.now() - m.ts;
+            this._evaluarCalidadRed(rtt);
+          }
+          break;
+
         case 'bienvenida':
           this.localParticipant.identity = m.identidad || this.localParticipant.identity;
           this._canMic = !!m.canMic;
@@ -800,6 +1343,9 @@
           break;
 
         case 'peers':
+          if (typeof m.haySinOpus === 'boolean') {
+            this._haySinOpus = m.haySinOpus;
+          }
           this._sincronizarPeers(m.peers || []);
           break;
 
@@ -817,6 +1363,7 @@
           if (!m.activo) {
             const pub = p.pubs.get(TrackSource.ScreenShareAudio);
             if (pub) {
+              this._limpiarPipelineRemoto(pub.trackSid);
               p.pubs.delete(TrackSource.ScreenShareAudio);
               this.emit(RoomEvent.TrackUnsubscribed, pub.track, pub, p);
             }
@@ -903,6 +1450,7 @@
       for (const [id, p] of [...this.remoteParticipants.entries()]) {
         if (!vistos.has(id)) {
           for (const pub of p.pubs.values()) {
+            this._limpiarPipelineRemoto(pub.trackSid);
             this.emit(RoomEvent.TrackUnsubscribed, pub.track, pub, p);
           }
           p.pubs.clear();
@@ -913,20 +1461,188 @@
       this.emit(RoomEvent.ConnectionStateChanged, 'connected');
     }
 
+    _limpiarPipelineRemoto(sid) {
+      const pipe = this._rxPipelines.get(sid);
+      if (!pipe) return;
+      this._rxPipelines.delete(sid);
+      try { if (pipe.opusDecoder && pipe.opusDecoder.state !== 'closed') pipe.opusDecoder.close(); } catch {}
+      try { if (pipe.proc) pipe.proc.disconnect(); } catch {}
+    }
+
+    // Crea un pipeline receptor continuo basado en un Ring Buffer circular con
+    // pre-buffering adaptativo al jitter (90–240 ms) e interpolación continua
+    // entre paquetes. Elimina al 100% el ruido de bordes ("basurita") y los
+    // micro-cortes de createBufferSource() por paquete.
     _asegurarAudioRemoto(p, source, nombre) {
       let pub = p.pubs.get(source);
       if (pub) return pub;
 
       const ctx = this._asegurarRxAudioCtx();
+      const ctxRate = ctx.sampleRate || 48000;
       const dest = ctx.createMediaStreamDestination();
       const msTrack = dest.stream.getAudioTracks()[0];
       const track = new MediaTrack('audio', source, msTrack);
       const sid = 'TR_' + source + '_' + p.identity;
       pub = new TrackPublication(source, track, sid, nombre);
       p.pubs.set(source, pub);
-      this._rxPipelines.set(sid, { ctx, dest, nextTime: 0, pub, p });
+
+      // Ring buffer de 2.5 segundos a la frecuencia nativa del AudioContext
+      const cap = Math.ceil(ctxRate * 2.5);
+      const pipe = {
+        ctx,
+        ctxRate,
+        dest,
+        pub,
+        p,
+        ring: new Float32Array(cap),
+        cap,
+        writePos: 0,
+        readPos: 0,
+        available: 0,
+        playing: false,
+        fadeInPos: 0,
+        fadeInLen: Math.ceil(ctxRate * 0.006), // 6 ms fade-in suave al arrancar frase
+        lastOutSample: 0,
+        underrunSamples: 0,
+        // Estado de remuestreo continuo entre paquetes consecutivos
+        rxPhase: 0,
+        rxLastInSample: 0,
+        rxHasLast: false,
+        // Estado de jitter adaptativo
+        lastArrivalMs: 0,
+        jitterMs: 25,
+        targetPrebuffer: Math.ceil(ctxRate * 0.11), // 110 ms inicial
+        maxBuffer: Math.ceil(ctxRate * 0.42),       // 420 ms tope antes de recortar latencia
+        deemphState: { yPrev: 0 },
+        opusDecoder: null,
+        opusTimestampUs: 0,
+        proc: null,
+      };
+
+      const proc = ctx.createScriptProcessor(1024, 1, 1);
+      proc.onaudioprocess = (ev) => {
+        const out = ev.outputBuffer.getChannelData(0);
+        const n = out.length;
+
+        if (!pipe.playing) {
+          if (pipe.available >= pipe.targetPrebuffer) {
+            pipe.playing = true;
+            pipe.fadeInPos = 0;
+            pipe.underrunSamples = 0;
+          } else {
+            // Todavía acumulando colchón inicial de jitter
+            for (let i = 0; i < n; i++) out[i] = 0;
+            return;
+          }
+        }
+
+        const ring = pipe.ring;
+        const capLocal = pipe.cap;
+        for (let i = 0; i < n; i++) {
+          if (pipe.available > 0) {
+            let s = ring[pipe.readPos];
+            pipe.readPos = (pipe.readPos + 1) % capLocal;
+            pipe.available--;
+            if (pipe.fadeInPos < pipe.fadeInLen) {
+              s *= (pipe.fadeInPos / pipe.fadeInLen);
+              pipe.fadeInPos++;
+            }
+            out[i] = s;
+            pipe.lastOutSample = s;
+            pipe.underrunSamples = 0;
+          } else {
+            // Si falta un paquete por retraso momentáneo en 2G/3G, decaer suavemente
+            // a cero en lugar de producir un escalón brusco (clic)
+            pipe.lastOutSample *= 0.965;
+            if (Math.abs(pipe.lastOutSample) < 0.0001) pipe.lastOutSample = 0;
+            out[i] = pipe.lastOutSample;
+            pipe.underrunSamples++;
+            // Tras ~55 ms sin datos, volver a modo pre-buffer para la siguiente frase
+            if (pipe.underrunSamples > pipe.ctxRate * 0.055) {
+              pipe.playing = false;
+              for (let k = i + 1; k < n; k++) out[k] = 0;
+              break;
+            }
+          }
+        }
+      };
+
+      proc.connect(dest);
+      pipe.proc = proc;
+      this._rxPipelines.set(sid, pipe);
       this.emit(RoomEvent.TrackSubscribed, track, pub, p);
       return pub;
+    }
+
+    // Remuestrea continuamente y empuja un bloque decodificado al Ring Buffer
+    // adaptando el colchón de jitter según la estabilidad de llegada de los paquetes.
+    _empujarMuestrasRemotas(pipe, samples, inRate, fromId, ftipo) {
+      if (!samples || samples.length === 0) return;
+      const nowMs = performance.now();
+      const durMs = (samples.length / inRate) * 1000;
+      if (pipe.lastArrivalMs > 0) {
+        const deltaMs = nowMs - pipe.lastArrivalMs;
+        if (deltaMs < 350) {
+          const jit = Math.abs(deltaMs - durMs);
+          pipe.jitterMs = pipe.jitterMs * 0.88 + jit * 0.12;
+          // Colchón adaptativo entre 95 ms (red limpia) y 240 ms (red móvil con ráfagas TCP)
+          const targetMs = Math.max(95, Math.min(240, 85 + pipe.jitterMs * 2.2));
+          pipe.targetPrebuffer = Math.ceil(pipe.ctxRate * (targetMs / 1000));
+          pipe.maxBuffer = pipe.targetPrebuffer + Math.ceil(pipe.ctxRate * 0.28);
+        } else {
+          // Nueva frase tras silencio: reiniciar interpolador
+          pipe.rxHasLast = false;
+          pipe.rxPhase = 0;
+        }
+      }
+      pipe.lastArrivalMs = nowMs;
+
+      // Si se acumularon demasiados paquetes por un atasco TCP previo, hacer crossfade
+      // suave descartando el exceso más antiguo para mantener tiempo real sin clics
+      if (pipe.available > pipe.maxBuffer) {
+        const drop = pipe.available - pipe.targetPrebuffer;
+        pipe.readPos = (pipe.readPos + drop) % pipe.cap;
+        pipe.available -= drop;
+        pipe.fadeInPos = 0;
+      }
+
+      const step = inRate / pipe.ctxRate;
+      const nIn = samples.length;
+      const ring = pipe.ring;
+      const cap = pipe.cap;
+      let sum = 0;
+
+      if (!pipe.rxHasLast) {
+        pipe.rxLastInSample = samples[0];
+        pipe.rxHasLast = true;
+        pipe.rxPhase = 0;
+      }
+
+      while (pipe.rxPhase < nIn) {
+        const idx = pipe.rxPhase | 0;
+        const frac = pipe.rxPhase - idx;
+        const s0 = idx === 0 ? pipe.rxLastInSample : samples[idx - 1];
+        const s1 = samples[idx];
+        const val = s0 + frac * (s1 - s0);
+
+        if (pipe.available < cap) {
+          ring[pipe.writePos] = val;
+          pipe.writePos = (pipe.writePos + 1) % cap;
+          pipe.available++;
+        }
+        pipe.rxPhase += step;
+      }
+      pipe.rxPhase -= nIn;
+      pipe.rxLastInSample = samples[nIn - 1];
+
+      for (let i = 0; i < nIn; i += 4) {
+        sum += samples[i] * samples[i];
+      }
+      const rms = Math.sqrt(sum / Math.max(1, Math.ceil(nIn / 4)));
+      if (ftipo === FRAME_AUDIO && rms > 0.008) {
+        this._speakers.set(fromId, Date.now() + 650);
+        this._actualizarSpeakers();
+      }
     }
 
     _asegurarVideoRemoto(p, source, width, height) {
@@ -966,8 +1682,6 @@
       if (ftipo === FRAME_AUDIO || ftipo === FRAME_AUDIO_SHARE) {
         if (payload.length < 2) return;
         const rateCode = payload[0];
-        const sampleRate = rateCode === 1 ? 8000 : 12000;
-        const samples = payload.subarray(1);
 
         const source = ftipo === FRAME_AUDIO_SHARE ? TrackSource.ScreenShareAudio : TrackSource.Microphone;
         const pub = this._asegurarAudioRemoto(p, source, ftipo === FRAME_AUDIO_SHARE ? '🎵 Audio' : 'microfono');
@@ -978,31 +1692,58 @@
 
         const pipe = this._rxPipelines.get(pub.trackSid);
         if (!pipe) return;
-        const ctx = this._asegurarRxAudioCtx();
-        const audioBuf = ctx.createBuffer(1, samples.length, sampleRate);
-        const ch = audioBuf.getChannelData(0);
-        let sum = 0;
+        this._asegurarRxAudioCtx();
+
+        // 1. Trama Opus nativa ultraligera (10 kbps / 18 kbps / 28 kbps)
+        if (rateCode >= 10 && rateCode <= 19) {
+          if (!SOPORTE_OPUS_RX || typeof window.AudioDecoder !== 'function') return;
+          try {
+            if (!pipe.opusDecoder || pipe.opusDecoder.state === 'closed') {
+              pipe.opusDecoder = new window.AudioDecoder({
+                output: (audioData) => {
+                  const sRate = audioData.sampleRate || 48000;
+                  const pcm = extraerFloat32DeAudioData(audioData);
+                  audioData.close();
+                  this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo);
+                },
+                error: () => {},
+              });
+              pipe.opusDecoder.configure({
+                codec: 'opus',
+                sampleRate: 48000,
+                numberOfChannels: 1,
+              });
+            }
+            const opusBytes = payload.subarray(1);
+            const chunk = new window.EncodedAudioChunk({
+              type: 'key',
+              timestamp: pipe.opusTimestampUs,
+              duration: 40000,
+              data: opusBytes,
+            });
+            pipe.opusTimestampUs += 40000;
+            pipe.opusDecoder.decode(chunk);
+          } catch {}
+          return;
+        }
+
+        // 2. Trama IMA-ADPCM de 4 bits con pre/de-énfasis (24 kbps / 32 kbps / 48 kbps)
+        if (rateCode >= 20 && rateCode <= 39) {
+          const baseCode = rateCode >= 30 ? (rateCode - 10) : rateCode;
+          const sampleRate = baseCode === 21 ? 6000 : (baseCode === 22 ? 8000 : (baseCode === 23 ? 12000 : 16000));
+          const pcm = decodificarBloqueADPCM(payload, pipe.deemphState);
+          this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo);
+          return;
+        }
+
+        // 3. Retrocompatibilidad con tramas µ-law antiguas (rateCode 1 = 8kHz, 2 = 12kHz)
+        const sampleRate = rateCode === 1 ? 8000 : 12000;
+        const samples = payload.subarray(1);
+        const pcm = new Float32Array(samples.length);
         for (let i = 0; i < samples.length; i++) {
-          const v = ulawDecodeTable[samples[i]];
-          ch[i] = v;
-          sum += v * v;
+          pcm[i] = ulawDecodeTable[samples[i]];
         }
-        const src = ctx.createBufferSource();
-        src.buffer = audioBuf;
-        src.connect(pipe.dest);
-
-        // Jitter buffer adaptativo ligero (60ms de colchón para redes móviles)
-        const now = ctx.currentTime;
-        if (pipe.nextTime < now || pipe.nextTime > now + 0.45) {
-          pipe.nextTime = now + 0.06;
-        }
-        src.start(pipe.nextTime);
-        pipe.nextTime += audioBuf.duration;
-
-        if (ftipo === FRAME_AUDIO && Math.sqrt(sum / samples.length) > 0.015) {
-          this._speakers.set(fromId, Date.now() + 650);
-          this._actualizarSpeakers();
-        }
+        this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo);
         return;
       }
 

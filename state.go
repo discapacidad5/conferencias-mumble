@@ -112,11 +112,12 @@ func NewHub() *Hub {
 
 func nuevoEstado() *EstadoSala {
 	// En la edición Mumble para conexiones lentas, por defecto CamAudiencia y
-	// CamAsientos nacen en true (solo Asiento 1 y Palabra publican video).
+	// CamAsientos nacen en true (solo Asiento 1 y Palabra publican video) y el
+	// perfil de audio nace en "auto" (adapta entre ~10, 18 y 26 kbps según la red).
 	return &EstadoSala{
 		Rejilla:      "asientos",
 		VistaFija:    true,
-		AudioPerfil:  "telefono",
+		AudioPerfil:  "auto",
 		CamAudiencia: true,
 		CamAsientos:  true,
 		votantes:     map[string]int8{},

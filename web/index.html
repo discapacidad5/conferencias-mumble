@@ -12,8 +12,8 @@
 <meta name="apple-mobile-web-app-title" content="Conferencia">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
-<link rel="stylesheet" href="/styles.css?v=109">
-<script src="/mumble-engine.js?v=109"></script>
+<link rel="stylesheet" href="/styles.css?v=110">
+<script src="/mumble-engine.js?v=110"></script>
 </head>
 <body>
 
@@ -406,9 +406,10 @@
     <button id="mod-terminar" class="btn mini peligro" style="margin-top:.5rem">🔴 Terminar la reunión para todos</button>
     <label class="fila" style="align-items:center">Calidad de audio de la sala
       <select id="mod-audio" class="mini">
-        <option value="telefono">Teléfono (12 kbps, máximo ahorro)</option>
-        <option value="voz">Voz (24 kbps)</option>
-        <option value="musica">Música (estéreo HQ)</option>
+        <option value="auto">Automática (10–28 kbps según conexión de cada quien)</option>
+        <option value="telefono">Teléfono (10 kbps, forzar máximo ahorro en la sala)</option>
+        <option value="voz">Voz nítida (hasta 18 kbps)</option>
+        <option value="musica">Alta nitidez (hasta 28 kbps)</option>
       </select>
     </label>
     <div class="tabs">
@@ -455,10 +456,10 @@
     <label>Altavoces <select id="aj-spk"></select></label>
     <label>Calidad de tu micrófono
       <select id="aj-calidad">
-        <option value="auto">Automática (según tu conexión)</option>
-        <option value="telefono">Teléfono (ahorro de datos)</option>
-        <option value="voz">Voz</option>
-        <option value="musica">Música</option>
+        <option value="auto">Automática (según tu conexión: 10–28 kbps)</option>
+        <option value="telefono">Teléfono (10 kbps, ahorro máximo 2G/3G)</option>
+        <option value="voz">Voz nítida (18 kbps)</option>
+        <option value="musica">Alta nitidez (28 kbps)</option>
       </select>
     </label>
     <label>Ganancia del micrófono <span id="aj-gan-val" class="muted"></span>
@@ -504,6 +505,6 @@
   <button id="nav-tip-x" class="btn mini" aria-label="Cerrar">✕</button>
 </div>
 <div id="toast-wrap"></div>
-<script src="/app.js?v=109"></script>
+<script src="/app.js?v=110"></script>
 </body>
 </html>
