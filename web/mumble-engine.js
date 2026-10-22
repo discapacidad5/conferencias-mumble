@@ -154,8 +154,13 @@
     }
 
     stop() {
-      if (this.mediaStreamTrack && this.mediaStreamTrack.stop) {
-        try { this.mediaStreamTrack.stop(); } catch {}
+      if (this.mediaStreamTrack) {
+        if (this.mediaStreamTrack._rawStream) {
+          try { this.mediaStreamTrack._rawStream.getTracks().forEach(t => t.stop()); } catch {}
+        }
+        if (this.mediaStreamTrack.stop) {
+          try { this.mediaStreamTrack.stop(); } catch {}
+        }
       }
     }
 
@@ -765,6 +770,13 @@
           this._canMic = !!m.canMic;
           this._canCam = !!m.canCam;
           this._canPan = !!m.canPan;
+          if (!this._canMic) {
+            const mp = this.localParticipant.getTrackPublication(TrackSource.Microphone);
+            if (mp) {
+              if (mp.track) mp.track.stop();
+              this.localParticipant.unpublishTrack(mp.track).catch(() => {});
+            }
+          }
           if (!this._canCam && this.localParticipant.isCameraEnabled) {
             this.localParticipant.setCameraEnabled(false).catch(() => {});
           }
@@ -777,7 +789,10 @@
         case 'forzar_mute':
           if (m.mic) {
             const mp = this.localParticipant.getTrackPublication(TrackSource.Microphone);
-            if (mp) mp.mute().catch(() => {});
+            if (mp) {
+              if (mp.track) mp.track.stop();
+              this.localParticipant.unpublishTrack(mp.track).catch(() => {});
+            }
           }
           if (m.cam && this.localParticipant.isCameraEnabled) {
             this.localParticipant.setCameraEnabled(false).catch(() => {});

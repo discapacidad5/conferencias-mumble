@@ -84,9 +84,9 @@ function toast(msg, ms = 5000, cls = '') {
 }
 function cerrarModal(id) {
   document.getElementById(id).classList.add('oculto');
-  // fuera de la sala el medidor era solo una prueba; dentro se mantiene
-  // para el indicador gris de "hablas silenciado"
-  if (id === 'modal-ajustes' && !S.room) detenerMedidor();
+  // al cerrar ajustes se libera siempre el medidor para no dejar el
+  // micrófono del teléfono ocupado cuando estás silenciado o de pie
+  if (id === 'modal-ajustes') detenerMedidor();
 }
 function abrirModal(id) {
   document.getElementById(id).classList.remove('oculto');
@@ -998,20 +998,15 @@ async function entrar() {
       } catch {}
     }
 
-    // el micro también se decide al entrar: si la sala lo prohíbe, el
-    // servidor lo rechaza/silencia y queda apagado igualmente
+    // soltar siempre el medidor y la vista previa del prejoin al entrar:
+    // si estás de pie o silenciado, el hardware del micrófono debe quedar
+    // 100% libre para otras apps del teléfono
+    detenerMedidor();
+    if (S.previewStream) { S.previewStream.getTracks().forEach(t => t.stop()); S.previewStream = null; }
     S.audio.liberar = $('#pj-mic-btn').classList.contains('off');
-    if (!S.audio.liberar) {
-      // entra por el pipeline para que el micro lleve ganancia/perfil y se
-      // pueda silenciar y liberar igual que durante la sala
+    if (!S.audio.liberar && (estoySentado() || tengoPalabra())) {
       try { await activarMic(true); } catch {}
-    } else {
-      detenerMedidor(); // entra sin micro: suelta la captura del prejoin
     }
-
-    if (S.previewStream) S.previewStream.getTracks().forEach(t => t.stop());
-    // el medidor sigue vivo en la sala: alimenta el indicador gris
-    // de "hablas con el micro silenciado"
 
     entrarVistaSala();
   } catch (e) {
@@ -1100,7 +1095,6 @@ function entrarVistaSala() {
     'Guardar');
   cablearAjustes();
   cablearPanel();
-  if (!S.audio.liberar && !S.micAnalyser && !S.audio.analyser) arrancarMedidor();
   if (!nivelRAF) nivelRAF = requestAnimationFrame(loopNivel);
   window.addEventListener('beforeunload', beaconSalir);
   // cronómetro de la palabra + avisos a quien habla (2'/1'/30" toast;
@@ -3649,14 +3643,21 @@ async function iniciarGrabacion() {
 
 /* ---------- pipeline de audio: micro → ganancia → analyser → publicación ---------- */
 async function construirMicTrack() {
+  // Asegurar que cualquier stream anterior quede cerrado antes de abrir otro
+  if (S.audio.rawStream) {
+    S.audio.rawStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    S.audio.rawStream = null;
+  }
+  if (S.audio.ctx) {
+    S.audio.ctx.close().catch(() => {});
+    S.audio.ctx = null;
+  }
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: S.dev.mic ? { exact: S.dev.mic } : undefined,
       echoCancellation: S.audio.ec,
       noiseSuppression: S.audio.ns,
       autoGainControl: S.audio.agc,
-      // mono: la captura estéreo confunde la cancelación de eco en muchos
-      // teléfonos con altavoz — con 1 canal el AEC funciona mejor
       channelCount: 1,
     },
   });
@@ -3672,7 +3673,9 @@ async function construirMicTrack() {
   S.audio.analyser = an;
   S.audio.gain = gain;
   S.audio.rawStream = stream;
-  return dest.stream.getAudioTracks()[0];
+  const outTrack = dest.stream.getAudioTracks()[0];
+  if (outTrack) outTrack._rawStream = stream;
+  return outTrack;
 }
 
 function cerrarPipeline() {
