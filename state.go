@@ -193,6 +193,26 @@ func (sv *salaViva) broadcast(ev *Evento) {
 		default:
 		}
 	}
+	// También empujar el estado en tiempo real por el WebSocket activo (/media)
+	// para que ningún proxy ni Service Worker retrase los cambios de asientos.
+	if media != nil {
+		r := media.room(sv.nombre)
+		r.mu.RLock()
+		clientes := make([]*clienteWS, 0, len(r.clientes))
+		for _, c := range r.clientes {
+			clientes = append(clientes, c)
+		}
+		r.mu.RUnlock()
+		for _, c := range clientes {
+			b, err := marshalEstadoPara(sv, ev, c.identidad)
+			if err != nil {
+				continue
+			}
+			env := append([]byte(`{"t":"estado_push","d":`), b...)
+			env = append(env, '}')
+			c.enviarCtrl(append([]byte{1}, env...))
+		}
+	}
 }
 
 // --- estado por grupo ---

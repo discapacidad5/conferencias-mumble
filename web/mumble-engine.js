@@ -788,6 +788,12 @@
           this._sincronizarPeers(m.peers || []);
           break;
 
+        case 'estado_push':
+          if (m.d && typeof window.aplicarEstado === 'function') {
+            try { window.aplicarEstado(m.d, 'sse'); } catch {}
+          }
+          break;
+
         case 'audio_share_meta': {
           const from = m.from;
           if (!from || from === this.localParticipant.identity) break;

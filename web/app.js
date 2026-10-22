@@ -177,9 +177,14 @@ async function api(path, body, opts = {}) {
 const accion = async (tipo, asiento, extra = {}) => {
   const r = await api(`/api/salas/${S.sala}/accion`, { tipo, asiento, ...extra });
   comprobarInstancia(r.instancia);
+  refrescarEstado();
   return r;
 };
-const moderar = (tipo, extra = {}) => api(`/api/salas/${S.sala}/moderar`, { tipo, ...extra });
+const moderar = async (tipo, extra = {}) => {
+  const r = await api(`/api/salas/${S.sala}/moderar`, { tipo, ...extra });
+  refrescarEstado();
+  return r;
+};
 const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 function mostrar(vistaId) {
@@ -1356,6 +1361,7 @@ function aplicarEstado(d, fuente = 'http') {
   chequearGrupo();
   renderInvitacion();
 }
+window.aplicarEstado = aplicarEstado;
 
 let consultandoEstado = false;
 async function refrescarEstado() {
@@ -1367,13 +1373,28 @@ async function refrescarEstado() {
   finally { consultandoEstado = false; }
 }
 
+let sseTimer = null;
+function abrirEventSource() {
+  if (S.evt) { try { S.evt.close(); } catch {} }
+  if (!S.sala || !S.token || S.saliendo) return;
+  const evt = new EventSource(`/api/salas/${S.sala}/eventos?token=${S.token}`);
+  S.evt = evt;
+  evt.onmessage = (m) => aplicarEstado(JSON.parse(m.data), 'sse');
+  evt.onerror = () => {
+    refrescarEstado();
+    if (evt.readyState === 2 && !S.saliendo) {
+      setTimeout(() => { if (S.evt === evt && !S.saliendo) abrirEventSource(); }, 1500);
+    }
+  };
+}
 function conectarSSE() {
-  S.evt = new EventSource(`/api/salas/${S.sala}/eventos?token=${S.token}`);
-  S.evt.onmessage = (m) => aplicarEstado(JSON.parse(m.data), 'sse');
-  S.evt.onerror = () => { /* EventSource reintenta solo */ refrescarEstado(); };
-  setInterval(() => {
-    if (Date.now() - S.estadoRecibido > 15000) refrescarEstado();
-  }, 5000);
+  abrirEventSource();
+  if (!sseTimer) {
+    sseTimer = setInterval(() => {
+      if (S.evt && S.evt.readyState === 2 && !S.saliendo) abrirEventSource();
+      if (Date.now() - S.estadoRecibido > 15000) refrescarEstado();
+    }, 5000);
+  }
 }
 
 function manejarEvento(ev) {
