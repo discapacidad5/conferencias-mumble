@@ -623,7 +623,10 @@
       } else {
         this._speakers.delete(id);
       }
-      this._actualizarSpeakers();
+      if (this._localHablando !== hablando) {
+        this._localHablando = hablando;
+        this._actualizarSpeakers();
+      }
     }
 
     _actualizarSpeakers() {
@@ -639,6 +642,9 @@
           this._speakers.delete(id);
         }
       }
+      const clave = activos.map(p => p.identity).join(',');
+      if (clave === this._ultSpeakersClave) return;
+      this._ultSpeakersClave = clave;
       this.emit(RoomEvent.ActiveSpeakersChanged, activos);
     }
 

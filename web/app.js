@@ -1888,8 +1888,22 @@ function cablearRoom(room) {
     if (S.prefAudio === 'auto' && S.audio.pub) reconstruirMic();
   });
   room.on(LC.RoomEvent.ActiveSpeakersChanged, (speakers) => {
-    S.activo = speakers.length ? speakers[0].identity : null;
-    renderTodo();
+    const nuevo = speakers.length ? speakers[0].identity : null;
+    if (nuevo === S.activo) return;
+    S.activo = nuevo;
+    // Actualizar el borde verde en caliente SIN reconstruir el DOM de los
+    // asientos: si se llamara renderTodo() al hablar, innerHTML='' destruiría
+    // el <div class="asiento"> bajo el dedo y se tragaría el clic/tap.
+    $$('.asiento[data-id]').forEach(el => {
+      el.style.borderColor = el.dataset.id === S.activo ? 'var(--verde)' : '';
+    });
+    $$('#audiencia .mini-tile').forEach(el => {
+      el.classList.toggle('hablando', el.dataset.id === S.activo);
+    });
+    $$('.tile[data-id]').forEach(el => {
+      el.classList.toggle('hablando', el.dataset.id === S.activo);
+    });
+    if (!$('#z-orador').classList.contains('oculto')) renderOrador();
   });
   room.on(LC.RoomEvent.DataReceived, (payload, participant) => {
     let d;
