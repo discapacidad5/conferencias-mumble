@@ -1,0 +1,509 @@
+﻿<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conferencia</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0e1117">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Conferencia">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" href="/icon-192.png">
+<link rel="stylesheet" href="/styles.css?v=106">
+<script src="/mumble-engine.js?v=106"></script>
+</head>
+<body>
+
+<!-- ============ PORTADA (sin sala en URL) ============ -->
+<section id="vista-portada" class="vista oculto">
+  <div class="tarjeta centro">
+    <h1>Conferencias</h1>
+    <p class="muted">Introduce el nombre de la sala o usa el enlace que te compartieron.</p>
+    <div class="fila">
+      <input id="p-sala" placeholder="nombre-de-sala" autocomplete="off">
+      <button id="p-ir" class="btn prim">Ir a la sala</button>
+    </div>
+    <div class="fila">
+      <input id="p-enlace" placeholder="o pega aquí el enlace completo" autocomplete="off">
+      <button id="p-ir-enlace" class="btn">Abrir enlace</button>
+    </div>
+    <hr>
+    <div id="p-admin-zone"></div>
+  </div>
+</section>
+
+<!-- ============ ELEGIR ENTRADA (móvil con ?sala=) ============ -->
+<section id="vista-entrada" class="vista oculto">
+  <div class="tarjeta centro">
+    <h1 id="e-titulo">Sala</h1>
+    <p id="e-sub" class="muted"></p>
+    <div id="e-prog" class="oculto">
+      <svg class="e-prog-ring" viewBox="0 0 64 64" role="img" aria-label="Instalando">
+        <circle class="e-prog-fondo" cx="32" cy="32" r="26"/>
+        <circle class="e-prog-fill" cx="32" cy="32" r="26"/>
+      </svg>
+      <p id="e-prog-txt">Instalando la app…</p>
+      <p class="muted e-prog-sub">Android la está añadiendo a tu pantalla de inicio — esto puede tardar hasta un minuto.</p>
+    </div>
+    <button id="e-app" class="btn prim grande oculto">Abrir en la app</button>
+    <button id="e-web" class="btn grande">Abrir en el navegador</button>
+    <p class="muted" style="font-size:.8rem">La app abre la sala a pantalla completa, sin barra del navegador.</p>
+  </div>
+</section>
+
+<!-- ============ DASHBOARD ADMIN ============ -->
+<section id="vista-admin" class="vista oculto">
+  <div class="tarjeta ancho">
+    <div class="fila spread">
+      <h1>Panel de administración</h1>
+      <div>
+        <span id="a-usuario" class="muted"></span>
+        <button id="a-salir" class="btn peligro">Cerrar sesión</button>
+      </div>
+    </div>
+    <div class="fila">
+      <button id="a-salas-btn" class="btn prim">🚪 Administrar salas</button>
+    </div>
+    <hr>
+    <h2>Servidor de Voz Mumble (Local o Público Remoto)</h2>
+    <p class="muted" style="font-size:.85rem">Elige si las salas usan el servidor Mumble local (instalado en este equipo/Docker) o cualquier servidor Mumble público gratuito en Internet.</p>
+    <div class="fila" style="flex-wrap:wrap;gap:.5rem">
+      <label style="flex:1;min-width:210px">Modo de conexión Mumble
+        <select id="mumble-modo">
+          <option value="local">🏠 Servidor Mumble Local (en este servidor)</option>
+          <option value="remoto">🌐 Servidor Mumble Público / Remoto en Internet</option>
+        </select>
+      </label>
+      <label id="mumble-host-wrap" style="flex:2;min-width:220px">Host / Dominio Mumble remoto
+        <input id="mumble-host" placeholder="ej: mumble.ejemplo.org">
+      </label>
+      <label id="mumble-puerto-wrap" style="width:110px">Puerto
+        <input id="mumble-puerto" type="number" min="1" max="65535" value="64738">
+      </label>
+      <label id="mumble-clave-wrap" style="flex:1;min-width:160px">Contraseña (opcional)
+        <input id="mumble-clave" type="password" placeholder="vacío si es público">
+      </label>
+    </div>
+    <div class="fila" style="margin-top:.5rem;flex-wrap:wrap;gap:.5rem;align-items:center">
+      <button id="mumble-guardar" class="btn prim" type="button">💾 Guardar servidor Mumble</button>
+      <button id="mumble-probar" class="btn" type="button">🔌 Probar conexión</button>
+      <span id="mumble-estado" class="muted" style="font-size:.85rem"></span>
+    </div>
+    <hr>
+    <h2>Crear usuario administrador</h2>
+    <div class="fila">
+      <input id="a-nuevo-usuario" placeholder="usuario">
+      <input id="a-nuevo-pass" type="password" placeholder="contraseña">
+      <button id="a-crear-usuario" class="btn">Crear usuario</button>
+    </div>
+  </div>
+</section>
+
+<!-- ============ GESTIÓN DE SALAS (admin) ============ -->
+<div id="modal-salas" class="modal oculto">
+  <div class="modal-caja ancho">
+    <div class="fila spread"><h2>Salas</h2><button class="btn" onclick="cerrarModal('modal-salas')">✕</button></div>
+    <button id="ms-nueva" class="btn prim">➕ Crear sala nueva</button>
+    <div id="ms-crear" class="oculto" style="margin-top:.5rem">
+      <div class="fila">
+        <input id="ms-nombre" placeholder="nombre-de-sala">
+        <input id="ms-clave" type="password" placeholder="contraseña (vacío = pública)">
+        <button id="ms-crear-btn" class="btn prim">Crear</button>
+      </div>
+    </div>
+    <div id="ms-lista" style="margin-top:.6rem"></div>
+  </div>
+</div>
+
+<!-- ============ PRE-SALA ============ -->
+<section id="vista-prejoin" class="vista oculto">
+  <div class="tarjeta centro">
+    <h1 id="pj-titulo">Unirse a la sala</h1>
+    <p id="pj-sub" class="muted"></p>
+    <div class="prejoin-grid">
+      <div class="prejoin-preview">
+        <video id="pj-video" autoplay playsinline muted></video>
+        <div class="medidor"><div id="pj-nivel"></div></div>
+        <div class="pj-toggles">
+          <button id="pj-mic-btn" class="btn pj-toggle" type="button" title="Micrófono"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z"/></svg></span><span class="ctl-txt">Micro</span></button>
+          <button id="pj-cam-btn" class="btn pj-toggle" type="button" title="Cámara"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg></span><span class="ctl-txt">Cámara</span></button>
+        </div>
+      </div>
+      <div class="prejoin-form">
+        <label>Tu nombre
+          <input id="pj-nombre" maxlength="32" placeholder="¿Cómo te llamas?">
+        </label>
+        <label id="pj-clave-wrap" class="oculto">Contraseña de la sala
+          <input id="pj-clave" type="password" placeholder="contraseña">
+        </label>
+        <label>Cámara <select id="pj-cam"></select></label>
+        <label>Micrófono <select id="pj-mic"></select></label>
+        <label>Altavoces
+          <span class="fila">
+            <select id="pj-spk"></select>
+            <button id="pj-probar" class="btn mini" title="Probar sonido">Probar</button>
+          </span>
+        </label>
+        <p class="muted pj-nota">Los botones bajo la imagen deciden si entras con micro y cámara activos.</p>
+        <div id="pj-error" class="error"></div>
+        <div id="pj-espera" class="oculto">
+          <p class="muted">⏳ Estás en la sala de espera. Un moderador debe admitirte para entrar.</p>
+          <button id="pj-espera-cancelar" class="btn mini" type="button">Cancelar</button>
+        </div>
+        <button id="pj-entrar" class="btn prim grande">Entrar</button>
+        <a id="pj-app" class="btn link oculto" href="#">📱 Abrir en la app</a>
+        <button id="pj-admin-link" class="btn link">Entrar como administrador</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- cuenta regresiva gigante cuando a quien habla le quedan <10 s de palabra -->
+<div id="cuenta-regresiva" class="oculto">
+  <div id="cr-num">10</div>
+  <div id="cr-barra"><div id="cr-fill"></div></div>
+</div>
+
+<!-- ============ SALA ============ -->
+<section id="vista-sala" class="vista oculto">
+  <header id="barra-top">
+    <div id="st-avisos">
+      <button id="st-silencio" class="chip-ico oculto" title="Modo silencio activo">🔇</button>
+      <button id="st-micasientos" class="chip-ico oculto" title="Micros de asientos bloqueados">🪑🔒</button>
+      <button id="st-cam" class="chip-ico oculto" title="Cámaras bloqueadas">📵</button>
+      <button id="st-rec" class="chip-ico rec oculto" title="Grabando">⏺</button>
+      <button id="st-conexion" class="chip-ico rec oculto" title="Servidores distintos">⚠️</button>
+      <button id="st-grupo" class="chip-ico oculto"></button>
+      <button id="st-manos" class="chip-ico oculto" title="Manos levantadas — toca para ver solicitudes">✋ <span id="st-manos-n">0</span></button>
+      <button id="st-cola" class="chip-ico oculto" title="Gente en la cola para sentarse — ver solicitudes">🪑 <span id="st-cola-n">0</span></button>
+      <button id="st-lobby" class="chip-ico oculto" title="Gente esperando en la sala de espera — abrir moderación">🚪 <span id="st-lobby-n">0</span></button>
+    </div>
+    <div class="fila top-identidad">
+      <strong id="st-nombre-sala"></strong>
+      <button id="st-renombrar" class="btn mini oculto" title="Cambiar el nombre visible de la sala">✎</button>
+    </div>
+    <nav class="fila" id="st-vistas">
+      <button class="btn vista-btn" data-vista="asientos">Asientos</button>
+      <button class="btn vista-btn" data-vista="rejilla">Rejilla</button>
+      <button class="btn vista-btn" data-vista="orador">Orador</button>
+      <button class="btn vista-btn" data-vista="pantalla">Pantalla</button>
+      <button class="btn vista-btn" data-vista="presentacion">Documento</button>
+      <button class="btn vista-btn" data-vista="pizarra">Pizarra</button>
+      <button id="st-aud-vista" class="btn mini oculto" title="La audiencia está en otra pestaña — toca para llevarlos a tu vista">👥</button>
+      <button id="st-sync" class="btn prim oculto" title="Forzar esta vista en todas las pantallas">Sincronizar</button>
+    </nav>
+    <div class="fila top-acciones">
+      <button id="st-vistas-toggle" class="btn" aria-label="Cambiar vista">☰</button>
+      <button id="st-panel-admin" class="btn oculto" aria-label="Moderación">Moderación</button>
+      <button id="st-salir" class="btn peligro" aria-label="Salir de la sala">Salir<svg class="salir-ico" viewBox="0 0 24 24"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.52-.29.7l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.68-1.36-2.66-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg></button>
+    </div>
+  </header>
+
+  <main id="zona-principal">
+    <!-- vista asientos -->
+    <div id="z-asientos" class="zona">
+      <div id="fila-mod" class="fila-asientos fila-mod"></div>
+      <div id="fila-2" class="fila-asientos"></div>
+      <div id="fila-3" class="fila-asientos"></div>
+      <div class="fila spread audiencia-cab">
+        <h3>Audiencia</h3>
+        <div id="audiencia-acciones"></div>
+      </div>
+      <div id="audiencia" class="audiencia"></div>
+      <div id="cola-wrap" class="oculto"><h3>Cola de espera</h3><ol id="cola"></ol></div>
+    </div>
+    <!-- vista rejilla -->
+    <div id="z-rejilla" class="zona oculto">
+      <div id="rejilla" class="rejilla"></div>
+      <div id="rej-nav" class="rej-nav oculto">
+        <button id="rej-prev" class="btn" type="button" aria-label="Pagina anterior">◀</button>
+        <span id="rej-pag"></span>
+        <button id="rej-next" class="btn" type="button" aria-label="Pagina siguiente">▶</button>
+      </div>
+    </div>
+    <!-- vista orador -->
+    <div id="z-orador" class="zona oculto">
+      <div id="orador-principal" class="orador-principal"></div>
+      <div id="orador-tira" class="orador-tira"></div>
+    </div>
+    <!-- vista pantalla compartida -->
+    <div id="z-pantalla" class="zona oculto">
+      <div id="pantalla-zona" class="doc-zona">
+        <div id="pantalla-vacia" class="muted centro-flex">Nadie está compartiendo pantalla.</div>
+      </div>
+    </div>
+    <!-- vista presentación/documento -->
+    <div id="z-presentacion" class="zona oculto">
+      <div id="doc-zona" class="doc-zona">
+        <button id="doc-tools-toggle" class="tools-toggle oculto" title="Mostrar/ocultar herramientas">🛠</button>
+        <div id="doc-vacio" class="muted centro-flex">Nadie está presentando. Quien esté en el asiento del anfitrión o tenga la palabra puede compartir un PDF, una imagen, un vídeo, un audio o una web.</div>
+        <div id="doc-musica" class="doc-musica oculto">
+          <span class="doc-musica-info">🎵 <b id="doc-musica-nombre"></b><span id="doc-musica-quien" class="muted"></span></span>
+          <span class="doc-musica-volwrap">🔊 <input type="range" id="doc-musica-vol" min="0" max="150" value="100"></span>
+        </div>
+        <div id="doc-zoom">
+          <iframe id="doc-frame" class="oculto" allow="fullscreen"></iframe>
+          <img id="doc-img" class="oculto" alt="documento">
+          <audio id="doc-audio-el" class="oculto" controls style="width:min(480px,92%)"></audio>
+          <div id="doc-video-wrap" class="oculto"></div>
+        </div>
+        <div id="doc-zoom-ctl" class="oculto">
+          <button id="doc-zoom-menos" class="btn" title="Alejar">🔍−</button>
+          <span id="doc-zoom-pct">100%</span>
+          <button id="doc-zoom-mas" class="btn" title="Acercar">🔍+</button>
+          <button id="doc-zoom-reset" class="btn" title="Restablecer">⟲</button>
+        </div>
+      </div>
+      <div id="doc-controles" class="fila oculto plegado">
+        <input type="file" id="doc-archivo" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp" class="oculto">
+        <button id="doc-subir" class="btn">Subir PDF/imagen</button>
+        <input id="doc-url" placeholder="https://… (página web)">
+        <button id="doc-web" class="btn">Proyectar web</button>
+        <button id="doc-audio" class="btn">🎵 Audio</button>
+        <input type="file" id="doc-audio-archivo" accept="audio/*" class="oculto">
+        <button id="doc-quitar" class="btn peligro">Quitar documento</button>
+      </div>
+    </div>
+    <!-- vista pizarra -->
+    <div id="z-pizarra" class="zona oculto">
+      <div class="fila pizarra-tools plegado">
+        <button class="btn mini wb-tool activo" data-tool="lapiz" title="Lápiz">✏️</button>
+        <button class="btn mini wb-tool" data-tool="marcador" title="Marcador">🖍️</button>
+        <button class="btn mini wb-tool" data-tool="linea" title="Línea">📏</button>
+        <button class="btn mini wb-tool" data-tool="rect" title="Rectángulo">▭</button>
+        <button class="btn mini wb-tool" data-tool="circulo" title="Círculo">◯</button>
+        <button class="btn mini wb-tool" data-tool="texto" title="Texto">🅰️</button>
+        <button class="btn mini wb-tool" data-tool="borrador" title="Borrador">🧽</button>
+        <button class="btn mini wb-tool" data-tool="laser" title="Puntero (no deja marca)">🔴</button>
+        <input type="color" id="pz-color" value="#ffffff" title="Color">
+        <input type="range" id="pz-grosor" min="1" max="20" value="3" title="Grosor">
+        <label class="check mini" title="Rellenar figuras"><input type="checkbox" id="pz-relleno"> relleno</label>
+        <button id="pz-deshacer" class="btn mini" title="Deshacer mi último trazo">↩️</button>
+        <button id="pz-limpiar" class="btn mini peligro">Limpiar</button>
+      </div>
+      <div class="pizarra-wrap"><button id="pz-tools-toggle" class="tools-toggle" title="Mostrar/ocultar herramientas">🛠</button><canvas id="pizarra"></canvas><canvas id="pizarra-fx"></canvas></div>
+    </div>
+  </main>
+
+  <div id="panel-fondo"></div>
+  <aside id="panel-lateral">
+    <div class="panel-top">
+      <button id="panel-cerrar" class="btn">✕ Cerrar</button>
+      <button id="btn-opaco" class="btn mini" title="Transparencia del panel">◐</button>
+    </div>
+    <div class="tabs">
+      <button class="tab activo" data-tab="chat">Chat</button>
+      <button class="tab" data-tab="cola-manos">Solicitudes <span id="badge-manos" class="badge oculto">0</span></button>
+      <button class="tab" data-tab="personas">Personas</button>
+    </div>
+    <div id="tab-chat" class="tabpanel">
+      <div id="chat-lista"></div>
+      <div class="fila">
+        <input id="chat-input" placeholder="Escribe un mensaje…" maxlength="500">
+        <button id="chat-enviar" class="btn prim mini">➤</button>
+      </div>
+    </div>
+    <div id="tab-colamanos" class="tabpanel oculto">
+      <h3>Manos levantadas</h3>
+      <div id="lista-manos" class="lista"></div>
+      <h3>Cola de espera</h3>
+      <div id="lista-cola" class="lista"></div>
+    </div>
+    <div id="tab-personas" class="tabpanel oculto">
+      <div id="lista-personas"></div>
+    </div>
+  </aside>
+  <div id="panel-opaco-float" class="opaco-float oculto">
+    <span class="muted">Opacidad</span>
+    <input type="range" id="panel-opacidad" min="35" max="100" value="100">
+  </div>
+
+  <div id="flotantes"></div>
+  <div id="hablas-aviso" class="oculto"><span id="hablas-txt"></span></div>
+  <div id="reacciones-panel" class="oculto">
+    <button id="rp-mano" class="btn rp-mano" type="button">✋ Levantar la mano</button>
+    <div id="rp-grid"></div>
+  </div>
+  <!-- ventanita del audio que el moderador está retransmitiendo -->
+  <div id="audio-share" class="oculto">
+    <div class="fila spread"><strong>🎵 Compartiendo audio</strong>
+      <span><button id="as-sync" class="btn mini" type="button" title="Fijar mi volumen en todos (reinicia el slider de cada oyente)">📢</button>
+      <button id="as-stop" class="btn mini peligro" type="button">⏹ Parar</button></span></div>
+    <audio id="as-player" controls></audio>
+    <div id="as-nombre" class="muted"></div>
+  </div>
+
+    <footer id="barra-controles">
+    <div class="controles-principales">
+      <span id="mic-wrap" class="ctl-wrap"><button id="ctl-mic" class="btn ctl" title="Microfono"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z"/></svg></span></button><button id="ctl-mic-cfg" class="ctl-cfg" type="button" title="Elegir micrófono">Micro ▾</button><span id="mic-nivel"><i></i></span><small id="mic-estado">Silenciado</small>
+        <div id="mic-pop" class="popmenu oculto">
+          <span class="muted">Micrófono</span>
+          <select id="mic-sel"></select>
+          <button id="mic-mas" class="btn mini" type="button">Más ajustes…</button>
+        </div>
+      </span>
+      <span class="ctl-wrap"><button id="ctl-cam" class="btn ctl" title="Camara"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg></span></button><button id="ctl-cam-cfg" class="ctl-cfg" type="button" title="Elegir cámara">Camara ▾</button>
+        <div id="cam-pop" class="popmenu oculto">
+          <span class="muted">Cámara</span>
+          <select id="cam-sel"></select>
+        </div>
+      </span>
+      <button id="ctl-emoji" class="btn ctl" title="Mano y reacciones"><span class="ctl-ico">✋</span><span class="ctl-txt">Mano</span></button>
+      <span class="ctl-wrap"><button id="ctl-vol" class="btn ctl" title="Salida y amplificación del audio"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.74 2.5-2.26 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg></span></button><button id="ctl-vol-cfg" class="ctl-cfg" type="button" title="Salida y amplificación">Audio ▾</button>
+        <div id="vol-pop" class="popmenu oculto">
+          <span class="muted">Escuchar por</span>
+          <select id="vol-spk"></select>
+          <span class="muted">Amplificar volumen <b id="vol-val">100%</b></span>
+          <input type="range" id="vol-master" min="1" max="3" step="0.05" value="1">
+          <button id="vol-probar" class="btn mini" type="button">🔔 Probar sonido</button>
+        </div>
+      </span>
+      <button id="ctl-chat" class="btn ctl" title="Chat y panel"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg></span><span class="ctl-txt">Chat</span></button>
+      <button id="ctl-mas" class="btn ctl" title="Mas controles" aria-expanded="false" aria-controls="controles-secundarios"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></span><span class="ctl-txt">Mas</span></button>
+    </div>
+    <div id="controles-secundarios" class="controles-secundarios">
+      <button id="ctl-pantalla" class="btn ctl" title="Compartir pantalla"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.11-.9-2-2-2H4C2.89 4 2 4.89 2 6v10c0 1.1.89 2 2 2H0v2h24v-2h-4zm-7-3.53v-2.19c-2.78 0-4.61.85-6 2.72.56-2.67 2.11-5.33 6-5.87V7l4 3.73-4 3.74z"/></svg></span><span class="ctl-txt">Pantalla</span></button>
+      <button id="ctl-rec" class="btn ctl" title="Grabar en este equipo"><span class="ctl-ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="4.5"/></svg></span><span class="ctl-txt">Grabar</span></button>
+      <button id="ctl-ajustes" class="btn ctl" title="Ajustes de audio"><span class="ctl-ico"><svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.05-.24-.24-.41-.47-.41h-3.75c-.24 0-.44.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.75c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></span><span class="ctl-txt">Ajustes</span></button>
+    </div>
+    <span id="ctl-aviso" class="muted"></span>
+    <button id="ctl-plegar" class="btn mini" title="Ocultar/mostrar controles">⌄</button>
+  </footer>
+</section>
+
+<!-- ============ PANEL DE MODERACIÓN ============ -->
+<div id="modal-admin" class="modal oculto">
+  <div class="modal-caja ancho">
+    <div class="fila spread"><h2>Moderación</h2><button class="btn" onclick="cerrarModal('modal-admin')">✕</button></div>
+    <button type="button" class="tog rojo" id="mod-silencio" title="Si está activo, la audiencia no puede hablar"><span>Silenciar audiencia</span><i></i></button>
+    <button type="button" class="tog" id="mod-mic-asientos" title="Micros de quienes están sentados (excepto el asiento 1)"><span>Micrófonos de asientos</span><i></i></button>
+    <button type="button" class="tog" id="mod-cam-audiencia" title="Cámaras de quienes no están sentados"><span>Cámaras de audiencia</span><i></i></button>
+    <button type="button" class="tog" id="mod-cam-asientos" title="Cámaras de quienes están sentados (excepto el asiento 1)"><span>Cámaras de asientos</span><i></i></button>
+    <button type="button" class="tog" id="mod-chat-off" title="Si está activo, todos pueden escribir en el chat"><span>Chat activado</span><i></i></button>
+    <button type="button" class="tog rojo" id="mod-vista-fija" title="Si está activo, la audiencia solo ve la pestaña que elijas con Sincronizar (y en modo Asientos las cámaras de los que están de pie no gastan datos). Apagarlo = cada quien se mueve libre."><span>Vista fijada (todos siguen al moderador)</span><i></i></button>
+    <div class="fila" style="gap:.4rem;flex-wrap:wrap;align-items:center">
+      <span class="muted" style="font-size:.78rem">Asientos de un toque (no tocan el anfitrión):</span>
+      <button id="mod-seat-libres" class="btn mini">🔓 Todos libres</button>
+      <button id="mod-seat-mods" class="btn mini">👥 Solo moderadores</button>
+      <button id="mod-seat-nadie" class="btn mini peligro">⛔ Bloquear todos</button>
+    </div>
+    <label class="fila" style="align-items:center">Acceso a la sala
+      <select id="mod-acceso" class="mini">
+        <option value="abierto">Abierta para todos</option>
+        <option value="admin">Entra gente solo si hay un moderador dentro</option>
+        <option value="lobby">Lista de espera — admitir a cada quien</option>
+      </select>
+    </label>
+    <div id="mod-lobby-wrap" class="oculto">
+      <div class="fila spread" style="margin:.4rem 0 .2rem"><strong>Sala de espera</strong>
+        <span class="acciones"><button id="mod-lobby-todos" class="btn mini prim">Admitir a todos</button>
+        <button id="mod-lobby-ninguno" class="btn mini peligro">Rechazar a todos</button></span></div>
+      <div id="mod-lobby" class="lista"></div>
+    </div>
+    <button id="mod-terminar" class="btn mini peligro" style="margin-top:.5rem">🔴 Terminar la reunión para todos</button>
+    <label class="fila" style="align-items:center">Calidad de audio de la sala
+      <select id="mod-audio" class="mini">
+        <option value="telefono">Teléfono (12 kbps, máximo ahorro)</option>
+        <option value="voz">Voz (24 kbps)</option>
+        <option value="musica">Música (estéreo HQ)</option>
+      </select>
+    </label>
+    <div class="tabs">
+      <button class="tab mod-tab activo" data-mtab="manos" onclick="mtab(this)">Manos <span id="mod-badge-manos" class="badge oculto">0</span></button>
+      <button class="tab mod-tab" data-mtab="cola" onclick="mtab(this)">Cola</button>
+      <button class="tab mod-tab" data-mtab="salas" onclick="mtab(this)">Salas</button>
+    </div>
+    <div id="mtab-manos" class="tabpanel"><div id="mod-manos" class="lista"></div></div>
+    <div id="mtab-cola" class="tabpanel oculto"><div id="mod-cola" class="lista"></div></div>
+    <div id="mtab-salas" class="tabpanel oculto">
+      <p class="muted" style="font-size:.8rem">Crea la sala, añade personas al plan y pulsa ▶ para moverlas todas y arrancar el reloj.</p>
+      <div class="fila" style="flex-wrap:wrap">
+        <input id="grupo-nombre" placeholder="nombre de la sala" style="flex:1;min-width:120px;width:auto">
+        <input id="grupo-cant" type="number" min="1" placeholder="cant." title="Cuántas salas crear (se numeran 1, 2, 3…)" style="width:62px">
+        <input id="grupo-minutos" type="number" min="0" placeholder="min (0=∞)" title="Minutos de duración (0 = sin límite)" style="width:90px">
+        <button id="grupo-crear" class="btn mini prim">Crear sala</button>
+        <button id="grupo-todas" class="btn mini" title="Comienza todas las salas pendientes: mueve a la gente del plan y arranca el reloj">▶ Todas</button>
+        <button id="grupo-cerrart" class="btn mini" title="Devuelve a la gente a la sala principal sin borrar las salas">⏹ Cerrar todas</button>
+        <button id="grupo-disolver" class="btn mini peligro" title="Disolver todas">Disolver todas</button>
+      </div>
+      <div id="mod-grupos" class="lista"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MENÚ CONTEXTUAL ============ -->
+<div id="menu-ctx" class="oculto"></div>
+
+<!-- ============ POPUP DE INVITACIÓN ============ -->
+<div id="inv-popup" class="inv-popup oculto">
+  <p id="inv-texto"></p>
+  <div class="fila">
+    <button id="inv-si" class="btn prim mini">Aceptar</button>
+    <button id="inv-no" class="btn mini">Rechazar</button>
+  </div>
+</div>
+
+<!-- ============ AJUSTES DE AUDIO ============ -->
+<div id="modal-ajustes" class="modal oculto">
+  <div class="modal-caja">
+    <div class="fila spread"><h2>Ajustes de audio</h2><button class="btn" onclick="cerrarModal('modal-ajustes')">✕</button></div>
+    <label>Cámara <select id="aj-cam"></select></label>
+    <label>Micrófono <select id="aj-mic"></select></label>
+    <label>Altavoces <select id="aj-spk"></select></label>
+    <label>Calidad de tu micrófono
+      <select id="aj-calidad">
+        <option value="auto">Automática (según tu conexión)</option>
+        <option value="telefono">Teléfono (ahorro de datos)</option>
+        <option value="voz">Voz</option>
+        <option value="musica">Música</option>
+      </select>
+    </label>
+    <label>Ganancia del micrófono <span id="aj-gan-val" class="muted"></span>
+      <input type="range" id="aj-ganancia" min="0" max="3" step="0.05" value="1">
+    </label>
+    <label>Nivel de entrada (prueba local, incluso silenciado)
+      <div class="medidor"><div id="aj-nivel"></div></div>
+    </label>
+    <div id="aj-mensaje" class="error" role="status"></div>
+    <label class="check"><input type="checkbox" id="aj-ns" checked> Supresión de ruido</label>
+    <label class="check"><input type="checkbox" id="aj-ec" checked> Cancelación de eco</label>
+    <label class="check"><input type="checkbox" id="aj-agc" checked> Control automático de ganancia</label>
+    <p class="muted" style="font-size:.8rem">Cambiar micro o filtros reinicia tu audio brevemente.</p>
+  </div>
+</div>
+
+<!-- ============ LOGIN ADMIN ============ -->
+<div id="modal-login" class="modal oculto">
+  <div class="modal-caja">
+    <div class="fila spread"><h2>Acceso administrador</h2><button class="btn" onclick="cerrarModal('modal-login')">✕</button></div>
+    <label>Usuario <input id="lg-usuario" autocomplete="username"></label>
+    <label>Contraseña <input id="lg-clave" type="password" autocomplete="current-password"></label>
+    <div id="lg-error" class="error"></div>
+    <button id="lg-entrar" class="btn prim">Entrar</button>
+  </div>
+</div>
+
+<!-- ============ MODAL GENÉRICO (confirmar / preguntar) ============ -->
+<div id="modal-gen" class="modal oculto">
+  <div class="modal-caja">
+    <h2 id="gen-titulo"></h2>
+    <div id="gen-cuerpo"></div>
+    <div class="fila" style="justify-content:flex-end">
+      <button id="gen-cancel" class="btn">Cancelar</button>
+      <button id="gen-ok" class="btn prim">Aceptar</button>
+    </div>
+  </div>
+</div>
+
+<div id="nav-tip" class="oculto">
+  <span id="nav-tip-txt"></span>
+  <a id="nav-tip-btn" class="btn mini prim oculto" href="#"></a>
+  <button id="nav-tip-x" class="btn mini" aria-label="Cerrar">✕</button>
+</div>
+<div id="toast-wrap"></div>
+<script src="/app.js?v=106"></script>
+</body>
+</html>

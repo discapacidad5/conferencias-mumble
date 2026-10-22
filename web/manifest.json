@@ -1,0 +1,20 @@
+{
+  "name": "Conferencia",
+  "short_name": "Conferencia",
+  "description": "Salas de videoconferencia",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "related_applications": [
+    { "platform": "webapp", "url": "/manifest.json" },
+    { "platform": "play", "id": "com.conferencia.app" }
+  ],
+  "prefer_related_applications": false,
+  "background_color": "#0e1117",
+  "theme_color": "#0e1117",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

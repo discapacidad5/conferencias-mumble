@@ -1,0 +1,5 @@
+data/
+tmp-test-data/
+*.exe
+conferencia-mumble
+cookies.txt

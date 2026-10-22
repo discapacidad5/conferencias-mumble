@@ -1,0 +1,7 @@
+.git
+data/
+*.exe
+.env
+.env.*
+!.env.example
+README.md
