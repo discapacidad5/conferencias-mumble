@@ -804,7 +804,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
               },
             });
           }
-          const opusBitrate = maxBr <= 11000 ? 14000 : (maxBr <= 20000 ? 22000 : 32000);
+          const opusBitrate = maxBr <= 11000 ? 10000 : (maxBr <= 20000 ? 18000 : 28000);
           try {
             opusEncoder.configure({
               codec: 'opus',
@@ -993,7 +993,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
                     enviarTrama40ms(pre);
                   }
                 }
-                silencioCola = 20; // 800 ms de cola continua: cero cortes entre sílabas o palabras
+                silencioCola = 11; // 440 ms de cola continua: cero cortes entre sílabas y ahorro de datos en pausas
                 this._room._marcarHablandoLocal(true);
                 enviarTrama40ms(frameBuf);
               } else if (silencioCola > 0) {
