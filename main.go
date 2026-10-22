@@ -1598,7 +1598,10 @@ func hAdminRenombrarSala(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	store.FijarNombreVisible(sala, req.NombreVisible)
-	hub.sala(sala).broadcast(&Evento{Tipo: "sincronizar"})
+	sv := hub.sala(sala)
+	sv.mu.Lock()
+	sv.broadcast(&Evento{Tipo: "sincronizar"})
+	sv.mu.Unlock()
 	escribirJSON(w, 200, map[string]bool{"ok": true})
 }
 

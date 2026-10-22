@@ -356,12 +356,14 @@ type puenteMumble struct {
 	conectado bool
 	ultimoErr string
 	seq       uint64
+	txCh      chan []byte
 	cerrarCh  chan struct{}
 }
 
 func nuevoPuenteMumble(sala string) *puenteMumble {
 	p := &puenteMumble{
 		sala:     sala,
+		txCh:     make(chan []byte, 32),
 		cerrarCh: make(chan struct{}),
 	}
 	go p.bucle()
@@ -425,7 +427,7 @@ func (p *puenteMumble) bucle() {
 		p.ultimoErr = ""
 		p.mu.Unlock()
 
-		// Goroutine de Ping cada 15s (Mumble desconecta tras 30s sin Ping)
+		// Goroutine de Ping y envío asíncrono de audio a Mumble (nunca bloquea WebSocket)
 		doneConn := make(chan struct{})
 		go func(c net.Conn) {
 			tk := time.NewTicker(15 * time.Second)
@@ -436,12 +438,32 @@ func (p *puenteMumble) bucle() {
 					return
 				case <-p.cerrarCh:
 					return
+				case opusFrame := <-p.txCh:
+					if len(opusFrame) == 0 {
+						continue
+					}
+					p.mu.Lock()
+					p.seq++
+					seqNow := p.seq
+					p.mu.Unlock()
+					pkt := make([]byte, 0, 16+len(opusFrame))
+					pkt = append(pkt, 0x80)
+					pkt = append(pkt, mumbleVarintEncode(seqNow)...)
+					pkt = append(pkt, mumbleVarintEncode(uint64(len(opusFrame)))...)
+					pkt = append(pkt, opusFrame...)
+					_ = c.SetWriteDeadline(time.Now().Add(1500 * time.Millisecond))
+					if err := escribirPaqueteMumble(c, mumbleMsgUDPTunnel, pkt); err != nil {
+						_ = c.Close()
+						return
+					}
 				case <-tk.C:
 					var pg []byte
 					pg = pbTagVarint(pg, 1, uint64(time.Now().UnixMilli()))
-					p.mu.Lock()
-					_ = escribirPaqueteMumble(c, mumbleMsgPing, pg)
-					p.mu.Unlock()
+					_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					if err := escribirPaqueteMumble(c, mumbleMsgPing, pg); err != nil {
+						_ = c.Close()
+						return
+					}
 				}
 			}
 		}(conn)
@@ -472,23 +494,18 @@ func (p *puenteMumble) bucle() {
 	}
 }
 
-// enviarAudioMumble encapsula una trama de voz en un paquete UDPTunnel (tipo 1)
-// con cabecera Opus (codec 4) del protocolo Mumble y la envía al servidor Mumble.
+// enviarAudioMumble encola de forma 100% no bloqueante una trama Opus hacia el
+// servidor Mumble nativo sin detener jamás el WebSocket de los navegadores.
 func (p *puenteMumble) enviarAudioMumble(audioPayload []byte) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.conn == nil || !p.conectado || len(audioPayload) == 0 {
+	if len(audioPayload) == 0 {
 		return
 	}
-	p.seq++
-	// Header Mumble audio: codec=4 (Opus -> 4<<5 = 0x80), target=0 (normal talking)
-	pkt := make([]byte, 0, 16+len(audioPayload))
-	pkt = append(pkt, 0x80)
-	pkt = append(pkt, mumbleVarintEncode(p.seq)...)
-	pkt = append(pkt, mumbleVarintEncode(uint64(len(audioPayload)))...)
-	pkt = append(pkt, audioPayload...)
-	_ = p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_ = escribirPaqueteMumble(p.conn, mumbleMsgUDPTunnel, pkt)
+	cp := make([]byte, len(audioPayload))
+	copy(cp, audioPayload)
+	select {
+	case p.txCh <- cp:
+	default:
+	}
 }
 
 // ============================================================================
@@ -1096,10 +1113,11 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				// rc 10..19 = Opus (solo para clientes con opusRx=true)
 				// rc 30..39 = ADPCM respaldo simultáneo (solo para clientes con opusRx=false)
 				// rc 20..29 o 1..2 = ADPCM/u-law primario (para todos cuando el emisor no tiene Opus)
-				if rc >= 10 && rc <= 19 && len(payload) > 4 {
-					mr.mumble.enviarAudioMumble(payload[1:])
-				} else if (rc > 0 && rc < 10) || (rc >= 20 && rc <= 29) {
-					mr.mumble.enviarAudioMumble(payload)
+				if rc >= 10 && rc <= 19 && len(payload) > 8 && payload[3] == 0xA5 {
+					l1 := int(payload[4]) | (int(payload[5]) << 8)
+					if 6+l1 <= len(payload) && l1 > 0 {
+						mr.mumble.enviarAudioMumble(payload[6 : 6+l1])
+					}
 				}
 				mr.mu.RLock()
 				for _, otro := range mr.clientes {

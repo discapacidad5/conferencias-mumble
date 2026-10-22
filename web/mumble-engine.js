@@ -481,6 +481,29 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
   }
 }
 registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
+
+class MumbleTxProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(2048);
+    this.fill = 0;
+  }
+  process(inputs) {
+    const inp = inputs[0] && inputs[0][0];
+    if (!inp || inp.length === 0) return true;
+    for (let i = 0; i < inp.length; i++) {
+      this.buf[this.fill++] = inp[i];
+      if (this.fill === 2048) {
+        this.fill = 0;
+        const copy = new Float32Array(2048);
+        copy.set(this.buf);
+        this.port.postMessage(copy, [copy.buffer]);
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 `;
   let workletBlobUrl = null;
   const ctxWorkletPromesas = new WeakMap();
@@ -897,7 +920,8 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
           actx.resume().catch(() => {});
         }
 
-        proc = actx.createScriptProcessor(2048, 1, 1);
+        proc = null;
+        let txWorklet = null;
         muteGain = actx.createGain();
         muteGain.gain.value = 0; // silencio total hacia destination local; mantiene vivo el reloj de hardware
         const inRate = actx.sampleRate || 48000;
@@ -917,10 +941,7 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
         let silencioCola = 0;
         let noiseFloor = 0.0018;
 
-        proc.onaudioprocess = (ev) => {
-          const outChan = ev.outputBuffer.getChannelData(0);
-          outChan.fill(0);
-
+        const procesarBloqueEntrada = (rawIn) => {
           if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) {
             if (hablandoActivo) {
               hablandoActivo = false;
@@ -930,7 +951,6 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
             }
             return;
           }
-          const rawIn = ev.inputBuffer.getChannelData(0);
           const nIn = rawIn.length;
           if (nIn === 0) return;
 
@@ -1007,25 +1027,55 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
           lastInSample = filtered[nIn - 1];
         };
 
-        srcNode.connect(proc);
-        proc.connect(muteGain);
-        muteGain.connect(actx.destination);
+        let micCerrado = false;
+        asegurarWorkletEnCtx(actx).then((ok) => {
+          if (micCerrado) return;
+          if (ok && typeof window.AudioWorkletNode === 'function') {
+            try {
+              txWorklet = new window.AudioWorkletNode(actx, 'mumble-tx-worklet', {
+                numberOfInputs: 1,
+                numberOfOutputs: 1,
+                outputChannelCount: [1],
+              });
+              txWorklet.port.onmessage = (ev) => {
+                if (ev.data instanceof Float32Array) {
+                  procesarBloqueEntrada(ev.data);
+                }
+              };
+              srcNode.connect(txWorklet);
+              txWorklet.connect(muteGain);
+              muteGain.connect(actx.destination);
+              return;
+            } catch {}
+          }
+          // Fallback si el navegador no soporta AudioWorklet
+          proc = actx.createScriptProcessor(2048, 1, 1);
+          proc.onaudioprocess = (ev) => {
+            ev.outputBuffer.getChannelData(0).fill(0);
+            procesarBloqueEntrada(ev.inputBuffer.getChannelData(0));
+          };
+          srcNode.connect(proc);
+          proc.connect(muteGain);
+          muteGain.connect(actx.destination);
+        });
+
+        this._micCleanup = () => {
+          micCerrado = true;
+          this._actualizarBitrateMic = null;
+          try { if (opusEncoder && opusEncoder.state !== 'closed') opusEncoder.close(); } catch {}
+          opusEncoder = null;
+          try { if (txWorklet) txWorklet.disconnect(); } catch {}
+          try { if (proc) proc.disconnect(); } catch {}
+          try { if (muteGain) muteGain.disconnect(); } catch {}
+          if (!esCtxCompartido) {
+            try { if (srcNode) srcNode.disconnect(); } catch {}
+            try { if (actx) actx.close(); } catch {}
+          }
+          this._room._marcarHablandoLocal(false);
+        };
       } catch (e) {
         console.warn('Error iniciando codificador de voz Mumble:', e);
       }
-
-      this._micCleanup = () => {
-        this._actualizarBitrateMic = null;
-        try { if (opusEncoder && opusEncoder.state !== 'closed') opusEncoder.close(); } catch {}
-        opusEncoder = null;
-        try { if (proc) proc.disconnect(); } catch {}
-        try { if (muteGain) muteGain.disconnect(); } catch {}
-        if (!esCtxCompartido) {
-          try { if (srcNode) srcNode.disconnect(); } catch {}
-          try { if (actx) actx.close(); } catch {}
-        }
-        this._room._marcarHablandoLocal(false);
-      };
     }
 
     _iniciarEnvioAudioCompartido(mediaStreamTrack, pub, name) {
@@ -1497,7 +1547,7 @@ registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
       // ~400 ms SIN destruir Room, SIN cerrar el micrófono y SIN llamar a /api/obtener-acceso.
       const programarReconexionInterna = (intento) => {
         if (this._closedByClient || this._reconnectTimer) return;
-        const espera = Math.min(2500, 350 + intento * 350);
+        const espera = Math.min(4500, 900 + intento * 800);
         this._reconnectTimer = setTimeout(() => {
           this._reconnectTimer = null;
           if (this._closedByClient) return;

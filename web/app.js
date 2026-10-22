@@ -3755,6 +3755,8 @@ async function retirarMic() {
 }
 
 async function activarMic(on) {
+  if (on && S.audio.activando) return;
+  if (on) S.audio.activando = true;
   // anillo "encendiendo" en el botón: puede tardar segundos en teléfonos
   const bm = $('#ctl-mic');
   bm.classList.add('cargando');
@@ -3794,6 +3796,7 @@ async function activarMic(on) {
     if (!S.room.localParticipant.getTrackPublication(LC.Track.Source.Microphone)) cerrarPipeline();
     toast('No se pudo activar el micro: ' + e.message);
   } finally {
+    if (on) S.audio.activando = false;
     bm.classList.remove('cargando'); // renderControles ya lo limpió si salió bien
   }
 }
