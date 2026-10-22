@@ -320,6 +320,27 @@
     }
   }
 
+  // Autocorrelación simple sobre la historia de salida para hallar el período
+  // de pitch (80–480 muestras ≈ 100–600 Hz) y que el PLC repita la forma de
+  // onda real en vez de producir un zumbido metálico.
+  function estimarPeriodoPLC(hist, pos, cap) {
+    let bestLag = 240;
+    let bestCorr = -Infinity;
+    for (let lag = 80; lag <= 480; lag += 4) {
+      let sum = 0;
+      for (let i = 0; i < 240; i++) {
+        const a = hist[(pos - 1 - i + cap * 4) % cap];
+        const b = hist[(pos - 1 - i - lag + cap * 4) % cap];
+        sum += a * b;
+      }
+      if (sum > bestCorr) {
+        bestCorr = sum;
+        bestLag = lag;
+      }
+    }
+    return bestLag;
+  }
+
   class Emitter {
     constructor() {
       this._handlers = new Map();
@@ -580,7 +601,6 @@
                 application: 'voip',
                 frameDuration: 40000,
                 complexity: 5,
-                useinbandfec: true,
               },
             });
             opusListo = true;
@@ -604,10 +624,12 @@
         if (br !== maxBr) configurarOpus(br);
       };
 
-      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) por Opus y/o ADPCM
+      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) por Opus y/o ADPCM.
+      // La voz NO se descarta salvo congestión extrema del socket: en TCP los
+      // datos no se pierden, solo se atrasan; el oyente decide con su buffer.
       const enviarTrama40ms = (frame48k) => {
         if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-        if (this._room._ws.bufferedAmount > 36 * 1024) return;
+        if (this._room._ws.bufferedAmount > 160 * 1024) return;
 
         let enviadoOpus = false;
         if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
@@ -667,12 +689,14 @@
         let inPhase = 0;
         let lastInSample = 0;
 
-        // Estado VAD con pre-roll de 40 ms, piso de ruido adaptativo e histéresis suave
+        // Estado VAD con pre-roll de 40 ms, piso de ruido adaptativo e histéresis suave.
+        // Umbrales deliberadamente bajos: jamás recortar una sílaba suave — en el
+        // peor caso se envían unos bytes de ruido, nunca un corte a mitad de palabra.
         let prevFrame48k = new Float32Array(1920);
         let tienePrevFrame = false;
         let hablandoActivo = false;
         let silencioCola = 0;
-        let noiseFloor = 0.0025;
+        let noiseFloor = 0.002;
 
         proc.onaudioprocess = (ev) => {
           if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) {
@@ -708,12 +732,13 @@
               }
               const rms = Math.sqrt(sum / 960);
 
-              // Actualizar piso de ruido suavemente durante silencio
-              if (!hablandoActivo && rms < noiseFloor * 1.8) {
-                noiseFloor = Math.max(0.0012, Math.min(0.0055, noiseFloor * 0.95 + rms * 0.05));
+              // Actualizar piso de ruido suavemente durante silencio (tope 0.004:
+              // un ambiente ruidoso no debe ahogar sílabas suaves)
+              if (!hablandoActivo && rms < noiseFloor * 1.6) {
+                noiseFloor = Math.max(0.001, Math.min(0.004, noiseFloor * 0.95 + rms * 0.05));
               }
-              const umbralAbrir = Math.max(0.0055, noiseFloor * 2.5);
-              const umbralMantener = Math.max(0.0032, noiseFloor * 1.55);
+              const umbralAbrir = Math.max(0.0045, noiseFloor * 2.2);
+              const umbralMantener = Math.max(0.0024, noiseFloor * 1.3);
 
               if (rms >= (hablandoActivo ? umbralMantener : umbralAbrir)) {
                 if (!hablandoActivo) {
@@ -725,7 +750,7 @@
                     enviarTrama40ms(pre);
                   }
                 }
-                silencioCola = 10; // mantener 400 ms de cola entre palabras para no entrecortar frases
+                silencioCola = 12; // mantener ~480 ms de cola entre palabras para no entrecortar frases
                 this._room._marcarHablandoLocal(true);
                 enviarTrama40ms(frameBuf);
               } else if (silencioCola > 0) {
@@ -788,7 +813,7 @@
 
         proc.onaudioprocess = (ev) => {
           if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-          if (this._room._ws.bufferedAmount > 64 * 1024) return;
+          if (this._room._ws.bufferedAmount > 160 * 1024) return;
           const input = ev.inputBuffer.getChannelData(0);
           let sum = 0;
           for (let i = 0; i < input.length; i += 4) sum += input[i] * input[i];
@@ -1469,10 +1494,12 @@
       try { if (pipe.proc) pipe.proc.disconnect(); } catch {}
     }
 
-    // Crea un pipeline receptor continuo basado en un Ring Buffer circular con
-    // pre-buffering adaptativo al jitter (90–240 ms) e interpolación continua
-    // entre paquetes. Elimina al 100% el ruido de bordes ("basurita") y los
-    // micro-cortes de createBufferSource() por paquete.
+    // Crea un pipeline receptor continuo basado en un Ring Buffer circular.
+    // Regla del usuario: NUNCA cortar la voz — mejor 1-2 s de retraso acumulado
+    // en redes malas que un solo corte. Por eso el buffer objetivo "aprende"
+    // hasta ~1.5 s, la reproducción puede ir ±8% más rápida/lenta para alcanzar
+    // el tiempo real sin saltos, y cuando falta un paquete se sintetiza audio
+    // por autocorrelación (PLC) en vez de soltar silencio.
     _asegurarAudioRemoto(p, source, nombre) {
       let pub = p.pubs.get(source);
       if (pub) return pub;
@@ -1486,8 +1513,8 @@
       pub = new TrackPublication(source, track, sid, nombre);
       p.pubs.set(source, pub);
 
-      // Ring buffer de 2.5 segundos a la frecuencia nativa del AudioContext
-      const cap = Math.ceil(ctxRate * 2.5);
+      // Ring buffer de entrada: 4 segundos a la frecuencia nativa del AudioContext
+      const cap = Math.ceil(ctxRate * 4);
       const pipe = {
         ctx,
         ctxRate,
@@ -1497,73 +1524,129 @@
         ring: new Float32Array(cap),
         cap,
         writePos: 0,
-        readPos: 0,
-        available: 0,
+        readPosF: 0,          // posición de lectura fraccional (velocidad variable)
+        available: 0,         // muestras acumuladas sin reproducir
         playing: false,
         fadeInPos: 0,
-        fadeInLen: Math.ceil(ctxRate * 0.006), // 6 ms fade-in suave al arrancar frase
-        lastOutSample: 0,
-        underrunSamples: 0,
+        fadeInLen: Math.ceil(ctxRate * 0.006), // 6 ms fade-in suave
+        readRate: 1,
         // Estado de remuestreo continuo entre paquetes consecutivos
         rxPhase: 0,
         rxLastInSample: 0,
         rxHasLast: false,
-        // Estado de jitter adaptativo
+        // Jitter y buffer objetivo aprendido
         lastArrivalMs: 0,
-        jitterMs: 25,
-        targetPrebuffer: Math.ceil(ctxRate * 0.11), // 110 ms inicial
-        maxBuffer: Math.ceil(ctxRate * 0.42),       // 420 ms tope antes de recortar latencia
+        jitterMs: 30,
+        learnedMs: 160,       // sube tras cada corte real; baja con estabilidad
+        // PLC: historia de salida para repetir forma de onda en huecos
+        hist: new Float32Array(8192),
+        histPos: 0,
+        plcActive: false,
+        plcPeriod: 240,
+        plcGain: 1,
+        plcUsed: 0,
         deemphState: { yPrev: 0 },
         opusDecoder: null,
         opusTimestampUs: 0,
         proc: null,
       };
 
+      // Buffer objetivo: base + jitter medido, con el mínimo aprendido en cortes
+      const targetSamples = () => {
+        const ms = Math.max(pipe.learnedMs, Math.min(1500, 160 + pipe.jitterMs * 3));
+        return pipe.ctxRate * (ms / 1000);
+      };
+
       const proc = ctx.createScriptProcessor(1024, 1, 1);
       proc.onaudioprocess = (ev) => {
         const out = ev.outputBuffer.getChannelData(0);
         const n = out.length;
+        const target = targetSamples();
 
         if (!pipe.playing) {
-          if (pipe.available >= pipe.targetPrebuffer) {
+          // Acumular hasta el objetivo antes de soltar sonido: en redes malas
+          // el objetivo aprendido llega a ~1-1.5 s — el usuario prefiere ese
+          // retraso a cualquier corte a mitad de palabra.
+          if (pipe.available >= Math.min(target, pipe.ctxRate * 1.8)) {
             pipe.playing = true;
             pipe.fadeInPos = 0;
-            pipe.underrunSamples = 0;
+            pipe.plcActive = false;
+            pipe.plcGain = 1;
+            pipe.plcUsed = 0;
           } else {
-            // Todavía acumulando colchón inicial de jitter
             for (let i = 0; i < n; i++) out[i] = 0;
             return;
           }
         }
 
+        // Velocidad de consumo adaptativa: si sobra buffer acelera hasta +10%
+        // (alcanza el tiempo real sin saltos); si escasea estira hasta -6%
+        // (cubre huecos cortos sin silencio ni corte).
+        const over = pipe.available - target;
+        let desired = 1;
+        if (over > pipe.ctxRate * 0.25) {
+          desired = Math.min(1.10, 1 + (over / pipe.ctxRate) * 0.18);
+        } else if (pipe.available < target * 0.5) {
+          desired = 0.94;
+        }
+        pipe.readRate += (desired - pipe.readRate) * 0.08;
+
         const ring = pipe.ring;
         const capLocal = pipe.cap;
+        const hist = pipe.hist;
+        const histCap = hist.length;
+
         for (let i = 0; i < n; i++) {
-          if (pipe.available > 0) {
-            let s = ring[pipe.readPos];
-            pipe.readPos = (pipe.readPos + 1) % capLocal;
-            pipe.available--;
+          let s;
+          if (pipe.available > 1.5) {
+            if (pipe.plcActive) {
+              // volvió la voz tras un hueco: crossfade corto desde el PLC
+              pipe.plcActive = false;
+              pipe.fadeInPos = Math.min(pipe.fadeInPos, Math.ceil(pipe.fadeInLen * 0.4));
+            }
+            const idx0 = pipe.readPosF | 0;
+            const frac = pipe.readPosF - idx0;
+            const idx1 = (idx0 + 1) % capLocal;
+            s = ring[idx0] + frac * (ring[idx1] - ring[idx0]);
+            pipe.readPosF = (pipe.readPosF + pipe.readRate) % capLocal;
+            pipe.available -= pipe.readRate;
             if (pipe.fadeInPos < pipe.fadeInLen) {
-              s *= (pipe.fadeInPos / pipe.fadeInLen);
+              s *= pipe.fadeInPos / pipe.fadeInLen;
               pipe.fadeInPos++;
             }
-            out[i] = s;
-            pipe.lastOutSample = s;
-            pipe.underrunSamples = 0;
           } else {
-            // Si falta un paquete por retraso momentáneo en 2G/3G, decaer suavemente
-            // a cero en lugar de producir un escalón brusco (clic)
-            pipe.lastOutSample *= 0.965;
-            if (Math.abs(pipe.lastOutSample) < 0.0001) pipe.lastOutSample = 0;
-            out[i] = pipe.lastOutSample;
-            pipe.underrunSamples++;
-            // Tras ~55 ms sin datos, volver a modo pre-buffer para la siguiente frase
-            if (pipe.underrunSamples > pipe.ctxRate * 0.055) {
+            // PLC: hueco en la llegada. Repetir el último período de pitch con
+            // decaimiento suave — huecos de 40-150 ms se vuelven inaudibles.
+            if (!pipe.plcActive) {
+              pipe.plcActive = true;
+              pipe.plcGain = 1;
+              pipe.plcUsed = 0;
+              pipe.plcPeriod = estimarPeriodoPLC(hist, pipe.histPos, histCap);
+            }
+            const p0 = (pipe.histPos - pipe.plcPeriod + histCap) % histCap;
+            s = hist[p0] * pipe.plcGain;
+            pipe.plcGain *= 0.99975;   // ~150 ms hasta desvanecer
+            if (pipe.plcGain < 0.12) s = 0;
+            pipe.plcUsed++;
+            // tras ~300 ms de hueco real: rendirse y re-acumular buffer
+            if (pipe.plcUsed > pipe.ctxRate * 0.3) {
+              s = 0;
               pipe.playing = false;
-              for (let k = i + 1; k < n; k++) out[k] = 0;
-              break;
+              pipe.learnedMs = Math.min(1500, pipe.learnedMs + 150);
+              out[i] = 0;
+              hist[pipe.histPos] = 0;
+              pipe.histPos = (pipe.histPos + 1) % histCap;
+              for (let k = i + 1; k < n; k++) {
+                out[k] = 0;
+                hist[pipe.histPos] = 0;
+                pipe.histPos = (pipe.histPos + 1) % histCap;
+              }
+              return;
             }
           }
+          out[i] = s;
+          hist[pipe.histPos] = s;
+          pipe.histPos = (pipe.histPos + 1) % histCap;
         }
       };
 
@@ -1574,21 +1657,18 @@
       return pub;
     }
 
-    // Remuestrea continuamente y empuja un bloque decodificado al Ring Buffer
-    // adaptando el colchón de jitter según la estabilidad de llegada de los paquetes.
+    // Remuestrea continuamente y empuja un bloque decodificado al Ring Buffer.
+    // El colchón lo marca el propio receptor (aprende con cada corte), aquí solo
+    // medimos jitter de llegada y decaimos lentamente el objetivo aprendido.
     _empujarMuestrasRemotas(pipe, samples, inRate, fromId, ftipo) {
       if (!samples || samples.length === 0) return;
       const nowMs = performance.now();
       const durMs = (samples.length / inRate) * 1000;
       if (pipe.lastArrivalMs > 0) {
         const deltaMs = nowMs - pipe.lastArrivalMs;
-        if (deltaMs < 350) {
+        if (deltaMs < 400) {
           const jit = Math.abs(deltaMs - durMs);
           pipe.jitterMs = pipe.jitterMs * 0.88 + jit * 0.12;
-          // Colchón adaptativo entre 95 ms (red limpia) y 240 ms (red móvil con ráfagas TCP)
-          const targetMs = Math.max(95, Math.min(240, 85 + pipe.jitterMs * 2.2));
-          pipe.targetPrebuffer = Math.ceil(pipe.ctxRate * (targetMs / 1000));
-          pipe.maxBuffer = pipe.targetPrebuffer + Math.ceil(pipe.ctxRate * 0.28);
         } else {
           // Nueva frase tras silencio: reiniciar interpolador
           pipe.rxHasLast = false;
@@ -1596,12 +1676,15 @@
         }
       }
       pipe.lastArrivalMs = nowMs;
+      // Estabilidad acumulada: el objetivo aprendido vuelve poco a poco a ~160 ms
+      pipe.learnedMs = Math.max(150, pipe.learnedMs - 0.15);
 
-      // Si se acumularon demasiados paquetes por un atasco TCP previo, hacer crossfade
-      // suave descartando el exceso más antiguo para mantener tiempo real sin clics
-      if (pipe.available > pipe.maxBuffer) {
-        const drop = pipe.available - pipe.targetPrebuffer;
-        pipe.readPos = (pipe.readPos + drop) % pipe.cap;
+      // Solo en exceso extremo (>3.5 s tras un atasco TCP larguísimo) se recorta
+      // lo más viejo; por debajo de eso NADA se descarta: se acelera la lectura.
+      const hardCap = pipe.ctxRate * 3.5;
+      if (pipe.available > hardCap) {
+        const drop = Math.floor(pipe.available - pipe.ctxRate * 1.2);
+        pipe.readPosF = (pipe.readPosF + drop) % pipe.cap;
         pipe.available -= drop;
         pipe.fadeInPos = 0;
       }
