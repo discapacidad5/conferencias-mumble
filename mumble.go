@@ -535,9 +535,10 @@ type clienteWS struct {
 	sala      string
 	grupo     int
 	esAdmin   bool
+	connSid   string
 	conn      *websocket.Conn
 	ctrlCh    chan []byte // Señalización JSON (prioridad alta, nunca se descarta por audio)
-	audioCh   chan []byte // Voz binaria (cola profunda de 256 tramas ~10s, cero pérdidas en baches WiFi)
+	audioCh   chan []byte // Voz binaria en tiempo real (máx 10 tramas = 400ms, cero retraso acumulado)
 	videoCh   chan []byte // Video y Pantalla (drop-oldest si la red celular es lenta)
 	cerrado   chan struct{}
 	once      sync.Once
@@ -868,10 +869,11 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		sala:      sala,
 		grupo:     grupo,
 		esAdmin:   cl.RoomAdmin,
+		connSid:   r.URL.Query().Get("sid"),
 		conn:      conn,
 		ctrlCh:    make(chan []byte, 64),
-		audioCh:   make(chan []byte, 256), // ~10 segundos de voz: absorbe cualquier ráfaga WiFi/móvil sin perder paquetes
-		videoCh:   make(chan []byte, 2),   // máximo 2 frames en cola: cero latencia acumulada
+		audioCh:   make(chan []byte, 10), // máx 400 ms en cola: tiempo real sin acumular 3-5s de retraso
+		videoCh:   make(chan []byte, 2),  // máximo 2 frames en cola: cero latencia acumulada
 		cerrado:   make(chan struct{}),
 		canMic:    canMic,
 		canCam:    canCam,
@@ -885,10 +887,14 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	mr.clientes[c.identidad] = c
 	mr.mu.Unlock()
 
-	// Si había otra conexión activa con la misma identidad, cerrarla con
-	// código 4002 (DUPLICATE_IDENTITY) para que muestre el modal sin reconectar en bucle.
+	// Si es la misma pestaña reconectándose tras un micro-corte WiFi (mismo sid),
+	// cerrar el socket viejo en silencio (1000). Solo usar 4002 si es otro dispositivo/pestaña.
 	if prev != nil && prev != c {
-		prev.cerrarConCodigo(4002, "DUPLICATE_IDENTITY")
+		if prev.connSid != "" && prev.connSid == c.connSid {
+			prev.cerrarConCodigo(websocket.CloseNormalClosure, "reconnected")
+		} else {
+			prev.cerrarConCodigo(4002, "DUPLICATE_IDENTITY")
+		}
 	}
 
 	mr.difundirEstadoPeers(grupo)
@@ -939,7 +945,9 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	}
 
 	go func() {
-		pingTk := time.NewTicker(20 * time.Second)
+		// Ping cada 5s mantiene despierta la radio WiFi del móvil (evita que entre
+		// en Power Save Mode cada 2-3 min) y acelera la detección de pérdida TCP.
+		pingTk := time.NewTicker(5 * time.Second)
 		defer pingTk.Stop()
 		for {
 			// 1. Drenar primero cualquier paquete de voz o control pendiente

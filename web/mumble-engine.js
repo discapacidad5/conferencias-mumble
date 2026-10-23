@@ -351,7 +351,7 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
     super();
     const rate = sampleRate || 48000;
     this.rate = rate;
-    this.cap = Math.ceil(rate * 4);
+    this.cap = Math.ceil(rate * 1.5);
     this.ring = new Float32Array(this.cap);
     this.writePos = 0;
     this.readPosF = 0;
@@ -362,9 +362,9 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
     this.underrunSamples = 0;
     this.lastOut = 0;
     this.fadeInPos = 0;
-    this.fadeInLen = Math.ceil(rate * 0.006);
+    this.fadeInLen = Math.ceil(rate * 0.005);
     this.readRate = 1.0;
-    this.targetSamples = Math.ceil(rate * 0.14); // 140 ms inicial
+    this.targetSamples = Math.ceil(rate * 0.06); // 60 ms: tiempo real instantáneo
     this.port.onmessage = (ev) => {
       const d = ev.data;
       if (!d) return;
@@ -373,7 +373,7 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
         return;
       }
       if (d.t === 'target' && typeof d.ms === 'number') {
-        this.targetSamples = Math.ceil(this.rate * (Math.max(110, Math.min(420, d.ms)) / 1000));
+        this.targetSamples = Math.ceil(this.rate * (Math.max(55, Math.min(180, d.ms)) / 1000));
         return;
       }
       if (d.t === 'push' && d.pcm) {
@@ -381,10 +381,11 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
         const n = src.length;
         if (n === 0) return;
         this.eosPending = false;
-        // Si hubiera >1.8s acumulados tras un corte largo de red, avanzar con fade
-        const hardCap = this.rate * 1.8;
+        // Tope estricto de tiempo real (260 ms): si llega una ráfaga atrasada tras
+        // un bache WiFi, saltar a los últimos 80 ms en vivo para que JAMÁS haya 3-5s de retraso.
+        const hardCap = this.rate * 0.26;
         if (this.available + n > hardCap) {
-          const keep = Math.ceil(this.rate * 0.28);
+          const keep = Math.ceil(this.rate * 0.08);
           const drop = Math.max(0, (this.available + n) - keep);
           this.readPosF = (this.readPosF + drop) % this.cap;
           this.available = Math.max(0, this.available - drop);
@@ -414,7 +415,7 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
         if (
           this.available >= this.targetSamples ||
           this.eosPending ||
-          this.waitSamples >= this.rate * 0.18
+          this.waitSamples >= this.rate * 0.08
         ) {
           this.playing = true;
           this.waitSamples = 0;
@@ -430,15 +431,15 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Ajuste suave de velocidad: +6% si hay retraso acumulado, -5% si escasea y sigue hablando
+    // Drenar cualquier micro-retraso rápidamente (+12%) para mantener tiempo real
     const over = this.available - this.targetSamples;
     let desired = 1.0;
-    if (over > this.rate * 0.14) {
-      desired = Math.min(1.07, 1.0 + (over / this.rate) * 0.14);
-    } else if (!this.eosPending && this.available < this.targetSamples * 0.45) {
-      desired = 0.95;
+    if (over > this.rate * 0.05) {
+      desired = Math.min(1.12, 1.0 + (over / this.rate) * 0.35);
+    } else if (!this.eosPending && this.available < this.targetSamples * 0.4) {
+      desired = 0.96;
     }
-    this.readRate += (desired - this.readRate) * 0.1;
+    this.readRate += (desired - this.readRate) * 0.15;
 
     const ring = this.ring;
     const cap = this.cap;
@@ -458,15 +459,11 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
         this.lastOut = s;
         this.underrunSamples = 0;
       } else {
-        // Sin muestras: decaimiento suave a cero en ~8 ms (cero zumbido ni clic)
         this.lastOut *= 0.982;
         if (Math.abs(this.lastOut) < 0.0001) this.lastOut = 0;
         out[i] = this.lastOut;
         this.underrunSamples++;
-        if (this.eosPending || this.underrunSamples > this.rate * 0.065) {
-          if (!this.eosPending) {
-            this.targetSamples = Math.min(Math.ceil(this.rate * 0.38), this.targetSamples + Math.ceil(this.rate * 0.035));
-          }
+        if (this.eosPending || this.underrunSamples > this.rate * 0.045) {
           this.playing = false;
           this.eosPending = false;
           this.waitSamples = 0;
@@ -844,17 +841,26 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         }
       };
 
+      // Enviar 3 marcadores cortos EOS espaciados 25ms fuerza 3 DupACKs (TCP Fast Retransmit)
+      // en caso de que el último paquete de voz se haya perdido en un WiFi débil.
       const enviarMarcadorEOS = () => {
-        if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-        const s = (txSeq = (txSeq + 1) & 0xffff);
-        const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
-        try { this._room._ws.send(eos); } catch {}
+        const sendOne = () => {
+          if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
+          const s = (txSeq = (txSeq + 1) & 0xffff);
+          const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
+          try { this._room._ws.send(eos); } catch {}
+        };
+        sendOne();
+        setTimeout(sendOne, 25);
+        setTimeout(sendOne, 50);
       };
 
-      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) como 2 sub-tramas Opus de 20 ms y/o ADPCM
+      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) en tiempo real.
+      // Tope estricto de 6 KB en bufferedAmount: jamás acumular segundos de audio
+      // viejo en el socket TCP del emisor cuando su WiFi tiene un micro-corte.
       const enviarTrama40ms = (frame48k) => {
         if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-        if (this._room._ws.bufferedAmount > 192 * 1024) return;
+        if (this._room._ws.bufferedAmount > 6 * 1024) return;
         txSeq = (txSeq + 1) & 0xffff;
 
         let enviadoOpus = false;
@@ -1491,25 +1497,41 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 
     _iniciarMonitorRed() {
       if (this._pingTimer) clearInterval(this._pingTimer);
-      // Evaluación inicial inmediata según el tipo de red móvil reportado por el navegador
+      this._lastRxAt = performance.now();
       this._evaluarCalidadRed();
       this.emit(RoomEvent.ConnectionQualityChanged, this._calidadActual, this.localParticipant);
 
       const enviarPing = () => {
         if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
-        if (this._ws.bufferedAmount > 16384) {
+        const now = performance.now();
+        // Watchdog Make-Before-Break: si el WiFi del vecino congeló el socket TCP
+        // más de 4.5s sin recibir respuesta o atascó la cola de subida (>14 KB),
+        // abrir un socket nuevo en paralelo de inmediato sin esperar 10-15s al OS.
+        if ((now - (this._lastRxAt || now)) > 4500 || this._ws.bufferedAmount > 14 * 1024) {
+          this._lastRxAt = now;
+          if (typeof this._reemplazarSocketCongelado === 'function') {
+            this._reemplazarSocketCongelado();
+            return;
+          }
+        }
+        if (this._ws.bufferedAmount > 6144) {
           this._evaluarCalidadRed(420);
         }
         try {
-          this._ws.send(JSON.stringify({ t: 'ping_net', ts: Math.round(performance.now()) }));
+          this._ws.send(JSON.stringify({ t: 'ping_net', ts: Math.round(now) }));
         } catch {}
       };
-      setTimeout(enviarPing, 600);
-      this._pingTimer = setInterval(enviarPing, 3200);
+      setTimeout(enviarPing, 500);
+      this._pingTimer = setInterval(enviarPing, 2000);
 
       const navConn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
       if (navConn && typeof navConn.addEventListener === 'function') {
-        this._onNetChange = () => this._evaluarCalidadRed();
+        this._onNetChange = () => {
+          this._evaluarCalidadRed();
+          if (typeof this._reemplazarSocketCongelado === 'function') {
+            this._reemplazarSocketCongelado();
+          }
+        };
         navConn.addEventListener('change', this._onNetChange);
       }
     }
@@ -1517,6 +1539,9 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
     async connect(baseUrl, token) {
       await promesaDeteccionOpus;
       this._closedByClient = false;
+      if (!this._connSid) {
+        this._connSid = Math.random().toString(36).slice(2, 10);
+      }
       if (this._reconnectTimer) {
         clearTimeout(this._reconnectTimer);
         this._reconnectTimer = null;
@@ -1539,23 +1564,20 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 
       const sala = (window.S && window.S.sala) || new URLSearchParams(location.search).get('sala') || '';
       const wsBase = (baseUrl || location.origin).replace(/^http/, 'ws').replace(/\/$/, '');
-      const wsUrl = `${wsBase}/api/salas/${encodeURIComponent(sala)}/media?token=${encodeURIComponent(token)}&opus=${SOPORTE_OPUS_RX ? 1 : 0}`;
+      const wsUrl = `${wsBase}/api/salas/${encodeURIComponent(sala)}/media?token=${encodeURIComponent(token)}&opus=${SOPORTE_OPUS_RX ? 1 : 0}&sid=${encodeURIComponent(this._connSid)}`;
       this._wsUrl = wsUrl;
 
-      // Reconexión interna transparente del WebSocket: ante micro-cortes de WiFi
-      // o del túnel Cloudflare, reabre el socket con el mismo token de 24h en
-      // ~400 ms SIN destruir Room, SIN cerrar el micrófono y SIN llamar a /api/obtener-acceso.
       const programarReconexionInterna = (intento) => {
         if (this._closedByClient || this._reconnectTimer) return;
-        const espera = Math.min(4500, 900 + intento * 800);
+        const espera = Math.min(3500, 600 + intento * 600);
         this._reconnectTimer = setTimeout(() => {
           this._reconnectTimer = null;
           if (this._closedByClient) return;
-          abrirSocket(intento + 1, null, null);
+          abrirSocket(intento + 1, null, null, false);
         }, espera);
       };
 
-      const abrirSocket = (intento, resolveInicial, rejectInicial) => {
+      const abrirSocket = (intento, resolveInicial, rejectInicial, esReemplazoVivo) => {
         if (this._closedByClient) return;
         let conectado = false;
         let ws;
@@ -1564,23 +1586,25 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         } catch (err) {
           if (resolveInicial) {
             if (intento < 4) {
-              setTimeout(() => abrirSocket(intento + 1, resolveInicial, rejectInicial), 600);
+              setTimeout(() => abrirSocket(intento + 1, resolveInicial, rejectInicial, false), 600);
             } else {
               rejectInicial(err);
             }
-          } else {
+          } else if (!esReemplazoVivo) {
             programarReconexionInterna(intento);
           }
           return;
         }
         ws.binaryType = 'arraybuffer';
-        this._ws = ws;
+        if (!esReemplazoVivo) {
+          this._ws = ws;
+        }
 
         const timeout = setTimeout(() => {
           if (!conectado) {
             try { ws.close(); } catch {}
           }
-        }, 9000);
+        }, 7000);
 
         ws.onopen = () => {
           if (this._closedByClient) {
@@ -1589,12 +1613,17 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           }
           conectado = true;
           clearTimeout(timeout);
+          const viejo = this._ws;
+          this._ws = ws;
+          this._lastRxAt = performance.now();
+          if (viejo && viejo !== ws) {
+            try { viejo.close(1000, 'replaced'); } catch {}
+          }
           if (!this._speakerTimer) {
             this._speakerTimer = setInterval(() => this._actualizarSpeakers(), 300);
           }
           this._iniciarMonitorRed();
           this._enviarEstadoMedia();
-          // Si teníamos grupo de discusión distinto al del token inicial, resincronizarlo
           if (window.S && typeof window.S.grupoActual === 'number' && window.S.grupoActual > 0) {
             try { ws.send(JSON.stringify({ t: 'cambiar_grupo', grupo: window.S.grupoActual })); } catch {}
           }
@@ -1605,6 +1634,8 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         ws.onerror = () => {};
 
         ws.onmessage = (ev) => {
+          if (this._ws !== ws) return;
+          this._lastRxAt = performance.now();
           if (typeof ev.data === 'string') {
             this._manejarTexto(ev.data);
           } else if (ev.data instanceof ArrayBuffer) {
@@ -1614,9 +1645,9 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 
         ws.onclose = (ev) => {
           clearTimeout(timeout);
-          if (this._ws === ws) {
-            this._ws = null;
-          }
+          // Si este socket ya fue reemplazado por otro nuevo (Make-Before-Break), ignorar su cierre
+          if (this._ws !== ws) return;
+          this._ws = null;
           if (this._closedByClient) return;
 
           if (ev.code === 4002 || ev.reason === 'DUPLICATE_IDENTITY') {
@@ -1632,20 +1663,24 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 
           if (!conectado && resolveInicial) {
             if (intento < 4) {
-              setTimeout(() => abrirSocket(intento + 1, resolveInicial, rejectInicial), 650);
+              setTimeout(() => abrirSocket(intento + 1, resolveInicial, rejectInicial, false), 650);
             } else {
               rejectInicial(new Error('No se pudo abrir la conexión WebSocket HTTPS'));
             }
             return;
           }
 
-          // Cierre inesperado de red/túnel: reconectar en silencio manteniendo micro y audio vivos
           programarReconexionInterna(1);
         };
       };
 
+      this._reemplazarSocketCongelado = () => {
+        if (this._closedByClient || this._reconnectTimer) return;
+        abrirSocket(1, null, null, true);
+      };
+
       await new Promise((resolve, reject) => {
-        abrirSocket(0, resolve, reject);
+        abrirSocket(0, resolve, reject, false);
       });
     }
 
@@ -1924,9 +1959,9 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         underrunSamples: 0,
         lastOut: 0,
         fadeInPos: 0,
-        fadeInLen: Math.ceil(ctxRate * 0.006),
+        fadeInLen: Math.ceil(ctxRate * 0.005),
         readRate: 1.0,
-        targetSamples: Math.ceil(ctxRate * 0.14), // 140 ms inicial
+        targetSamples: Math.ceil(ctxRate * 0.06), // 60 ms inicial: tiempo real instantáneo
         // Estado de remuestreo continuo entre paquetes consecutivos
         rxPhase: 0,
         rxLastInSample: 0,
@@ -1934,7 +1969,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         // Medición de jitter sólo entre secuencias consecutivas
         lastArrivalMs: 0,
         lastSeq: -1,
-        jitterMs: 20,
+        jitterMs: 15,
         opusDecoder: null,
         opusTimestampUs: 0,
       };
@@ -1974,7 +2009,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
               if (
                 pipe.available >= pipe.targetSamples ||
                 pipe.eosPending ||
-                pipe.waitSamples >= pipe.ctxRate * 0.18
+                pipe.waitSamples >= pipe.ctxRate * 0.08
               ) {
                 pipe.playing = true;
                 pipe.waitSamples = 0;
@@ -1992,12 +2027,12 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 
           const over = pipe.available - pipe.targetSamples;
           let desired = 1.0;
-          if (over > pipe.ctxRate * 0.14) {
-            desired = Math.min(1.07, 1.0 + (over / pipe.ctxRate) * 0.14);
-          } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.45) {
-            desired = 0.95;
+          if (over > pipe.ctxRate * 0.05) {
+            desired = Math.min(1.12, 1.0 + (over / pipe.ctxRate) * 0.35);
+          } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.4) {
+            desired = 0.96;
           }
-          pipe.readRate += (desired - pipe.readRate) * 0.1;
+          pipe.readRate += (desired - pipe.readRate) * 0.15;
 
           const ring = pipe.ring;
           const capLocal = pipe.cap;
@@ -2021,13 +2056,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
               if (Math.abs(pipe.lastOut) < 0.0001) pipe.lastOut = 0;
               out[i] = pipe.lastOut;
               pipe.underrunSamples++;
-              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.065) {
-                if (!pipe.eosPending) {
-                  pipe.targetSamples = Math.min(
-                    Math.ceil(pipe.ctxRate * 0.38),
-                    pipe.targetSamples + Math.ceil(pipe.ctxRate * 0.035)
-                  );
-                }
+              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.045) {
                 pipe.playing = false;
                 pipe.eosPending = false;
                 pipe.waitSamples = 0;
@@ -2077,8 +2106,8 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
             const deltaMs = nowMs - pipe.lastArrivalMs;
             if (deltaMs < 500) {
               const jit = Math.abs(deltaMs - 40);
-              pipe.jitterMs = pipe.jitterMs * 0.88 + jit * 0.12;
-              const targetMs = Math.max(125, Math.min(360, 115 + pipe.jitterMs * 2.0));
+              pipe.jitterMs = pipe.jitterMs * 0.85 + jit * 0.15;
+              const targetMs = Math.max(55, Math.min(180, 50 + pipe.jitterMs * 1.4));
               pipe.targetSamples = Math.ceil(pipe.ctxRate * (targetMs / 1000));
               if (pipe.worklet) {
                 try { pipe.worklet.port.postMessage({ t: 'target', ms: targetMs }); } catch {}
@@ -2148,10 +2177,10 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         } catch {}
       }
 
-      // Empujar al Ring Buffer del fallback ScriptProcessor
-      const hardCap = pipe.ctxRate * 1.8;
+      // Empujar al Ring Buffer del fallback ScriptProcessor (tope 260 ms en vivo)
+      const hardCap = pipe.ctxRate * 0.26;
       if (pipe.available + outPcm.length > hardCap) {
-        const keep = Math.ceil(pipe.ctxRate * 0.28);
+        const keep = Math.ceil(pipe.ctxRate * 0.08);
         const drop = Math.max(0, (pipe.available + outPcm.length) - keep);
         pipe.readPosF = (pipe.readPosF + drop) % pipe.cap;
         pipe.available = Math.max(0, pipe.available - drop);
