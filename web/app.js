@@ -1811,6 +1811,19 @@ function renderPttEstados() {
     : st === 'sinpermiso' ? 'Sin permiso'
     : st === 'ocupado' ? `Habla ${S.estado.pisoNombre || S.estado.piso}`
     : auto ? 'Auto: escuchando' : 'Piso libre';
+  // Círculo flotante central: de pie el dedo tapa el pulsador, así que el
+  // estado del piso se ve en grande en el centro de la pantalla. Sentado
+  // (o con La Palabra) el propio asiento ya lo marca, no hace falta.
+  const pf = $('#ptt-float');
+  if (pf) {
+    const mostrar = (st === 'conectando' || st === 'hablando') &&
+      !estoySentado() && !tengoPalabra();
+    pf.classList.toggle('oculto', !mostrar);
+    pf.classList.toggle('conectando', st === 'conectando');
+    pf.classList.toggle('hablando', st === 'hablando');
+    const t = pf.querySelector('.pf-txt');
+    if (t) t.textContent = st === 'conectando' ? 'Pidiendo el piso…' : '¡Habla ya!';
+  }
 }
 
 // Chirp estilo Zello: blip agudo al conseguir el piso, doble grave si te

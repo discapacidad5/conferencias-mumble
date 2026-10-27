@@ -133,6 +133,38 @@ label.check input { width: auto; }
   animation: pttGira .9s linear infinite;
 }
 @keyframes pttGira { to { transform: rotate(360deg); } }
+/* círculo flotante central del piso: de pie el dedo tapa el pulsador, el
+   estado se muestra en grande — aro bicolor girando al pedir, rojo al
+   hablar (sentado el mismo asiento ya lo marca, no hace falta) */
+#ptt-float {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 66; pointer-events: none;
+  width: 92px; height: 92px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: rgba(10,12,18,.72); border: 2px solid var(--borde);
+  font-size: 2rem;
+}
+#ptt-float .pf-txt {
+  position: absolute; bottom: -1.9rem; left: 50%; transform: translateX(-50%);
+  white-space: nowrap; font-size: .78rem; font-weight: 600; color: var(--texto);
+  text-shadow: 0 1px 4px rgba(0,0,0,.9);
+}
+#ptt-float.conectando::before {
+  content: ''; position: absolute; inset: -7px; border-radius: 50%;
+  background: repeating-conic-gradient(var(--ambar) 0 18deg, var(--peligro) 18deg 36deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+  animation: pttGira .9s linear infinite;
+}
+#ptt-float.hablando {
+  border-color: var(--peligro);
+  box-shadow: 0 0 0 4px var(--peligro), 0 0 26px rgba(255,77,79,.55);
+  animation: pulsa 1.2s infinite;
+}
+/* el pulsador crece un poco mientras lo tienes pisado: aunque el dedo lo
+   tape, el borde que asoma delata que está activo */
+.btn.ctl.ptt-conectando, .btn.ctl.ptt-hablando,
+#chat-enviar.ptt-conectando, #chat-enviar.ptt-hablando { transform: scale(1.15); }
 /* el asiento (cuadrado): franja bicolor que VIAJA por el borde — gradiente
    cónico animado por ángulo, recortado a anillo de 3px por la máscara.
    Si el navegador no soporta @property quedan tramos fijos alternados,

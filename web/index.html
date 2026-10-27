@@ -12,8 +12,8 @@
 <meta name="apple-mobile-web-app-title" content="Conferencia">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
-<link rel="stylesheet" href="/styles.css?v=141">
-<script src="/conferencia-engine.js?v=141"></script>
+<link rel="stylesheet" href="/styles.css?v=142">
+<script src="/conferencia-engine.js?v=142"></script>
 </head>
 <body>
 
@@ -307,6 +307,9 @@
 
   <!-- gestos del pulsador PTT: 🔒 arriba = bloquear, A a la izquierda = automático -->
   <div id="ptt-gestos" class="oculto"><span class="pg-auto" title="Modo automático">A</span><span class="pg-lock">🔒</span></div>
+  <!-- círculo flotante del piso: de pie el dedo tapa el pulsador, así que
+       el estado se ve en grande en el centro de la pantalla -->
+  <div id="ptt-float" class="oculto"><span class="pf-ico">🎙️</span><span class="pf-txt"></span></div>
   <div id="flotantes"></div>
   <div id="hablas-aviso" class="oculto"><span id="hablas-txt"></span></div>
   <div id="reacciones-panel" class="oculto">
@@ -533,6 +536,6 @@
   <button id="nav-tip-x" class="btn mini" aria-label="Cerrar">✕</button>
 </div>
 <div id="toast-wrap"></div>
-<script src="/app.js?v=141"></script>
+<script src="/app.js?v=142"></script>
 </body>
 </html>
