@@ -119,6 +119,20 @@ label.check input { width: auto; }
 @media (max-width: 640px) {
   .asiento-ptt { width: 38px; height: 38px; font-size: 1rem; }
 }
+/* MI asiento entero es el pulsador PTT: el nombre queda dentro del botón
+   y las esquinas guardan las acciones (⋮ opciones · ✕ salir · 📌 pin) */
+.asiento-mio { cursor: pointer; }
+.asiento-mio.ptt-libre { border: 3px solid var(--ambar); }
+.asiento-mio.ptt-ocupado { border: 3px solid var(--verde); }
+.asiento-mio.ptt-hablando { border: 3px solid var(--peligro); animation: pulsa 1.2s infinite; }
+.asiento-mio.ptt-sinpermiso { border-style: solid; opacity: .8; }
+.asiento-esq {
+  position: absolute; z-index: 5; min-width: 30px; min-height: 30px; padding: 0 .35rem;
+  border-radius: 8px; background: rgba(0,0,0,.72); border: 1px solid var(--borde);
+  color: var(--texto); font-size: .95rem; line-height: 1; cursor: pointer;
+}
+.asiento-esq.salir { top: .3rem; right: .3rem; }
+.asiento-esq.menu { bottom: .3rem; right: .3rem; }
 .badge {
   background: var(--peligro); color: #fff; border-radius: 999px;
   font-size: .7rem; padding: .1rem .45rem; margin-left: .3rem;
@@ -207,6 +221,9 @@ label.check input { width: auto; }
 .nv-play.cargando { opacity: .7; animation: pulsa 1.4s infinite; }
 .nv-play.oido { opacity: .6; }
 .nv-play:disabled { opacity: .45; cursor: default; }
+/* nota que se está grabando en este momento: ● + barra roja pulsante */
+.msg.nota-voz.grabando { border-left-color: var(--peligro); }
+.nv-relleno.rec { width: 100% !important; background: var(--peligro); animation: pulsa 1s infinite; }
 
 #barra-controles {
   grid-column: 1 / -1; background: var(--bg2); border-top: 1px solid var(--borde);

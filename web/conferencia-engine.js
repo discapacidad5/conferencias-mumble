@@ -543,9 +543,12 @@ class VozRxProcessor extends AudioWorkletProcessor {
     this.readRate += (desired - this.readRate) * 0.15;
 
     // Aceleración con SOLA (overlap-add alineado por correlación): consume
-    // más entrada de la que emite sin cambiar el tono de la voz. Solo se
-    // usa cuando hay retraso real (readRate > 1.02); en vivo corre a 1.0.
-    if (this.readRate > 1.02 && this.available > n * this.readRate + this.rate * 0.05) {
+    // más entrada de la que emite sin cambiar el tono de la voz. Se usa en
+    // el rango 1.02–1.9×; por encima el retraso es tan grande que la voz ya
+    // no se entiende ni con SOLA, y conviene el salto directo (resampleo
+    // barato) para llegar al presente cuanto antes.
+    if (this.readRate > 1.02 && this.readRate < 1.9 &&
+        this.available > n * this.readRate + this.rate * 0.05) {
       this._sola(out, n);
       return true;
     }
@@ -1747,7 +1750,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     _segMeta(seg) {
       return seg ? {
         seq: seg.seq, de: seg.de, nombre: seg.nombre, durMs: seg.durMs,
-        inicio: seg.inicio, interrumpida: seg.interrumpida,
+        inicio: seg.inicio, interrumpida: seg.interrumpida, abierto: seg.abierto,
       } : null;
     }
 
@@ -1924,9 +1927,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           }
           const over = pipe.available - pipe.targetSamples;
           let desired = 1.0;
-          // respaldo sin SOLA: limitar a +4% (imperceptible) para no subir el tono
+          // respaldo sin SOLA: limitar a +4% (imperceptible) para no subir el
+          // tono — salvo con retraso enorme (velMax≥2), donde importa llegar
+          // al presente aunque el tono suba
           if (over > pipe.ctxRate * 0.05) {
-            desired = Math.min(1.04, 1.0 + (over / pipe.ctxRate) * 0.35);
+            const capVel = pipe.velMax >= 2 ? pipe.velMax : 1.04;
+            desired = Math.min(capVel, 1.0 + (over / pipe.ctxRate) * 0.35);
           } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.4) {
             desired = 0.96;
           }
@@ -2003,7 +2009,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const dt = Math.min(250, ahoraMs - (this._feedUltimo || ahoraMs));
       this._feedUltimo = ahoraMs;
       const pipe = this._asegurarVozPipe();
-      this._vozBufMs = Math.max(0, this._vozBufMs - dt * (this._drenando ? 1.3 : 1.05));
+      this._vozBufMs = Math.max(0, this._vozBufMs - dt * (this._velAct || 1.05));
 
       // 1. Notas re-escuchadas tienen prioridad y suenan a velocidad natural
       while (this._replayQ.length && this._vozBufMs < 550) {
@@ -2072,12 +2078,21 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
       }
 
-      // 3. Velocidad de drenaje + estimación del retraso respecto al presente
-      // (una nota re-escuchada NO es retraso: siempre a velocidad natural)
+      // 3. Velocidad de drenaje escalonada según el retraso respecto al
+      // presente: a más atraso más aceleración (el audio queda grabado en
+      // las notas, así que conviene llegar al vivo cuanto antes). Una nota
+      // re-escuchada NO es retraso: siempre a velocidad natural.
       const retraso = this._retrasoMs();
       const replayActivo = this._replayQ.length > 0 ||
         this._replayProg.length > 0 || this._replayPendMs > 30;
-      const vel = replayActivo ? 1.0 : (retraso > 4000 ? 1.33 : 1.12);
+      const vel = replayActivo ? 1.0
+        : retraso > 60000 ? 4.0   // >1 min: casi a saltos, llegar ya
+        : retraso > 30000 ? 2.5
+        : retraso > 10000 ? 1.6
+        : retraso > 5000 ? 1.33
+        : retraso > 3000 ? 1.08
+        : 1.0;                    // ≤3 s se considera en vivo: voz natural
+      this._velAct = vel;
       if (vel !== pipe.velMax) {
         pipe.velMax = vel;
         if (pipe.worklet) {
@@ -2730,7 +2745,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         case 'seg_ini': {
           // Aviso de que alguien empezó una frase (segmento abierto)
           const de = m.de || '';
-          if (de === this.localParticipant.identity) break;
+          if (de === this.localParticipant.identity) {
+            // Mi propia voz no se encola ni se reproduce, pero la UI sí
+            // muestra la nota "grabando" en el historial al instante
+            this.emit('seg_ini', {
+              seq: m.seq, de, nombre: m.nombre || de,
+              inicio: Date.now(), durMs: 0, abierto: true,
+            });
+            break;
+          }
           const cur = this._segPorHablante.get(de);
           let seg;
           if (cur != null && cur < 0) {
@@ -3097,9 +3120,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
           const over = pipe.available - pipe.targetSamples;
           let desired = 1.0;
-          // respaldo sin SOLA: limitar a +4% (imperceptible) para no subir el tono
+          // respaldo sin SOLA: limitar a +4% (imperceptible) para no subir
+          // el tono — salvo con retraso enorme (velMax≥2): llegar al presente
           if (over > pipe.ctxRate * 0.05) {
-            desired = Math.min(1.04, 1.0 + (over / pipe.ctxRate) * 0.35);
+            const capVel = pipe.velMax >= 2 ? pipe.velMax : 1.04;
+            desired = Math.min(capVel, 1.0 + (over / pipe.ctxRate) * 0.35);
           } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.4) {
             desired = 0.96;
           }

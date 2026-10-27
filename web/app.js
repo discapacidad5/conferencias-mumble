@@ -2046,6 +2046,7 @@ function cablearRoom(room) {
     manejarData(d, participant);
   });
   // --- notas de voz en vivo (segmentos confiables) ---
+  room.on('seg_ini', (m) => { if (m) agregarNotaVozEnVivo(m); });
   room.on('seg_fin', (m) => {
     if (!m) return;
     agregarNotaVoz(m);
@@ -2688,20 +2689,28 @@ function renderAsientos() {
         pin.className = 'btn mini asiento-pin'; pin.type = 'button'; pin.textContent = '📌';
         pin.title = 'Vídeo flotante del asiento ' + (i + 1) + ' (sigue a quien se siente)';
         pin.onclick = (ev) => { ev.stopPropagation(); alternarFlotante('asiento:' + i); };
+        pin.addEventListener('pointerdown', ev => ev.stopPropagation());
         div.appendChild(pin);
       }
       if (S.activo === a.identidad) div.style.borderColor = 'var(--verde)';
-      // el centro de MI asiento es un pulsador PTT (esquinas = acciones del
-      // asiento); mismo comportamiento que el botón del micro
+      // MI asiento entero ES el pulsador PTT: mi nombre queda dentro del
+      // botón y las esquinas guardan las acciones (⋮ opciones · ✕ salir)
       if (a.identidad === S.identidad && S.room) {
-        const bp = document.createElement('button');
-        bp.type = 'button';
-        bp.className = 'asiento-ptt ptt-sup';
-        bp.textContent = '🎙️';
-        wirePttButton(bp);
-        div.appendChild(bp);
+        div.classList.add('asiento-mio', 'ptt-sup');
+        wirePttButton(div);
+        div.insertAdjacentHTML('beforeend',
+          '<button class="asiento-esq menu" type="button" title="Opciones del asiento">⋮</button>' +
+          '<button class="asiento-esq salir" type="button" title="Levantarme del asiento">✕</button>');
+        div.querySelector('.asiento-esq.menu').onclick =
+          (ev) => { ev.stopPropagation(); menuPersona(ev, a.identidad, i + 1); };
+        div.querySelector('.asiento-esq.salir').onclick =
+          (ev) => { ev.stopPropagation(); accion('levantarse').catch(e => toast(e.message)); };
+        // las esquinas no deben disparar el PTT del asiento completo
+        div.querySelectorAll('.asiento-esq').forEach(b =>
+          b.addEventListener('pointerdown', ev => ev.stopPropagation()));
+      } else {
+        div.onclick = (ev) => menuPersona(ev, a.identidad, i + 1);
       }
-      div.onclick = (ev) => menuPersona(ev, a.identidad, i + 1);
     } else {
       div.classList.add('libre');
       if (S.sentando) {
@@ -4178,8 +4187,57 @@ const fmtDurSeg = (ms) => {
 
 // Cada frase cerrada queda como nota de voz en el historial del chat:
 // reproducible, con indicador de sonando/escuchada
-function agregarNotaVoz(meta) {
+// La frase que se está grabando AHORA aparece al instante en el chat con
+// ● grabando + tiempo corriendo. No se puede rebobinar (aún no termina),
+// pero tocarla te adelanta hasta el audio en tiempo real — igual que el
+// chip "Ir al presente" cuando vas atrasado.
+function agregarNotaVozEnVivo(meta) {
   if (!meta || meta.seq <= 0 || S._nvEls.has(meta.seq)) return;
+  const lista = $('#chat-lista');
+  const el = document.createElement('div');
+  el.className = 'msg nota-voz grabando';
+  const inicio = meta.inicio || Date.now();
+  el.dataset.durMs = 0;
+  el.innerHTML = `<div class="quien">🎙️ ${esc(meta.nombre || meta.de)} · <span class="muted">ahora</span></div>` +
+    `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}" title="Ir al audio en tiempo real">⏭️</button>` +
+    `<div class="nv-pista"><div class="nv-relleno rec"></div></div>` +
+    `<span class="nv-tiempo">● 0:00</span></div>`;
+  lista.appendChild(el);
+  lista.scrollTop = lista.scrollHeight;
+  S._nvEls.set(meta.seq, el);
+  S._nvSeqs.push(meta.seq);
+  S._nvSeqs.sort((a, b) => a - b);
+  const t = el.querySelector('.nv-tiempo');
+  el._recTimer = setInterval(() => {
+    t.textContent = '● ' + fmtDurSeg(Math.max(0, Date.now() - inicio));
+  }, 500);
+  // tocarla: saltar todo el retraso acumulado y escuchar desde el vivo
+  el.querySelector('.nv-play').onclick = () => {
+    if (S.room && S.room.saltarAlPresente) S.room.saltarAlPresente();
+    marcarNotaVoz(meta.seq, 'sonando');
+    toast('Te adelantaste al audio en tiempo real');
+  };
+}
+
+function agregarNotaVoz(meta) {
+  if (!meta || meta.seq <= 0) return;
+  const viejo = S._nvEls.get(meta.seq);
+  if (viejo) {
+    // la nota en vivo se cerró: pasa de "grabando" a nota reproducible
+    viejo.classList.remove('grabando');
+    clearInterval(viejo._recTimer);
+    viejo.dataset.durMs = meta.durMs || viejo.dataset.durMs || 0;
+    const t = viejo.querySelector('.nv-tiempo');
+    if (t) t.textContent = fmtDurSeg(meta.durMs);
+    const r = viejo.querySelector('.nv-relleno');
+    if (r) { r.classList.remove('rec'); r.style.width = '0%'; }
+    const b = viejo.querySelector('.nv-play');
+    if (b) {
+      if (!b.classList.contains('sonando')) b.textContent = '▶';
+      b.onclick = () => reproducirNota(meta.seq);
+    }
+    return;
+  }
   const lista = $('#chat-lista');
   const el = document.createElement('div');
   el.className = 'msg nota-voz';
