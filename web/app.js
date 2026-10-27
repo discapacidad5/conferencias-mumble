@@ -4020,7 +4020,7 @@ function cablearControles() {
   // en modo selección el toque marca/desmarca; fuera de él, un toque largo
   // (o clic derecho) entra al modo marcando ese mensaje
   $('#chat-lista').addEventListener('click', (ev) => {
-    if (!chatSel) return;
+    if (!chatSel || ev.target.closest('.msg-opc')) return;
     const m = ev.target.closest('.msg');
     if (!m) return;
     ev.preventDefault(); ev.stopPropagation();
@@ -4484,10 +4484,46 @@ function sincronizarVista() {
 }
 
 /* ---------- chat ---------- */
+// ⋮ en la esquina de cada mensaje: abre un desplegable con acciones
+// directas — seleccionar (entra al modo selección con éste marcado),
+// descargar el audio (solo notas cerradas) o eliminar ese mensaje
+function ponerOpcionesMsg(el) {
+  const b = document.createElement('button');
+  b.className = 'msg-opc';
+  b.textContent = '⋮';
+  b.title = 'Opciones';
+  b.onclick = (ev) => {
+    ev.preventDefault(); ev.stopPropagation();
+    const r = b.getBoundingClientRect();
+    menuMensaje(el, r.right, r.bottom + 4);
+  };
+  el.appendChild(b);
+}
+
+function menuMensaje(el, x, y) {
+  const seq = +(el.querySelector('.nv-play')?.dataset.seq || 0);
+  const grabando = el.classList.contains('grabando');
+  const items = [
+    { label: '☑️ Seleccionar', fn: () => {
+      if (!chatSel) toggleChatSel(true);
+      el.classList.add('sel');
+    } },
+  ];
+  if (seq && !grabando)
+    items.push({ label: '⬇️ Descargar audio', fn: () => exportarNotas([seq]) });
+  items.push({ label: '🗑️ Eliminar', peligro: true, fn: () =>
+    confirmar(seq
+      ? '¿Eliminar esta nota de voz? No volverá a aparecer al sincronizar.'
+      : '¿Eliminar este mensaje?',
+      () => borrarMensajes([el])) });
+  abrirMenuCtx(x, y, items);
+}
+
 function agregarChat(quien, texto, propio) {
   const el = document.createElement('div');
   el.className = 'msg' + (propio ? ' propio' : '');
   el.innerHTML = `<div class="quien">${esc(quien)}</div>${esc(texto)}`;
+  ponerOpcionesMsg(el);
   const lista = $('#chat-lista');
   lista.appendChild(el);
   while (lista.children.length > 200) lista.firstChild.remove();
@@ -4531,6 +4567,7 @@ function agregarNotaVozEnVivo(meta) {
     `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}" title="Ir al audio en tiempo real">⏭️</button>` +
     `<div class="nv-pista"><div class="nv-relleno rec"></div></div>` +
     `<span class="nv-tiempo">● 0:00</span></div>`;
+  ponerOpcionesMsg(el);
   lista.appendChild(el);
   lista.scrollTop = lista.scrollHeight;
   S._nvEls.set(meta.seq, el);
@@ -4612,6 +4649,7 @@ function agregarNotaVoz(meta) {
     `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}">▶</button>` +
     `<div class="nv-pista"><div class="nv-relleno"></div></div>` +
     `<span class="nv-tiempo">${fmtDurSeg(meta.durMs)}</span></div>`;
+  ponerOpcionesMsg(el);
   lista.appendChild(el);
   while (lista.children.length > 200) {
     const viejo = lista.firstChild;
