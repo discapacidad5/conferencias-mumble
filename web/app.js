@@ -4874,7 +4874,11 @@ async function reproducirNota(seq) {
     const r = await fetch(`/api/salas/${S.sala}/audio/${seq}`,
       { headers: { Authorization: 'Bearer ' + S.token } });
     if (r.ok) {
-      await S.room.reproducirArchivo(await r.arrayBuffer(), seq);
+      const buf = await r.arrayBuffer();
+      await S.room.reproducirArchivo(buf, seq);
+      // la descarga queda en el caché local: la próxima vez suena sin conexión
+      const p = S.room.analizarArchivoSeg && S.room.analizarArchivoSeg(buf);
+      if (p) idbGuardarArchivo(p);
       return;
     }
   } catch {}
@@ -4993,6 +4997,30 @@ async function idbGuardarSeg(seq) {
       de: d.de, nombre: d.nombre, durMs: d.durMs,
       inicio: d.inicio || Date.now(), interrumpida: !!d.interrumpida,
       bytes: d.raw.reduce((a, u) => a + u.length, 0), raw,
+    };
+    const db = await idbAbrir();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('segs', 'readwrite');
+      tx.objectStore('segs').put(rec);
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+    idbEvict().catch(() => {});
+  } catch {}
+}
+
+// Persiste una nota descargada bajo demanda (espejo de idbGuardarSeg pero
+// a partir del archivo .seg del servidor): al darle ▶ una vez queda en el
+// teléfono y se puede escuchar después sin conexión
+async function idbGuardarArchivo(p) {
+  if (!p || !p.sg || !p.sg.seq || !p.frames || !p.frames.length) return;
+  try {
+    const raw = p.frames.map(u => u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+    const rec = {
+      k: S.sala + '|' + p.sg.seq, sala: S.sala, seq: p.sg.seq,
+      de: p.sg.de, nombre: p.sg.nombre, durMs: p.sg.durMs,
+      inicio: p.sg.inicio || Date.now(), interrumpida: !!p.sg.cortado,
+      bytes: raw.reduce((a, u) => a + u.byteLength, 0), raw,
     };
     const db = await idbAbrir();
     await new Promise((res, rej) => {

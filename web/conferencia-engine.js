@@ -2525,6 +2525,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return this._encolarReplay(seq || parsed.sg.seq || ('r' + Date.now()), bl);
     }
 
+    // Expone el parser CSEG: la app guarda en IndexedDB la nota descargada
+    // bajo demanda para que vuelva a sonar sin conexión
+    analizarArchivoSeg(buf) {
+      return parsearArchivoSeg(buf instanceof Uint8Array ? buf : new Uint8Array(buf));
+    }
+
     datosSeg(seq) {
       const s = this._vozSegs.get(seq);
       return s ? {
