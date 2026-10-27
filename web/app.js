@@ -4001,7 +4001,7 @@ function cablearControles() {
   $('#chat-sel').onclick = () => toggleChatSel();
   $('#cs-salir').onclick = () => toggleChatSel(false);
   $('#cs-todo').onclick = () => {
-    const msgs = $$('#chat-lista .msg');
+    const msgs = $$('#chat-lista .msg').filter(m => !m.classList.contains('grabando'));
     const todos = msgs.length > 0 && msgs.every(m => m.classList.contains('sel'));
     msgs.forEach(m => m.classList.toggle('sel', !todos));
   };
@@ -4022,13 +4022,13 @@ function cablearControles() {
   $('#chat-lista').addEventListener('click', (ev) => {
     if (!chatSel || ev.target.closest('.msg-opc')) return;
     const m = ev.target.closest('.msg');
-    if (!m) return;
+    if (!m || m.classList.contains('grabando')) return; // nota en vivo: no se marca
     ev.preventDefault(); ev.stopPropagation();
     m.classList.toggle('sel');
   }, true);
   $('#chat-lista').addEventListener('contextmenu', (ev) => {
     const m = ev.target.closest('.msg');
-    if (!m) return;
+    if (!m || m.classList.contains('grabando')) return;
     ev.preventDefault();
     if (!chatSel) toggleChatSel(true);
     m.classList.add('sel');
@@ -4567,7 +4567,7 @@ function agregarNotaVozEnVivo(meta) {
     `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}" title="Ir al audio en tiempo real">⏭️</button>` +
     `<div class="nv-pista"><div class="nv-relleno rec"></div></div>` +
     `<span class="nv-tiempo">● 0:00</span></div>`;
-  ponerOpcionesMsg(el);
+  // sin ⋮ mientras graba: no hay nada que seleccionar/descargar/borrar
   lista.appendChild(el);
   lista.scrollTop = lista.scrollHeight;
   S._nvEls.set(meta.seq, el);
@@ -4626,7 +4626,9 @@ function agregarNotaVoz(meta) {
       return;
     }
     // la nota en vivo se cerró: pasa de "grabando" a nota reproducible
+    // (y ahora sí gana su ⋮ de opciones)
     viejo.classList.remove('grabando');
+    ponerOpcionesMsg(viejo);
     clearInterval(viejo._recTimer);
     viejo.dataset.durMs = meta.durMs || viejo.dataset.durMs || 0;
     const t = viejo.querySelector('.nv-tiempo');
@@ -4723,6 +4725,7 @@ function toggleChatSel(on) {
 // mensajes de texto no se re-sincronizan y solo se quitan de la vista.
 function borrarMensajes(els) {
   for (const el of els) {
+    if (el.classList.contains('grabando')) continue; // nota aún grabándose: intocable
     const seq = +(el.querySelector('.nv-play')?.dataset.seq || 0);
     if (seq) {
       nvBorrarSeq(seq);
