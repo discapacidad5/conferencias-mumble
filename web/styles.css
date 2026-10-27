@@ -119,6 +119,24 @@ label.check input { width: auto; }
 @media (max-width: 640px) {
   .asiento-ptt { width: 38px; height: 38px; font-size: 1rem; }
 }
+/* Conectando: aro de segmentos amarillo/rojo girando mientras se abre el
+   micro y se pide el piso — aún NO se está transmitiendo */
+.ptt-conectando { position: relative; }
+.btn.ctl.ptt-conectando::before, #chat-enviar.ptt-conectando::before,
+.asiento-ptt.ptt-conectando::before {
+  content: ''; position: absolute; inset: -6px; border-radius: 50%; z-index: -1;
+  background: repeating-conic-gradient(var(--ambar) 0 30deg, var(--peligro) 30deg 60deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+  animation: pttGira .9s linear infinite;
+}
+@keyframes pttGira { to { transform: rotate(360deg); } }
+/* el asiento (cuadrado) alterna el borde punteado amarillo/rojo */
+.asiento-mio.ptt-conectando {
+  border: 3px dashed var(--ambar);
+  animation: pttBorde .55s steps(2, jump-none) infinite;
+}
+@keyframes pttBorde { 50% { border-color: var(--peligro); } }
 /* MI asiento entero es el pulsador PTT: el nombre queda dentro del botón
    y las esquinas guardan las acciones (⋮ opciones · ✕ salir · 📌 pin) */
 .asiento-mio { cursor: pointer; }

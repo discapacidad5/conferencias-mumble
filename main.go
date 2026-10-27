@@ -795,6 +795,7 @@ func hAccion(w http.ResponseWriter, r *http.Request, g *Claims) {
 				revisar[e.Palabra] = true
 			}
 			e.Palabra = id
+			e.PalabraPausada, e.PausadaDesde = 0, 0
 			e.PalabraFin = 0
 			limpiarVotos(e)
 			if segundos > 0 {
@@ -814,6 +815,7 @@ func hAccion(w http.ResponseWriter, r *http.Request, g *Claims) {
 	case "dejar_palabra":
 		if e.Palabra == id {
 			e.Palabra = ""
+			e.PalabraPausada, e.PausadaDesde = 0, 0
 			e.PalabraFin = 0
 			limpiarVotos(e)
 			revisar[id] = true
@@ -1067,6 +1069,7 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 		}
 		if e.Palabra == obj {
 			e.Palabra = ""
+			e.PalabraPausada, e.PausadaDesde = 0, 0
 			e.PalabraFin = 0
 			limpiarVotos(e)
 			muteSolo = append(muteSolo, muteOp{sv.grupoDe[obj], obj, true, true})
@@ -1079,6 +1082,7 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 	case "silenciar":
 		if e.Palabra == req.Objetivo {
 			e.Palabra = ""
+			e.PalabraPausada, e.PausadaDesde = 0, 0
 			e.PalabraFin = 0
 			limpiarVotos(e)
 			revisar[req.Objetivo] = true
@@ -1700,6 +1704,7 @@ func barrerParticipantes() {
 					revisar[e.Palabra] = true
 					expiraron[e.Palabra] = gidE
 					e.Palabra = ""
+					e.PalabraPausada, e.PausadaDesde = 0, 0
 					e.PalabraFin = 0
 					limpiarVotos(e)
 				}
@@ -1776,6 +1781,7 @@ func barrerParticipantes() {
 				e.Manos = nm
 				if e.Palabra != "" && !presentes[e.Palabra] && sv.ausente[e.Palabra] > 0 && ahora()-sv.ausente[e.Palabra] >= 20_000 {
 					e.Palabra = ""
+					e.PalabraPausada, e.PausadaDesde = 0, 0
 					e.PalabraFin = 0
 					limpiarVotos(e)
 					cambio = true
@@ -1791,9 +1797,30 @@ func barrerParticipantes() {
 						}
 					}
 					if !vivo {
-						e.Piso, e.PisoNombre, e.PisoDesde = "", "", 0
-						cambio = true
+						// soltarPisoEn re-concede el piso a La Palabra si existe
+						if solto, reasig := sv.soltarPisoEn(e, e.Piso); solto {
+							if reasig != "" {
+								if pc := media.room(nombre).clienteDe(reasig); pc != nil {
+									pc.ultimoHabl = ahora()
+									msg, _ := json.Marshal(map[string]any{"t": "piso_ok"})
+									pc.enviarCtrl(append([]byte{1}, msg...))
+								}
+							}
+							cambio = true
+						}
 					}
+				}
+				// La Palabra lleva >1 min interrumpida por otro hablante: se
+				// retira sola (quien la tenía puede volver a levantar la mano)
+				if e.Palabra != "" && e.PausadaDesde > 0 && ahora()-e.PausadaDesde > 60_000 {
+					exPalabra := e.Palabra
+					e.Palabra = ""
+					e.PalabraPausada, e.PausadaDesde = 0, 0
+					e.PalabraFin = 0
+					limpiarVotos(e)
+					revisar[exPalabra] = true
+					expiraron[exPalabra] = gid
+					cambio = true
 				}
 				sv.mu.Unlock()
 			}

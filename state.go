@@ -53,6 +53,11 @@ type EstadoSala struct {
 	Piso       string `json:"piso,omitempty"`
 	PisoNombre string `json:"pisoNombre,omitempty"`
 	PisoDesde  int64  `json:"pisoDesde,omitempty"` // unix ms en que se tomó
+	// La palabra se pausa mientras otro hablante tiene el piso (interrupción):
+	// PalabraPausada = ms restantes congelados; PausadaDesde = cuándo empezó
+	// (si la interrupción pasa de 60 s la palabra se retira sola).
+	PalabraPausada int64 `json:"palabraPausada,omitempty"`
+	PausadaDesde   int64 `json:"pausadaDesde,omitempty"`
 
 	votantes map[string]int8 // identidad -> 1 a favor / -1 en contra
 }
@@ -246,6 +251,7 @@ func sacarDeEstado(e *EstadoSala, id string) int {
 	}
 	if e.Palabra == id {
 		e.Palabra = ""
+		e.PalabraPausada, e.PausadaDesde = 0, 0
 		e.PalabraFin = 0
 		limpiarVotos(e)
 	}
@@ -543,6 +549,25 @@ const (
 	pisoOcupadoR = 3 // no puedo todavía: devuelve segundos restantes
 )
 
+// pisoAsignado pausa/reanuda el reloj de La Palabra según quién tenga el
+// piso: otro hablante congela su cuenta y al volver a ella se reanuda.
+func (sv *salaViva) pisoAsignado(e *EstadoSala, id string) {
+	if e.Palabra == "" {
+		return
+	}
+	if id == e.Palabra {
+		if e.PausadaDesde > 0 && e.PalabraPausada > 0 {
+			e.PalabraFin = ahora() + e.PalabraPausada
+		}
+		e.PalabraPausada, e.PausadaDesde = 0, 0
+	} else if e.PausadaDesde == 0 {
+		e.PausadaDesde = ahora()
+		if e.PalabraFin > 0 {
+			e.PalabraPausada = e.PalabraFin - ahora()
+		}
+	}
+}
+
 // tomarPisoEn gestiona el piso exclusivo del estado e. Llamar con sv.mu tomado.
 // Devuelve (resultado, faltanSegundos, anteriorHolder).
 func (sv *salaViva) tomarPisoEn(e *EstadoSala, id, nombre string, esAdmin bool) (int, int, string) {
@@ -551,6 +576,7 @@ func (sv *salaViva) tomarPisoEn(e *EstadoSala, id, nombre string, esAdmin bool) 
 	}
 	if e.Piso == "" {
 		e.Piso, e.PisoNombre, e.PisoDesde = id, nombre, ahora()
+		sv.pisoAsignado(e, id)
 		return pisoTomado, 0, ""
 	}
 	faltaMs := int64(sv.minSegPiso(id, esAdmin))*1000 - (ahora() - e.PisoDesde)
@@ -559,16 +585,24 @@ func (sv *salaViva) tomarPisoEn(e *EstadoSala, id, nombre string, esAdmin bool) 
 	}
 	ant := e.Piso
 	e.Piso, e.PisoNombre, e.PisoDesde = id, nombre, ahora()
+	sv.pisoAsignado(e, id)
 	return pisoRobado, 0, ant
 }
 
 // soltarPisoEn libera el piso si lo tiene id. Con sv.mu tomado.
-func (sv *salaViva) soltarPisoEn(e *EstadoSala, id string) bool {
+// Si La Palabra sigue puesta, el piso le vuelve automáticamente (su micro
+// no se suelta con el botón); devuelve la identidad reconcedida o "".
+func (sv *salaViva) soltarPisoEn(e *EstadoSala, id string) (bool, string) {
 	if e.Piso != id {
-		return false
+		return false, ""
 	}
 	e.Piso, e.PisoNombre, e.PisoDesde = "", "", 0
-	return true
+	if e.Palabra != "" && e.Palabra != id {
+		e.Piso, e.PisoNombre, e.PisoDesde = e.Palabra, sv.nombres[e.Palabra], ahora()
+		sv.pisoAsignado(e, e.Palabra)
+		return true, e.Palabra
+	}
+	return true, ""
 }
 
 // puedeMic decide si la identidad puede publicar micrófono en este instante.

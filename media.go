@@ -412,10 +412,20 @@ func liberarPisoDe(sala, id string, interrumpida bool) {
 	}
 	sv := hub.sala(sala)
 	sv.mu.Lock()
-	if sv.soltarPisoEn(sv.estadoDe(id), id) {
+	solto, reasignado := sv.soltarPisoEn(sv.estadoDe(id), id)
+	if solto {
 		sv.broadcast(&Evento{Tipo: "piso"})
 	}
 	sv.mu.Unlock()
+	if reasignado != "" {
+		// el piso volvió solo a quien tiene La Palabra: su cliente lo toma
+		// como concedido y su micro sigue activo sin tocar nada
+		if pc := mr.clienteDe(reasignado); pc != nil {
+			pc.ultimoHabl = ahora() // margen: su cliente reanuda el envío
+			msg, _ := json.Marshal(map[string]any{"t": "piso_ok"})
+			pc.enviarCtrl(append([]byte{1}, msg...))
+		}
+	}
 }
 
 // tomarPisoWS responde al mensaje WS {t:"piso_tomar"}: aplica la regla del

@@ -1120,6 +1120,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         let noiseFloor = 0.0018;
         let ultimoPedirPiso = 0;
         let autoPre = null; // pre-roll guardado esperando el piso
+        const tramaMuda = new Float32Array(1920); // colchón de silencio al abrir frase
         let autoPreTs = 0;
 
         const procesarBloqueEntrada = (rawIn) => {
@@ -1176,7 +1177,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               const ptt = window.S && window.S.ptt && window.S.ptt.modo !== 'auto';
               if (ptt) {
                 if (window.S.ptt.quiero && window.S.ptt.tengo) {
-                  if (!hablandoActivo) { hablandoActivo = true; opusPending.length = 0; }
+                  if (!hablandoActivo) {
+                    hablandoActivo = true;
+                    opusPending.length = 0;
+                    // ~80 ms de audio vacío al abrir la frase: da margen a
+                    // que el receptor cree el segmento y no se coma el
+                    // ataque de la primera sílaba
+                    enviarTrama40ms(tramaMuda);
+                    enviarTrama40ms(tramaMuda);
+                  }
                   silencioCola = 0;
                   this._room._marcarHablandoLocal(true);
                   enviarTrama40ms(frameBuf);

@@ -217,6 +217,12 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 	if sg.DurMs <= 0 {
 		sg.DurMs = ahora() - sg.Inicio
 	}
+	// tap accidental del PTT: notas de <0,7 s no se archivan ni entran al
+	// manifiesto (el cliente igual recibe seg_fin y borra la nota en vivo)
+	if sg.DurMs < 700 {
+		sg.frames = nil
+		return sg
+	}
 	ruta := filepath.Join(s.dir, "seg-"+itoa8(sg.Seq)+".seg")
 	tmp := ruta + ".tmp"
 	if escribirArchivoSeg(tmp, sg) == nil {

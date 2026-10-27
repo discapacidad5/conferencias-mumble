@@ -35,7 +35,7 @@ const S = {
   // PTT / piso exclusivo: modo 'auto' (micro libre), 'hold' (mantener
   // pisado) o 'lock' (tocar para bloquear/soltar). quiero = dedo/intención
   // pisada; tengo = el servidor confirmó el piso
-  ptt: { modo: localStorage.getItem('lk_ptt_modo') || 'hold', quiero: false, tengo: false, silencio: +(localStorage.getItem('lk_ptt_silencio')) || 2.2 },
+  ptt: { modo: localStorage.getItem('lk_ptt_modo') || 'hold', quiero: false, tengo: false, desde: 0, silencio: +(localStorage.getItem('lk_ptt_silencio')) || 2.2 },
   pisoCfg: null, pisoFaltan: 0,
   // historial local de notas de voz (IndexedDB): tope en MB y auto-salto
   segCapMB: +(localStorage.getItem('lk_seg_mb') || 100),
@@ -1055,7 +1055,10 @@ function entrarVistaSala() {
   // últimos 10 s = número gigante con barra que se vacía)
   setInterval(() => {
     $$('#z-asientos [data-crono]').forEach(el => {
-      if (S.estado && S.estado.palabraFin) el.textContent = fmtMMSS(S.estado.palabraFin - Date.now());
+      if (!S.estado) return;
+      // interrumpida: el reloj queda congelado mientras otro tiene el piso
+      if (S.estado.palabraPausada) el.textContent = fmtMMSS(S.estado.palabraPausada) + ' ⏸';
+      else if (S.estado.palabraFin) el.textContent = fmtMMSS(S.estado.palabraFin - Date.now());
     });
     const cr = $('#cuenta-regresiva');
     const soyYo = S.estado && S.estado.palabra && S.estado.palabra === S.identidad;
@@ -1288,7 +1291,23 @@ function aplicarEstado(d, fuente = 'http') {
     if (!ahoraPalabra) activarMic(false);
   }
   if (!S._palabra && ahoraPalabra) S.audio.autoPalabra = true;
-  if (S._palabra && !ahoraPalabra) S.audio.autoPalabra = false;
+  if (S._palabra && !ahoraPalabra) {
+    S.audio.autoPalabra = false;
+    // palabra retirada/expirada/interrumpida >60 s: suelta micro y piso
+    if (S.room) activarMic(false);
+  }
+  // La Palabra pisa el botón sola: al recibirla el micro se abre y toma el
+  // piso sin esperar un toque, en cualquier modo PTT
+  if (ahoraPalabra && S.room && !S.audio.retirando && !S.ptt.quiero) pttOn();
+  // el estado es la red de seguridad: si el servidor me (re)concedió el
+  // piso —p.ej. soy La Palabra y el interrumplente soltó— se refleja aquí
+  const pisoMio = !!(S.estado && S.estado.piso === S.identidad);
+  if (pisoMio && S.ptt.quiero && !S.ptt.tengo) {
+    S.ptt.tengo = true;
+    if (S.audio.pub && S.audio.pub.isMuted) S.audio.pub.unmute().catch(() => {});
+  } else if (!pisoMio && S.ptt.tengo) {
+    S.ptt.tengo = false;
+  }
   S._sentado = ahoraSentado; S._palabra = ahoraPalabra;
   // perfil de sala cambió: ajusta en caliente sin cortar el micrófono
   if (prevPerfil && d.estado.audioPerfil !== prevPerfil && S.audio.pub)
@@ -1566,6 +1585,7 @@ async function pttOn() {
     return;
   }
   S.ptt.quiero = true;
+  S.ptt.desde = Date.now(); // mientras quiero y !tengo el pulsador gira "conectando"
   S.room.tomarPiso();
   try {
     if (!S.audio.pub) {
@@ -1582,13 +1602,23 @@ async function pttOn() {
   renderControles();
 }
 
-async function pttOff() {
+async function pttOff(inmediato) {
+  // Teniendo La Palabra el botón no calla: su micro es obligatorio mientras
+  // la tenga (si te interrumpen te muta el piso, no el botón). Para callarse
+  // hay que dejar la palabra desde la esquina ✕ o el menú.
+  if (tengoPalabra() && !inmediato) return;
   S.ptt.quiero = false;
   S.ptt.tengo = false;
   if (S.room) S.room.soltarPiso();
+  const resta = S.ptt.desde ? Math.max(0, 900 - (Date.now() - S.ptt.desde)) : 0;
+  S.ptt.desde = 0;
   if (S.ptt.modo === 'auto') {
     // el micro sigue abierto en local para que el VAD siga escuchando
     S.audio.on = true;
+  } else if (resta > 0) {
+    // pulsación mínima ~1 s: un tap accidental no produce una nota de 0 s
+    // ni tumba el hardware que aún se está abriendo
+    setTimeout(() => { if (!S.ptt.quiero) retirarMic(); }, resta);
   } else {
     // manual: liberar el hardware del micrófono entre pulsaciones
     await retirarMic();
@@ -1630,24 +1660,28 @@ function wirePttButton(el, gate) {
 
 // Color compartido de todos los pulsadores PTT:
 // amarillo = piso libre · verde = otra persona habla · rojo = yo hablo
+// · aro girando amarillo/rojo = pisado pero aún conectando (micro + piso)
 function renderPttEstados() {
   const otro = !!(S.estado && S.estado.piso && S.estado.piso !== S.identidad);
-  const st = S.ptt.quiero || S.ptt.tengo ? 'hablando'
+  const st = S.ptt.tengo ? 'hablando'
+    : S.ptt.quiero ? 'conectando'
     : !puedoHablar() ? 'sinpermiso'
     : otro ? 'ocupado' : 'libre';
   const tit = st === 'hablando' ? 'Suelta para terminar'
+    : st === 'conectando' ? 'Conectando… verificando micro y piso'
     : st === 'sinpermiso' ? 'Pide la palabra para hablar'
     : st === 'ocupado' ? `Hablando: ${S.estado.pisoNombre || S.estado.piso}`
     : S.ptt.modo === 'hold' ? 'Mantén pisado para hablar'
     : S.ptt.modo === 'auto' ? 'Voz automática activa (también puedes pulsar)'
     : 'Toca para hablar / toca para soltar';
   $$('.ptt-sup').forEach(el => {
-    el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso');
+    el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso', 'ptt-conectando');
     el.classList.add('ptt-' + st);
     el.title = tit;
   });
   const me = $('#mic-estado');
   if (me) me.textContent = st === 'hablando' ? 'Estás hablando'
+    : st === 'conectando' ? 'Conectando…'
     : st === 'sinpermiso' ? 'Sin permiso'
     : st === 'ocupado' ? `Habla ${S.estado.pisoNombre || S.estado.piso}`
     : S.ptt.modo === 'auto' ? 'Auto: escuchando' : 'Piso libre';
@@ -2046,9 +2080,14 @@ function cablearRoom(room) {
     manejarData(d, participant);
   });
   // --- notas de voz en vivo (segmentos confiables) ---
-  room.on('seg_ini', (m) => { if (m) agregarNotaVozEnVivo(m); });
+  room.on('seg_ini', (m) => {
+    if (!m) return;
+    S._ultimoSeg = Math.max(S._ultimoSeg || 0, m.seq || 0);
+    agregarNotaVozEnVivo(m);
+  });
   room.on('seg_fin', (m) => {
     if (!m) return;
+    S._ultimoSeg = Math.max(S._ultimoSeg || 0, m.seq || 0);
     agregarNotaVoz(m);
     idbGuardarSeg(m.seq);
   });
@@ -2062,13 +2101,21 @@ function cablearRoom(room) {
   room.on('piso', (m) => {
     if (m && m.estado === 'mio') {
       S.ptt.tengo = true;
+      // si el micro quedó muteado (p.ej. soy la palabra y me interrumpieron)
+      // vuelve solo: con La Palabra el micro no se apaga con el botón
+      if (S.ptt.quiero && S.audio.pub && S.audio.pub.isMuted)
+        S.audio.pub.unmute().catch(() => {});
       if (modoPtt() && S.ptt.quiero) sonidoPiso(true); // chirp de "ya puedes hablar"
       renderControles();
     }
   });
   room.on('piso_ocupado', (m) => {
     S.ptt.tengo = false;
-    if (modoPtt()) pttOff(); // cancela el intento y libera el micrófono
+    // Teniendo La Palabra no se cancela la intención: quedo en espera y
+    // retomo el piso solo cuando el que me interrumpió suelte el botón
+    if (tengoPalabra()) {
+      if (S.audio.pub && !S.audio.pub.isMuted) S.audio.pub.mute().catch(() => {});
+    } else if (modoPtt()) pttOff(); // cancela el intento y libera el micrófono
     S.pisoFaltan = (m && m.faltan) || 0;
     // rechazo audible con enfriamiento: en modo auto el VAD reintenta solo
     // y el beep no debe sonar en cada intento
@@ -2082,8 +2129,16 @@ function cablearRoom(room) {
     renderControles();
   });
   room.on('piso_perdido', (m) => {
-    pttOff(); // suelta piso, intención y (en manual) el micrófono
-    toast(`⚠️ ${(m && m.por) || 'Otra persona'} tomó el piso`, 4500);
+    if (tengoPalabra()) {
+      // interrumpido: sigo con La Palabra y el piso vuelve solo cuando el
+      // otro suelte; mientras tanto el micro queda muteado y mi tiempo pausado
+      S.ptt.tengo = false;
+      if (S.audio.pub && !S.audio.pub.isMuted) S.audio.pub.mute().catch(() => {});
+      toast(`⏸️ ${(m && m.por) || 'Otra persona'} te interrumpió — tu palabra se pausa`, 4500);
+    } else {
+      pttOff(true); // suelta piso, intención y (en manual) el micrófono
+      toast(`⚠️ ${(m && m.por) || 'Otra persona'} tomó el piso`, 4500);
+    }
     renderControles();
   });
   room.on(LC.RoomEvent.Disconnected, (razon) => {
@@ -2175,8 +2230,15 @@ let reconectando = false;
 async function reconectar() {
   if (reconectando || S.saliendo) return;
   reconectando = true;
+  const tCaida = Date.now();
+  let avisado = false;
   for (let intento = 1; !S.saliendo; intento++) {
-    toast('Conexión perdida — reintentando (' + intento + ')…', 3500);
+    // Caída corta = silencio: las notas descargadas siguen sonando y la
+    // sala sigue ahí. Solo pasados ~10 s se muestra un aviso discreto.
+    if (!avisado && Date.now() - tCaida > 10000) {
+      avisado = true;
+      toast('📡 Sin conexión — reintentando en segundo plano (sigues en la sala)', 6000);
+    }
     try {
       const r = await api('/api/obtener-acceso', {
         sala: S.sala, nombre: S.nombre, clave: S.clave || '',
@@ -2190,6 +2252,10 @@ async function reconectar() {
       S.room = room;
       cablearRoom(room);
       await conectarRoom(room, r.url, r.token);
+      // conservar el historial de voz: el Room nuevo parte del último seq
+      // conocido y la bienvenida solo descarga lo que faltó durante el corte
+      room._ultimoSeg = Math.max(room._ultimoSeg || 0, S._ultimoSeg || 0);
+      room._vozBase = true;
       S.grupoActual = r.grupo || 0; S.miGrupo = S.grupoActual;
       if (S.camQuerida) {
         try { await room.localParticipant.setCameraEnabled(true, { deviceId: S.dev.cam ? { exact: S.dev.cam } : undefined }); } catch {}
@@ -2209,8 +2275,9 @@ async function reconectar() {
           }
         } catch {}
       }
-      toast('Reconectado a la sala');
+      if (avisado) toast('📡 Conexión restablecida');
       refrescarEstado();
+      sincronizarNotas(); // notas de voz del chat que se perdió el corte
       renderTodo();
       reconectando = false;
       return;
@@ -2760,17 +2827,25 @@ function renderAsientos() {
       pb.insertAdjacentHTML('beforeend', `<span class="tag">${esc(palabraId)}</span>`);
     }
     if (S.activo === palabraId) pb.style.borderColor = 'var(--verde)';
-    // con la palabra, el centro del puesto también es pulsador PTT
+    // con La Palabra mi puesto entero ES el pulsador: el micro es obligatorio
+    // (pttOff lo ignora) y las esquinas conservan ⋮ opciones y ✕ dejarla
     if (soyYo && S.room) {
-      const bpt = document.createElement('button');
-      bpt.type = 'button';
-      bpt.className = 'asiento-ptt ptt-sup';
-      bpt.textContent = '🎙️';
-      wirePttButton(bpt);
-      pb.appendChild(bpt);
+      pb.classList.add('asiento-mio', 'ptt-sup');
+      wirePttButton(pb);
+      pb.insertAdjacentHTML('beforeend',
+        '<button class="asiento-esq menu" type="button" title="Opciones de la palabra">⋮</button>' +
+        '<button class="asiento-esq salir" type="button" title="Dejar la palabra">✕</button>');
+      pb.querySelectorAll('.asiento-esq').forEach(b =>
+        b.addEventListener('pointerdown', ev => ev.stopPropagation()));
+      pb.querySelector('.asiento-esq.menu').onclick =
+        (ev) => { ev.stopPropagation(); if (pb._menuPalabra) pb._menuPalabra(ev); };
+      pb.querySelector('.asiento-esq.salir').onclick =
+        (ev) => { ev.stopPropagation(); confirmar('¿Dejar la palabra? Tu micrófono se silenciará.', dejarPalabra); };
     }
-    if (S.estado.palabraFin) {
-      pb.insertAdjacentHTML('beforeend', `<span class="crono" data-crono>${fmtMMSS(S.estado.palabraFin - Date.now())}</span>`);
+    if (S.estado.palabraFin || S.estado.palabraPausada) {
+      const msRest = S.estado.palabraPausada || Math.max(0, S.estado.palabraFin - Date.now());
+      pb.insertAdjacentHTML('beforeend',
+        `<span class="crono" data-crono>${fmtMMSS(msRest)}${S.estado.palabraPausada ? ' ⏸' : ''}</span>`);
     }
     // marcador de votación sobre el orador actual
     pb.insertAdjacentHTML('beforeend',
@@ -2854,6 +2929,13 @@ function renderAsientos() {
     }
     if (items.length) abrirMenuCtx(ev.clientX, ev.clientY, items, palabraId ? nombre : 'Palabra');
   };
+  // con La Palabra mi puesto es pulsador PTT: el click no abre el menú
+  // (soltar el botón dispararía el menú) — el menú va por la esquina ⋮
+  if (soyYo && S.room) {
+    pb._menuPalabra = pb.onclick;
+    pb.onclick = null;
+    pb.title = 'Tienes la palabra: tu micrófono está abierto';
+  }
   filas[0].appendChild(pb);
 
   // audiencia
@@ -4219,10 +4301,40 @@ function agregarNotaVozEnVivo(meta) {
   };
 }
 
+// Tras reconectar (o al entrar) rellena el historial del chat: pide al
+// manifiesto los segmentos recientes del grupo y crea notas para las que
+// el corte se llevó. Las ya mostradas se saltan por seq.
+async function sincronizarNotas() {
+  if (!S.room || !S.sala) return;
+  try {
+    const ultimo = Math.max(S._ultimoSeg || 0, ...(S._nvSeqs.length ? [S._nvSeqs[S._nvSeqs.length - 1]] : [0]));
+    const r = await fetch(
+      `/api/salas/${encodeURIComponent(S.sala)}/audio?desde=${Math.max(0, ultimo - 40)}&g=${S.miGrupo || 0}`,
+      { headers: { Authorization: 'Bearer ' + S.token } });
+    if (!r.ok) return;
+    const man = await r.json();
+    for (const meta of (man.segmentos || [])) {
+      if (meta.seq && !S._nvEls.has(meta.seq))
+        agregarNotaVoz({ seq: meta.seq, de: meta.de, nombre: meta.nombre, durMs: meta.durMs, inicio: meta.inicio, interrumpida: meta.interrumpida });
+    }
+    if (man.abierto && man.abierto.seq && !S._nvEls.has(man.abierto.seq))
+      agregarNotaVozEnVivo({ seq: man.abierto.seq, de: man.abierto.de, nombre: man.abierto.nombre, inicio: man.abierto.inicio });
+    if (man.ultimo) S._ultimoSeg = Math.max(S._ultimoSeg || 0, man.ultimo);
+  } catch {}
+}
+
 function agregarNotaVoz(meta) {
   if (!meta || meta.seq <= 0) return;
   const viejo = S._nvEls.get(meta.seq);
   if (viejo) {
+    // nota de tap accidental (<0,8 s): no queda en el historial, se borra
+    if ((meta.durMs || 0) < 800) {
+      clearInterval(viejo._recTimer);
+      S._nvEls.delete(meta.seq);
+      const i = S._nvSeqs.indexOf(meta.seq); if (i >= 0) S._nvSeqs.splice(i, 1);
+      viejo.remove();
+      return;
+    }
     // la nota en vivo se cerró: pasa de "grabando" a nota reproducible
     viejo.classList.remove('grabando');
     clearInterval(viejo._recTimer);
@@ -4293,7 +4405,14 @@ function marcarNotaVoz(seq, est, prog) {
     if (r) r.style.width = Math.min(100, (prog.posMs / tot) * 100) + '%';
     if (t) t.textContent = fmtDurSeg(prog.posMs) + ' / ' + fmtDurSeg(tot);
   }
-  if (est === 'perdida') { b.disabled = true; b.textContent = '⚠️'; }
+  if (est === 'perdida') {
+    // segmento descartado: se quita del chat (si seguía "grabando", su
+    // cronómetro también muere con él)
+    clearInterval(el._recTimer);
+    S._nvEls.delete(seq);
+    const i = S._nvSeqs.indexOf(seq); if (i >= 0) S._nvSeqs.splice(i, 1);
+    el.remove();
+  }
 }
 
 // Re-escuchar una nota: primero en la RAM del motor; si ya se limpió, en el
