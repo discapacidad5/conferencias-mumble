@@ -3,13 +3,9 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -79,437 +75,7 @@ func verificarToken(tok, salaEsperada string) (*Claims, error) {
 }
 
 // ============================================================================
-// 2. PROTOCOLO MUMBLE NATIVO (TLS + Framing + Protobuf ligero + UDPTunnel)
-// ============================================================================
-//
-// Tipos de paquete Mumble (RFC/Mumble.proto):
-//   0 = Version
-//   1 = UDPTunnel (trama de voz encapsulada en TCP/TLS)
-//   2 = Authenticate
-//   3 = Ping
-//   4 = Reject
-//   5 = ServerSync
-//   7 = ChannelState
-//   8 = UserRemove
-//   9 = UserState
-
-const (
-	mumbleMsgVersion      = 0
-	mumbleMsgUDPTunnel    = 1
-	mumbleMsgAuthenticate = 2
-	mumbleMsgPing         = 3
-	mumbleMsgReject       = 4
-	mumbleMsgServerSync   = 5
-	mumbleMsgChannelState = 7
-	mumbleMsgUserRemove   = 8
-	mumbleMsgUserState    = 9
-)
-
-// Codificación Protobuf minimalista para mensajes de handshake Mumble.
-func pbAppendVarint(b []byte, v uint64) []byte {
-	for v >= 0x80 {
-		b = append(b, byte(v)|0x80)
-		v >>= 7
-	}
-	return append(b, byte(v))
-}
-
-func pbTagVarint(b []byte, field int, v uint64) []byte {
-	b = pbAppendVarint(b, uint64((field<<3)|0))
-	return pbAppendVarint(b, v)
-}
-
-func pbTagString(b []byte, field int, s string) []byte {
-	if s == "" {
-		return b
-	}
-	b = pbAppendVarint(b, uint64((field<<3)|2))
-	b = pbAppendVarint(b, uint64(len(s)))
-	return append(b, s...)
-}
-
-func pbReadVarint(b []byte) (uint64, int) {
-	var x uint64
-	var s uint
-	for i, c := range b {
-		if i >= 10 {
-			return 0, 0
-		}
-		if c < 0x80 {
-			return x | uint64(c)<<s, i + 1
-		}
-		x |= uint64(c&0x7f) << s
-		s += 7
-	}
-	return 0, 0
-}
-
-// Decodifica campos básicos string/uint64 de un mensaje Protobuf de Mumble.
-func pbParseFields(b []byte) (ints map[int]uint64, strs map[int]string) {
-	ints = map[int]uint64{}
-	strs = map[int]string{}
-	i := 0
-	for i < len(b) {
-		tag, n := pbReadVarint(b[i:])
-		if n <= 0 {
-			break
-		}
-		i += n
-		field := int(tag >> 3)
-		wtype := int(tag & 7)
-		switch wtype {
-		case 0:
-			v, m := pbReadVarint(b[i:])
-			if m <= 0 {
-				return
-			}
-			i += m
-			ints[field] = v
-		case 2:
-			l, m := pbReadVarint(b[i:])
-			if m <= 0 || i+m+int(l) > len(b) {
-				return
-			}
-			i += m
-			strs[field] = string(b[i : i+int(l)])
-			i += int(l)
-		case 1:
-			i += 8
-		case 5:
-			i += 4
-		default:
-			return
-		}
-	}
-	return
-}
-
-func escribirPaqueteMumble(w io.Writer, tipo uint16, payload []byte) error {
-	var hdr [6]byte
-	binary.BigEndian.PutUint16(hdr[0:2], tipo)
-	binary.BigEndian.PutUint32(hdr[2:6], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	if len(payload) > 0 {
-		_, err := w.Write(payload)
-		return err
-	}
-	return nil
-}
-
-func leerPaqueteMumble(r io.Reader) (uint16, []byte, error) {
-	var hdr [6]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, nil, err
-	}
-	tipo := binary.BigEndian.Uint16(hdr[0:2])
-	largo := binary.BigEndian.Uint32(hdr[2:6])
-	if largo > 1024*1024 {
-		return 0, nil, errors.New("paquete Mumble demasiado grande")
-	}
-	buf := make([]byte, largo)
-	if largo > 0 {
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return 0, nil, err
-		}
-	}
-	return tipo, buf, nil
-}
-
-// Varint propio del túnel de audio de Mumble (distinto al de Protobuf)
-func mumbleVarintEncode(v uint64) []byte {
-	switch {
-	case v < 0x80:
-		return []byte{byte(v)}
-	case v < 0x4000:
-		return []byte{byte((v >> 8) | 0x80), byte(v)}
-	case v < 0x200000:
-		return []byte{byte((v >> 16) | 0xC0), byte(v >> 8), byte(v)}
-	case v < 0x10000000:
-		return []byte{byte((v >> 24) | 0xE0), byte(v >> 16), byte(v >> 8), byte(v)}
-	default:
-		return []byte{0xF0, byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
-	}
-}
-
-func direccionMumbleEfectiva(cfg MumbleConfig) string {
-	if cfg.Modo == "remoto" && strings.TrimSpace(cfg.Host) != "" {
-		p := cfg.Puerto
-		if p <= 0 {
-			p = 64738
-		}
-		return fmt.Sprintf("%s:%d", strings.TrimSpace(cfg.Host), p)
-	}
-	return mumbleLocalAddr
-}
-
-// EstadoMumble describe el resultado de probar o consultar el servidor Mumble.
-type EstadoMumble struct {
-	Conectado  bool   `json:"conectado"`
-	Direccion  string `json:"direccion"`
-	Modo       string `json:"modo"`
-	LatenciaMs int64  `json:"latenciaMs"`
-	Bienvenida string `json:"bienvenida,omitempty"`
-	Canales    int    `json:"canales,omitempty"`
-	Error      string `json:"error,omitempty"`
-}
-
-// ProbarConexionMumble realiza un handshake TLS + Version + Authenticate real
-// contra el servidor Mumble indicado (local o público remoto).
-func ProbarConexionMumble(cfg MumbleConfig) EstadoMumble {
-	addr := direccionMumbleEfectiva(cfg)
-	modo := cfg.Modo
-	if modo == "" {
-		modo = "local"
-	}
-	t0 := time.Now()
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-		InsecureSkipVerify: true, // Los servidores Mumble usan certificados autofirmados por defecto
-	})
-	if err != nil {
-		return EstadoMumble{
-			Conectado: false,
-			Direccion: addr,
-			Modo:      modo,
-			Error:     err.Error(),
-		}
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
-
-	// 1) Enviar Version (1.4.0 = 0x00010400)
-	var ver []byte
-	ver = pbTagVarint(ver, 1, 0x00010400)
-	ver = pbTagString(ver, 2, "Conferencia-Mumble-Bridge 1.0")
-	ver = pbTagString(ver, 3, "Linux")
-	if err := escribirPaqueteMumble(conn, mumbleMsgVersion, ver); err != nil {
-		return EstadoMumble{Conectado: false, Direccion: addr, Modo: modo, Error: err.Error()}
-	}
-
-	// 2) Enviar Authenticate
-	var auth []byte
-	auth = pbTagString(auth, 1, "conferencia-probe-"+randHex(2))
-	if cfg.Clave != "" {
-		auth = pbTagString(auth, 2, cfg.Clave)
-	}
-	auth = pbTagVarint(auth, 5, 1) // opus = true
-	if err := escribirPaqueteMumble(conn, mumbleMsgAuthenticate, auth); err != nil {
-		return EstadoMumble{Conectado: false, Direccion: addr, Modo: modo, Error: err.Error()}
-	}
-
-	// 3) Leer respuestas hasta ServerSync o Reject
-	canales := 0
-	bienvenida := ""
-	for i := 0; i < 64; i++ {
-		tipo, payload, err := leerPaqueteMumble(conn)
-		if err != nil {
-			break
-		}
-		_, strs := pbParseFields(payload)
-		switch tipo {
-		case mumbleMsgReject:
-			motivo := strs[2]
-			if motivo == "" {
-				motivo = "acceso rechazado por el servidor Mumble"
-			}
-			return EstadoMumble{
-				Conectado:  false,
-				Direccion:  addr,
-				Modo:       modo,
-				LatenciaMs: time.Since(t0).Milliseconds(),
-				Error:      motivo,
-			}
-		case mumbleMsgChannelState:
-			canales++
-		case mumbleMsgServerSync:
-			bienvenida = strs[3]
-			return EstadoMumble{
-				Conectado:  true,
-				Direccion:  addr,
-				Modo:       modo,
-				LatenciaMs: time.Since(t0).Milliseconds(),
-				Bienvenida: bienvenida,
-				Canales:    canales,
-			}
-		}
-	}
-
-	// Si el socket TLS abrió y respondió Version aunque no llegara ServerSync aún
-	return EstadoMumble{
-		Conectado:  true,
-		Direccion:  addr,
-		Modo:       modo,
-		LatenciaMs: time.Since(t0).Milliseconds(),
-		Bienvenida: bienvenida,
-		Canales:    canales,
-	}
-}
-
-// puenteMumble mantiene la sesión Mumble activa de una sala contra el servidor
-// Mumble configurado (local o público remoto) y puentea tramas de voz.
-type puenteMumble struct {
-	mu        sync.Mutex
-	sala      string
-	conn      net.Conn
-	conectado bool
-	ultimoErr string
-	seq       uint64
-	txCh      chan []byte
-	cerrarCh  chan struct{}
-}
-
-func nuevoPuenteMumble(sala string) *puenteMumble {
-	p := &puenteMumble{
-		sala:     sala,
-		txCh:     make(chan []byte, 32),
-		cerrarCh: make(chan struct{}),
-	}
-	go p.bucle()
-	return p
-}
-
-func (p *puenteMumble) cerrar() {
-	select {
-	case <-p.cerrarCh:
-	default:
-		close(p.cerrarCh)
-	}
-	p.mu.Lock()
-	if p.conn != nil {
-		_ = p.conn.Close()
-	}
-	p.mu.Unlock()
-}
-
-func (p *puenteMumble) bucle() {
-	for {
-		select {
-		case <-p.cerrarCh:
-			return
-		default:
-		}
-		cfg := store.ObtenerMumble()
-		addr := direccionMumbleEfectiva(cfg)
-		dialer := &net.Dialer{Timeout: 6 * time.Second}
-		conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{InsecureSkipVerify: true})
-		if err != nil {
-			p.mu.Lock()
-			p.conectado = false
-			p.ultimoErr = err.Error()
-			p.mu.Unlock()
-			select {
-			case <-p.cerrarCh:
-				return
-			case <-time.After(10 * time.Second):
-				continue
-			}
-		}
-
-		var ver []byte
-		ver = pbTagVarint(ver, 1, 0x00010400)
-		ver = pbTagString(ver, 2, "Conferencia-Mumble")
-		ver = pbTagString(ver, 3, "Linux")
-		_ = escribirPaqueteMumble(conn, mumbleMsgVersion, ver)
-
-		var auth []byte
-		auth = pbTagString(auth, 1, "sala-"+p.sala)
-		if cfg.Clave != "" {
-			auth = pbTagString(auth, 2, cfg.Clave)
-		}
-		auth = pbTagVarint(auth, 5, 1)
-		_ = escribirPaqueteMumble(conn, mumbleMsgAuthenticate, auth)
-
-		p.mu.Lock()
-		p.conn = conn
-		p.conectado = true
-		p.ultimoErr = ""
-		p.mu.Unlock()
-
-		// Goroutine de Ping y envío asíncrono de audio a Mumble (nunca bloquea WebSocket)
-		doneConn := make(chan struct{})
-		go func(c net.Conn) {
-			tk := time.NewTicker(15 * time.Second)
-			defer tk.Stop()
-			for {
-				select {
-				case <-doneConn:
-					return
-				case <-p.cerrarCh:
-					return
-				case opusFrame := <-p.txCh:
-					if len(opusFrame) == 0 {
-						continue
-					}
-					p.mu.Lock()
-					p.seq++
-					seqNow := p.seq
-					p.mu.Unlock()
-					pkt := make([]byte, 0, 16+len(opusFrame))
-					pkt = append(pkt, 0x80)
-					pkt = append(pkt, mumbleVarintEncode(seqNow)...)
-					pkt = append(pkt, mumbleVarintEncode(uint64(len(opusFrame)))...)
-					pkt = append(pkt, opusFrame...)
-					_ = c.SetWriteDeadline(time.Now().Add(1500 * time.Millisecond))
-					if err := escribirPaqueteMumble(c, mumbleMsgUDPTunnel, pkt); err != nil {
-						_ = c.Close()
-						return
-					}
-				case <-tk.C:
-					var pg []byte
-					pg = pbTagVarint(pg, 1, uint64(time.Now().UnixMilli()))
-					_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-					if err := escribirPaqueteMumble(c, mumbleMsgPing, pg); err != nil {
-						_ = c.Close()
-						return
-					}
-				}
-			}
-		}(conn)
-
-		for {
-			tipo, _, err := leerPaqueteMumble(conn)
-			if err != nil {
-				break
-			}
-			if tipo == mumbleMsgReject {
-				break
-			}
-		}
-		close(doneConn)
-		_ = conn.Close()
-		p.mu.Lock()
-		if p.conn == conn {
-			p.conn = nil
-			p.conectado = false
-		}
-		p.mu.Unlock()
-
-		select {
-		case <-p.cerrarCh:
-			return
-		case <-time.After(5 * time.Second):
-		}
-	}
-}
-
-// enviarAudioMumble encola de forma 100% no bloqueante una trama Opus hacia el
-// servidor Mumble nativo sin detener jamás el WebSocket de los navegadores.
-func (p *puenteMumble) enviarAudioMumble(audioPayload []byte) {
-	if len(audioPayload) == 0 {
-		return
-	}
-	cp := make([]byte, len(audioPayload))
-	copy(cp, audioPayload)
-	select {
-	case p.txCh <- cp:
-	default:
-	}
-}
-
-// ============================================================================
-// 3. HUB MULTIMEDIA POR WEBSOCKET HTTPS/443 (VOZ MUMBLE + VIDEO 240p ASIENTO 1/PALABRA)
+// 2. PROTOCOLO PROPIO (WebSocket binario + segmentos de voz confiables)
 // ============================================================================
 //
 // Encabezado de trama binaria WebSocket:
@@ -550,7 +116,8 @@ type clienteWS struct {
 	canCam     bool
 	canPan     bool
 	opusRx     bool
-	ultimoHabl int64
+	ultimoHabl int64 // unix ms de su última trama de voz aceptada (watchdog de piso)
+	avisPiso   int64 // rate-limit del aviso piso_ocupado
 }
 
 func (c *clienteWS) cerrarConCodigo(code int, reason string) {
@@ -634,7 +201,7 @@ type mediaRoom struct {
 	mu       sync.RWMutex
 	sala     string
 	clientes map[string]*clienteWS // identidad -> cliente activo
-	mumble   *puenteMumble
+	seg      *segStore             // historial de notas de voz (segmentos recuperables)
 }
 
 type MediaHub struct {
@@ -654,8 +221,8 @@ func (mh *MediaHub) room(sala string) *mediaRoom {
 		r = &mediaRoom{
 			sala:     sala,
 			clientes: map[string]*clienteWS{},
-			mumble:   nuevoPuenteMumble(sala),
 		}
+		r.seg = nuevoSegStore(sala, r)
 		mh.rooms[sala] = r
 	}
 	return r
@@ -669,7 +236,6 @@ func (mh *MediaHub) borrarRoom(sala string) {
 	}
 	mh.mu.Unlock()
 	if ok && r != nil {
-		r.mumble.cerrar()
 		r.mu.Lock()
 		for _, c := range r.clientes {
 			c.cerrarConCodigo(websocket.CloseGoingAway, "sala borrada")
@@ -780,6 +346,9 @@ func actualizarPermiso(sala, identidad string, mic, cam, pan bool) {
 		c.enviarCtrl(append([]byte{1}, msg...))
 		r.difundirEstadoPeers(grupo)
 	}
+	if !mic {
+		liberarPisoDe(sala, identidad, false)
+	}
 }
 
 func mutearPistas(sala string, _ int, identidad string, mic, cam bool) {
@@ -806,6 +375,9 @@ func mutearPistas(sala string, _ int, identidad string, mic, cam bool) {
 		c.enviarCtrl(append([]byte{1}, msg...))
 		r.difundirEstadoPeers(grupo)
 	}
+	if mic {
+		liberarPisoDe(sala, identidad, false)
+	}
 }
 
 func expulsarClienteWS(sala, identidad string) {
@@ -822,6 +394,122 @@ func expulsarClienteWS(sala, identidad string) {
 		c.cerrarConCodigo(4003, "expulsado de la sala")
 		r.difundirEstadoPeers(grupo)
 	}
+}
+
+func (r *mediaRoom) clienteDe(id string) *clienteWS {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.clientes[id]
+}
+
+// liberarPisoDe suelta el piso exclusivo de voz si id lo tiene y cierra la
+// frase (segmento) que tuviera abierta. Interrumpida marca la nota de voz
+// como cortada por otro hablante.
+func liberarPisoDe(sala, id string, interrumpida bool) {
+	mr := media.room(sala)
+	if sg := mr.seg.cerrarHablante(id, interrumpida); sg != nil {
+		mr.notificarSegFin(sg)
+	}
+	sv := hub.sala(sala)
+	sv.mu.Lock()
+	if sv.soltarPisoEn(sv.estadoDe(id), id) {
+		sv.broadcast(&Evento{Tipo: "piso"})
+	}
+	sv.mu.Unlock()
+}
+
+// tomarPisoWS responde al mensaje WS {t:"piso_tomar"}: aplica la regla del
+// mínimo de tiempos entre los roles del solicitante. Si el piso está ocupado
+// responde piso_ocupado con los segundos restantes; si lo roba, cierra la
+// frase del anterior como interrumpida y le avisa con piso_perdido.
+func (r *mediaRoom) tomarPisoWS(c *clienteWS) {
+	sv := hub.sala(r.sala)
+	sv.mu.Lock()
+	e := sv.estadoDe(c.identidad)
+	soyMod := c.esAdmin || sv.esModerador(c.identidad)
+	if !sv.puedeMic(c.identidad, soyMod) {
+		sv.mu.Unlock()
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ocupado", "error": "sin permiso de micrófono"})
+		c.enviarCtrl(append([]byte{1}, msg...))
+		return
+	}
+	res, faltan, anterior := sv.tomarPisoEn(e, c.identidad, c.nombre, soyMod)
+	holderNombre := e.PisoNombre
+	if res == pisoTomado || res == pisoRobado {
+		sv.broadcast(&Evento{Tipo: "piso"})
+	}
+	sv.mu.Unlock()
+
+	switch res {
+	case pisoYaMio, pisoTomado:
+		c.ultimoHabl = ahora()
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ok"})
+		c.enviarCtrl(append([]byte{1}, msg...))
+	case pisoRobado:
+		c.ultimoHabl = ahora()
+		if sg := r.seg.cerrarHablante(anterior, true); sg != nil {
+			r.notificarSegFin(sg)
+		}
+		if oc := r.clienteDe(anterior); oc != nil {
+			msg, _ := json.Marshal(map[string]any{"t": "piso_perdido", "por": c.nombre})
+			oc.enviarCtrl(append([]byte{1}, msg...))
+		}
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ok"})
+		c.enviarCtrl(append([]byte{1}, msg...))
+	case pisoOcupadoR:
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ocupado", "nombre": holderNombre, "faltan": faltan})
+		c.enviarCtrl(append([]byte{1}, msg...))
+	}
+}
+
+// pisoCheck arbitra el piso por cada trama de voz entrante: solo pasa audio
+// del dueño del piso. El primer hablante lo toma automáticamente; si otro
+// transmite mientras tanto y su tiempo mínimo ya pasó, se lo arrebata (robo
+// implícito por hablar). Las tramas rechazadas reciben piso_ocupado (máx.
+// 1 aviso cada 4 s por cliente para no saturar).
+// Devuelve true si la trama puede pasar a fanout/segmento.
+func (r *mediaRoom) pisoCheck(c *clienteWS, rc byte) bool {
+	sv := hub.sala(r.sala)
+	sv.mu.Lock()
+	e := sv.estadoDe(c.identidad)
+	soyMod := c.esAdmin || sv.esModerador(c.identidad)
+	if rc == 0 {
+		// EOS siempre pasa: solo cierra la frase abierta del propio emisor
+		sv.mu.Unlock()
+		return true
+	}
+	if !sv.puedeMic(c.identidad, soyMod) {
+		sv.mu.Unlock()
+		return false
+	}
+	res, faltan, anterior := sv.tomarPisoEn(e, c.identidad, c.nombre, soyMod)
+	holderNombre := e.PisoNombre
+	if res == pisoTomado || res == pisoRobado {
+		sv.broadcast(&Evento{Tipo: "piso"})
+	}
+	sv.mu.Unlock()
+
+	switch res {
+	case pisoYaMio, pisoTomado:
+		c.ultimoHabl = ahora()
+		return true
+	case pisoRobado:
+		c.ultimoHabl = ahora()
+		if sg := r.seg.cerrarHablante(anterior, true); sg != nil {
+			r.notificarSegFin(sg)
+		}
+		if oc := r.clienteDe(anterior); oc != nil {
+			msg, _ := json.Marshal(map[string]any{"t": "piso_perdido", "por": c.nombre})
+			oc.enviarCtrl(append([]byte{1}, msg...))
+		}
+		return true
+	}
+	if ahora()-c.avisPiso >= 4000 {
+		c.avisPiso = ahora()
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ocupado", "nombre": holderNombre, "faltan": faltan})
+		c.enviarCtrl(append([]byte{1}, msg...))
+	}
+	return false
 }
 
 var upgrader = websocket.Upgrader{
@@ -899,17 +587,16 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 
 	mr.difundirEstadoPeers(grupo)
 
-	// Enviar bienvenida con estado Mumble y permisos iniciales
-	cfgMumble := store.ObtenerMumble()
+	// Enviar bienvenida con permisos iniciales y el último segmento de voz
+	// cerrado (para que el cliente re-pida lo que se perdió tras un corte)
 	initMsg, _ := json.Marshal(map[string]any{
-		"t":          "bienvenida",
-		"identidad":  c.identidad,
-		"grupo":      c.grupo,
-		"canMic":     c.canMic,
-		"canCam":     c.canCam,
-		"canPan":     c.canPan,
-		"mumbleModo": cfgMumble.Modo,
-		"mumbleHost": direccionMumbleEfectiva(cfgMumble),
+		"t":         "bienvenida",
+		"identidad": c.identidad,
+		"grupo":     c.grupo,
+		"canMic":    c.canMic,
+		"canCam":    c.canCam,
+		"canPan":    c.canPan,
+		"ultimoSeg": mr.seg.ultimoCerrado(),
 	})
 	c.enviarCtrl(append([]byte{1}, initMsg...))
 	if len(estadoInicial) > 0 {
@@ -1017,6 +704,17 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			}
 			tipo, _ := m["t"].(string)
 			switch tipo {
+			case "piso_tomar":
+				mr.tomarPisoWS(c)
+
+			case "piso_soltar":
+				liberarPisoDe(sala, c.identidad, false)
+
+			case "piso_hold":
+				// Latido del PTT sostenido: mantiene vivo el piso aunque el
+				// hablante haga pausas (VAD deja de emitir tramas en silencio)
+				c.ultimoHabl = ahora()
+
 			case "ping_net":
 				// Medición de RTT y jitter del cliente para ajuste automático de bitrate (8–28 kbps)
 				pong, _ := json.Marshal(map[string]any{
@@ -1041,7 +739,11 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					c.opusRx = v
 				}
 				gActual := c.grupo
+				micApagado := !c.micOn
 				mr.mu.Unlock()
+				if micApagado {
+					liberarPisoDe(sala, c.identidad, false)
+				}
 				mr.difundirEstadoPeers(gActual)
 
 			case "cambiar_grupo":
@@ -1110,23 +812,23 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				if !c.canMic || len(payload) < 1 {
 					continue
 				}
+				rc := payload[0]
+				// Piso exclusivo: solo pasa la voz del dueño del piso; hablar
+				// lo toma en automático y un tercero puede tumbártelo según los
+				// tiempos de interrupción configurados por rol.
+				if !mr.pisoCheck(c, rc) {
+					continue
+				}
 				if !c.micOn {
 					mr.mu.Lock()
 					c.micOn = true
 					mr.mu.Unlock()
 					mr.difundirEstadoPeers(c.grupo)
 				}
-				rc := payload[0]
 				// rc == 0: marcador explícito de fin de frase (EOS), llega a todos los oyentes
 				// rc 10..19 = Opus (solo para clientes con opusRx=true)
 				// rc 30..39 = ADPCM respaldo simultáneo (solo para clientes con opusRx=false)
 				// rc 20..29 o 1..2 = ADPCM/u-law primario (para todos cuando el emisor no tiene Opus)
-				if rc >= 10 && rc <= 19 && len(payload) > 8 && payload[3] == 0xA5 {
-					l1 := int(payload[4]) | (int(payload[5]) << 8)
-					if 6+l1 <= len(payload) && l1 > 0 {
-						mr.mumble.enviarAudioMumble(payload[6 : 6+l1])
-					}
-				}
 				mr.mu.RLock()
 				for _, otro := range mr.clientes {
 					if otro == c || otro.grupo != c.grupo {
@@ -1141,6 +843,16 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					otro.enviarBinarioAudio(out)
 				}
 				mr.mu.RUnlock()
+
+				// Historial confiable: la frase se archiva como segmento
+				// descargable para reparar micro-cortes y notas de voz.
+				nuevo, cerrado := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
+				if nuevo != nil {
+					mr.seg.notificarSegIni(nuevo)
+				}
+				if cerrado != nil {
+					mr.notificarSegFin(cerrado)
+				}
 
 			case frameTipoVideo:
 				// Regla estricta: SOLO Asiento 1 y La Palabra tienen canCam = true
@@ -1211,6 +923,7 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	mr.mu.Unlock()
 	c.cerrarConCodigo(websocket.CloseNormalClosure, "")
 	if sigueActivo {
+		liberarPisoDe(sala, c.identidad, false)
 		mr.difundirEstadoPeers(c.grupo)
 	}
 }

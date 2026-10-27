@@ -163,6 +163,16 @@ label.check input { width: auto; }
 .msg { background: var(--bg3); border-radius: 8px; padding: .4rem .6rem; font-size: .85rem; }
 .msg .quien { font-size: .72rem; color: var(--muted); margin-bottom: .1rem; }
 .msg.propio { border-left: 3px solid var(--prim); }
+/* Notas de voz en el historial del chat: chip reproducible por frase */
+.msg.nota-voz { border-left: 3px solid var(--verde); }
+.nv-play {
+  margin-top: .15rem; min-width: 64px;
+  background: var(--bg2); border: 1px solid var(--borde); border-radius: 999px;
+  padding: .2rem .7rem; font-size: .8rem; cursor: pointer;
+}
+.nv-play.sonando { border-color: var(--verde); color: var(--verde); animation: pulsa 1.4s infinite; }
+.nv-play.oido { opacity: .6; }
+.nv-play:disabled { opacity: .45; cursor: default; }
 
 #barra-controles {
   grid-column: 1 / -1; background: var(--bg2); border-top: 1px solid var(--borde);
@@ -202,6 +212,8 @@ label.check input { width: auto; }
   height: 2.4px; background: var(--peligro); border-radius: 2px; transform: rotate(-45deg);
 }
 .btn.ctl.levantada .ctl-ico { background: var(--ambar); border-color: var(--ambar); color: #14100a; }
+/* PTT pisado: el micro se ve "hablando" aunque esté en modo pulsar */
+.btn.ctl.ptt .ctl-ico { background: var(--verde); border-color: var(--verde); color: #fff; animation: pulsa 1.4s infinite; }
 .btn.ctl.ctl-salir .ctl-ico { background: var(--peligro); border-color: var(--peligro); color: #fff; }
 #ctl-mas .ctl-ico { border-style: dashed; border-color: var(--prim); }
 #st-salir .salir-ico { display: none; fill: currentColor; }

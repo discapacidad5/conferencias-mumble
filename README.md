@@ -1,16 +1,18 @@
-# Conferencias con Protocolo Mumble + Video Ligero (Asiento 1 y Palabra)
+# Conferencias — Servidor Propio de Voz + Video Ligero (Asiento 1 y Palabra)
 
 Edición ultraligera de la plataforma de conferencias diseñada para funcionar sin fallos en **conexiones móviles lentas (2G/3G/4G)** y detrás de **Cloudflare Tunnel (sin IP pública, sin puertos UDP ni servidores TURN)**.
 
 ## Características principales
 
-1. **Protocolo Mumble (Servidor Local o Público Remoto)**:
-   - Desde el **Panel de Administración** puedes elegir en vivo si las salas se conectan a:
-     - **Servidor Mumble Local** (`mumble-server` incluido en `docker-compose.yml`, ~15 MB de RAM).
-     - **Cualquier servidor Mumble público o remoto en Internet** (`host:puerto`, contraseña opcional) con botón **🔌 Probar conexión**.
+1. **Servidor de voz propio (un solo binario Go)**:
+   - No depende de ningún servicio externo: el mismo proceso sirve la web, el WebSocket y el historial de audio.
+   - Protocolo propio sobre **WebSocket binario sobre HTTPS**: tramas de voz (Opus/ADPCM), video ligero y compartición de pantalla/documentos.
+   - **Voz confiable estilo nota de voz**: cada frase se archiva en el servidor como segmento recuperable (`DATA_DIR/audio/<sala>/`); si el cliente tiene microcortes o se desconecta, al volver descarga por HTTP las frases que le faltan — nada se pierde.
+   - **Piso exclusivo (PTT)**: solo una persona habla a la vez, con tiempos de interrupción configurables por rol (administrador, anfitrión, La Palabra, usuario).
+   - **Historial de voz en el chat**: cada intervención queda como nota de voz re-escuchable, con retención configurable.
 2. **Cero fallos ICE/TURN en datos móviles**:
    - Los teléfonos se conectan únicamente por **WebSocket sobre HTTPS (puerto 443)** pasando directo por tu túnel o proxy inverso.
-   - Audio con **Detector de Actividad de Voz (VAD)** (0 bytes/s en silencio) y compresión ultraligera (8–12 kHz µ-law).
+   - Audio con **Detector de Actividad de Voz (VAD)** (0 bytes/s en silencio) y compresión ultraligera (Opus ~10–26 kbps, con ADPCM de reserva).
 3. **Video Ligero 240p exclusivo para Asiento 1 (Anfitrión) y La Palabra**:
    - Solo quien ocupa el **Asiento 1** o tiene **La Palabra** transmite cámara (máximo 2 cámaras en toda la sala, 240p a 10 fps).
    - El servidor Go **no recodifica video (0% gasto de CPU)** y aplica descarte automático de cuadros antiguos (*drop-oldest-frame*) para oyentes con internet lento, de modo que la voz jamás se corta ni se desincroniza.
@@ -20,14 +22,14 @@ Edición ultraligera de la plataforma de conferencias diseñada para funcionar s
 ## Despliegue con Docker Compose
 
 ```bash
-cd mumble-conferencias
 docker compose up -d --build
 ```
 
 ## Ejecución directa en local (sin Docker)
 
 ```bash
-cd mumble-conferencias
-go build -o conferencia-mumble.exe .
-./conferencia-mumble.exe
+go build -o conferencia.exe .
+./conferencia.exe
 ```
+
+Variables de entorno: `PORT` (3000), `DATA_DIR` (./data), `APP_SECRET`, `ADMIN_USER`, `ADMIN_PASSWORD`, `PUBLIC_HOST`.

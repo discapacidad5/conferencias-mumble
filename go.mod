@@ -1,4 +1,4 @@
-module conferencia-mumble
+module conferencia
 
 go 1.24.2
 

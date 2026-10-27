@@ -16,18 +16,6 @@ type Admin struct {
 	Hash    string `json:"hash"`
 }
 
-// MumbleConfig define a qué servidor Mumble se conecta la plataforma:
-// Modo "local" usa el mumble-server local (MUMBLE_LOCAL_ADDR, por defecto
-// localhost:64738 o mumble-server:64738 en Docker); Modo "remoto" conecta a
-// cualquier servidor Mumble público o privado en Internet.
-type MumbleConfig struct {
-	Modo      string `json:"modo"`                // "local" | "remoto"
-	Host      string `json:"host"`                // ej: "mumble.ejemplo.org"
-	Puerto    int    `json:"puerto"`              // por defecto 64738
-	Clave     string `json:"clave,omitempty"`     // contraseña del servidor Mumble si requiere
-	CanalRaiz string `json:"canalRaiz,omitempty"` // canal base opcional en el servidor Mumble
-}
-
 type Sala struct {
 	Nombre        string            `json:"nombre"`
 	Privada       bool              `json:"privada"`
@@ -38,6 +26,13 @@ type Sala struct {
 	ModsFijos     map[string]string `json:"modsFijos,omitempty"` // identidad -> nombre (moderadores delegados)
 	Deshabilitada bool              `json:"deshabilitada,omitempty"`
 	NombreVisible string            `json:"nombreVisible,omitempty"`
+	// Segundos que debe llevar hablando quien tiene el piso antes de que cada
+	// rol pueda tumbárselo. PisoCfgOK=false => valores por defecto (0/0/10/60).
+	PisoIntAdminSeg     int  `json:"pisoIntAdminSeg"`
+	PisoIntAnfitrionSeg int  `json:"pisoIntAnfitrionSeg"`
+	PisoIntPalabraSeg   int  `json:"pisoIntPalabraSeg"`
+	PisoIntUsuarioSeg   int  `json:"pisoIntUsuarioSeg"`
+	PisoCfgOK           bool `json:"pisoCfgOK,omitempty"`
 }
 
 // Visible: el nombre para mostrar — NombreVisible si hay, si no el slug.
@@ -49,9 +44,8 @@ func (sl Sala) Visible() string {
 }
 
 type datos struct {
-	Admins []Admin      `json:"admins"`
-	Salas  []Sala       `json:"salas"`
-	Mumble MumbleConfig `json:"mumble"`
+	Admins []Admin `json:"admins"`
+	Salas  []Sala  `json:"salas"`
 }
 
 // Store: base de datos embebida, persistida en DATA_DIR/datos.json
@@ -71,22 +65,6 @@ func NewStore(dir string) (*Store, error) {
 			return nil, err
 		}
 	}
-	if s.d.Mumble.Modo == "" {
-		if m := os.Getenv("MUMBLE_MODE"); m == "remoto" || m == "local" {
-			s.d.Mumble.Modo = m
-		} else {
-			s.d.Mumble.Modo = "local"
-		}
-		if h := os.Getenv("MUMBLE_REMOTE_HOST"); h != "" {
-			s.d.Mumble.Host = h
-		}
-		if k := os.Getenv("MUMBLE_REMOTE_PASSWORD"); k != "" {
-			s.d.Mumble.Clave = k
-		}
-	}
-	if s.d.Mumble.Puerto <= 0 {
-		s.d.Mumble.Puerto = 64738
-	}
 	return s, nil
 }
 
@@ -98,35 +76,6 @@ func (s *Store) guardar() {
 		return
 	}
 	os.Rename(tmp, s.path)
-}
-
-// --- Configuración Mumble ---
-
-func (s *Store) ObtenerMumble() MumbleConfig {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cfg := s.d.Mumble
-	if cfg.Modo == "" {
-		cfg.Modo = "local"
-	}
-	if cfg.Puerto <= 0 {
-		cfg.Puerto = 64738
-	}
-	return cfg
-}
-
-func (s *Store) GuardarMumble(cfg MumbleConfig) MumbleConfig {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if cfg.Modo != "remoto" {
-		cfg.Modo = "local"
-	}
-	if cfg.Puerto <= 0 || cfg.Puerto > 65535 {
-		cfg.Puerto = 64738
-	}
-	s.d.Mumble = cfg
-	s.guardar()
-	return cfg
 }
 
 // --- Administradores ---
@@ -182,6 +131,33 @@ func (s *Store) QuitarMod(sala, identidad string) {
 	for i := range s.d.Salas {
 		if s.d.Salas[i].Nombre == sala {
 			delete(s.d.Salas[i].ModsFijos, identidad)
+			s.guardar()
+			return
+		}
+	}
+}
+
+// FijarPisoCfg guarda los 4 tiempos de interrupción de piso de una sala
+// (admin, anfitrión, palabra, usuario — en segundos, 0 = inmediato).
+func (s *Store) FijarPisoCfg(nombre string, admin, anfitrion, palabra, usuario int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clamp := func(v int) int {
+		if v < 0 {
+			return 0
+		}
+		if v > 3600 {
+			return 3600
+		}
+		return v
+	}
+	for i := range s.d.Salas {
+		if s.d.Salas[i].Nombre == nombre {
+			s.d.Salas[i].PisoIntAdminSeg = clamp(admin)
+			s.d.Salas[i].PisoIntAnfitrionSeg = clamp(anfitrion)
+			s.d.Salas[i].PisoIntPalabraSeg = clamp(palabra)
+			s.d.Salas[i].PisoIntUsuarioSeg = clamp(usuario)
+			s.d.Salas[i].PisoCfgOK = true
 			s.guardar()
 			return
 		}

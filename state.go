@@ -40,14 +40,19 @@ type EstadoSala struct {
 	Manos        []Mano     `json:"manos"`
 	Silencio     bool       `json:"silencio"`     // true = la audiencia (no sentada) no puede hablar
 	MicAsientos  bool       `json:"micAsientos"`  // true = los sentados (salvo el asiento 1) deben pedir la palabra
-	CamAudiencia bool       `json:"camAudiencia"` // mantenido por compatibilidad de UI (en modo Mumble solo Asiento 1 y Palabra tienen cámara)
+	CamAudiencia bool       `json:"camAudiencia"` // mantenido por compatibilidad de UI (en modo bajo consumo solo Asiento 1 y Palabra tienen cámara)
 	CamAsientos  bool       `json:"camAsientos"`  // mantenido por compatibilidad de UI
 	ChatOff      bool       `json:"chatOff"`      // true = solo los moderadores escriben en el chat
 	VistaFija    bool       `json:"vistaFija"`    // true = la audiencia solo ve la vista sincronizada
 	Rejilla      string     `json:"rejilla"`
-	AudioPerfil  string     `json:"audioPerfil"` // "telefono" | "voz" | "musica" — preset de voz Mumble
+	AudioPerfil  string     `json:"audioPerfil"` // "telefono" | "voz" | "musica" — preset de voz de bajo consumo
 	Doc          *Documento `json:"doc,omitempty"`
 	Moderadores  []string   `json:"moderadores"` // espejo de salaViva.moderadores al serializar
+	// Piso exclusivo de voz (PTT): solo el dueño transmite; otro con permiso
+	// puede tumbárselo tras cumplir su tiempo de espera configurable.
+	Piso       string `json:"piso,omitempty"`
+	PisoNombre string `json:"pisoNombre,omitempty"`
+	PisoDesde  int64  `json:"pisoDesde,omitempty"` // unix ms en que se tomó
 
 	votantes map[string]int8 // identidad -> 1 a favor / -1 en contra
 }
@@ -111,9 +116,10 @@ func NewHub() *Hub {
 }
 
 func nuevoEstado() *EstadoSala {
-	// En la edición Mumble para conexiones lentas, por defecto CamAudiencia y
-	// CamAsientos nacen en true (solo Asiento 1 y Palabra publican video) y el
-	// perfil de audio nace en "auto" (adapta entre ~10, 18 y 26 kbps según la red).
+	// En la edición de bajo consumo para conexiones lentas, por defecto
+	// CamAudiencia y CamAsientos nacen en true (solo Asiento 1 y Palabra
+	// publican video) y el perfil de audio nace en "auto" (adapta entre
+	// ~10, 18 y 26 kbps según la red).
 	return &EstadoSala{
 		Rejilla:      "asientos",
 		VistaFija:    true,
@@ -235,6 +241,9 @@ func sacarDeEstado(e *EstadoSala, id string) int {
 	}
 	e.Cola = filtrarCola(e.Cola, id)
 	e.Manos = filtrarManos(e.Manos, id)
+	if e.Piso == id {
+		e.Piso, e.PisoNombre, e.PisoDesde = "", "", 0
+	}
 	if e.Palabra == id {
 		e.Palabra = ""
 		e.PalabraFin = 0
@@ -487,6 +496,81 @@ func (sv *salaViva) asientoLibreEn(e *EstadoSala, id string, soyMod bool) int {
 	return -1
 }
 
+// pisoCfgDe resuelve los 4 tiempos de interrupción de piso de una sala
+// (segundos que debe llevar hablando el dueño antes de que cada rol pueda
+// tumbárselo). Sin config explícita: admin y anfitrión al instante, la
+// Palabra a los 10 s y el resto a los 60 s.
+type pisoCfg struct{ admin, anfitrion, palabra, usuario int }
+
+func pisoCfgDe(sl *Sala) pisoCfg {
+	if sl != nil && sl.PisoCfgOK {
+		return pisoCfg{sl.PisoIntAdminSeg, sl.PisoIntAnfitrionSeg, sl.PisoIntPalabraSeg, sl.PisoIntUsuarioSeg}
+	}
+	return pisoCfg{0, 0, 10, 60}
+}
+
+// minSegPiso: segundos que debe llevar hablando el dueño del piso antes de que
+// ESTA identidad pueda interrumpir. Regla: el MÍNIMO de los tiempos de TODOS
+// los roles que posea — todos parten del tiempo de usuario y cada rol extra
+// solo puede bajarlo (un admin que además tiene la Palabra usa el menor).
+func (sv *salaViva) minSegPiso(id string, esAdmin bool) int {
+	cfg := pisoCfgDe(store.BuscarSala(sv.nombre))
+	e := sv.estadoDe(id)
+	m := cfg.usuario
+	if esAdmin || sv.esModerador(id) {
+		if cfg.admin < m {
+			m = cfg.admin
+		}
+	}
+	if asientoEn(e, id) == 0 {
+		if cfg.anfitrion < m {
+			m = cfg.anfitrion
+		}
+	}
+	if e.Palabra == id {
+		if cfg.palabra < m {
+			m = cfg.palabra
+		}
+	}
+	return m
+}
+
+// Resultados de tomarPisoEn.
+const (
+	pisoYaMio    = 0 // ya lo tenía
+	pisoTomado   = 1 // estaba libre, ahora es mío
+	pisoRobado   = 2 // se lo tumbé a otro tras cumplir mi tiempo de espera
+	pisoOcupadoR = 3 // no puedo todavía: devuelve segundos restantes
+)
+
+// tomarPisoEn gestiona el piso exclusivo del estado e. Llamar con sv.mu tomado.
+// Devuelve (resultado, faltanSegundos, anteriorHolder).
+func (sv *salaViva) tomarPisoEn(e *EstadoSala, id, nombre string, esAdmin bool) (int, int, string) {
+	if e.Piso == id {
+		return pisoYaMio, 0, ""
+	}
+	if e.Piso == "" {
+		e.Piso, e.PisoNombre, e.PisoDesde = id, nombre, ahora()
+		return pisoTomado, 0, ""
+	}
+	faltaMs := int64(sv.minSegPiso(id, esAdmin))*1000 - (ahora() - e.PisoDesde)
+	if faltaMs > 0 {
+		return pisoOcupadoR, int((faltaMs + 999) / 1000), ""
+	}
+	ant := e.Piso
+	e.Piso, e.PisoNombre, e.PisoDesde = id, nombre, ahora()
+	return pisoRobado, 0, ant
+}
+
+// soltarPisoEn libera el piso si lo tiene id. Con sv.mu tomado.
+func (sv *salaViva) soltarPisoEn(e *EstadoSala, id string) bool {
+	if e.Piso != id {
+		return false
+	}
+	e.Piso, e.PisoNombre, e.PisoDesde = "", "", 0
+	return true
+}
+
 // puedeMic decide si la identidad puede publicar micrófono en este instante.
 func (sv *salaViva) puedeMic(id string, _ bool) bool {
 	if sv.micBloq[id] {
@@ -508,9 +592,9 @@ func (sv *salaViva) puedeMic(id string, _ bool) bool {
 	return !e.Silencio
 }
 
-// puedeCam: en la versión Mumble para conexiones lentas, SOLO el Asiento 1
-// (anfitrión) y quien tiene La Palabra pueden encender cámara (o excepción
-// explícita de moderador), garantizando máximo 2 cámaras de bajo consumo.
+// puedeCam: en la versión de bajo consumo para conexiones lentas, SOLO el
+// Asiento 1 (anfitrión) y quien tiene La Palabra pueden encender cámara (o
+// excepción explícita de moderador), garantizando máximo 2 cámaras.
 func (sv *salaViva) puedeCam(id string) bool {
 	if sv.camBloq[id] {
 		return false

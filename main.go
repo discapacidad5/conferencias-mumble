@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,13 +24,12 @@ import (
 var webFS embed.FS
 
 var (
-	appSecret       = env("APP_SECRET", "mumble-conferencias-secret-0123456789abcdef")
-	mumbleLocalAddr = env("MUMBLE_LOCAL_ADDR", "localhost:64738")
-	publicHost      = os.Getenv("PUBLIC_HOST")
-	port            = env("PORT", "3000")
-	dataDir         = env("DATA_DIR", "./data")
-	adminUser       = env("ADMIN_USER", "admin")
-	adminPass       = env("ADMIN_PASSWORD", "admin123")
+	appSecret  = env("APP_SECRET", "conferencia-secret-0123456789abcdef")
+	publicHost = os.Getenv("PUBLIC_HOST")
+	port       = env("PORT", "3000")
+	dataDir    = env("DATA_DIR", "./data")
+	adminUser  = env("ADMIN_USER", "admin")
+	adminPass  = env("ADMIN_PASSWORD", "admin123")
 )
 
 func env(k, def string) string {
@@ -86,6 +86,8 @@ func main() {
 
 	// --- participante (Bearer o query token HMAC) ---
 	mux.HandleFunc("GET /api/salas/{sala}/media", conParticipante(hMediaWS))
+	mux.HandleFunc("GET /api/salas/{sala}/audio", conParticipante(hAudioManifiesto))
+	mux.HandleFunc("GET /api/salas/{sala}/audio/{seq}", conParticipante(hAudioSegmento))
 	mux.HandleFunc("GET /api/salas/{sala}/estado", conParticipante(hEstado))
 	mux.HandleFunc("GET /api/salas/{sala}/eventos", conParticipante(hEventos))
 	mux.HandleFunc("POST /api/salas/{sala}/accion", conParticipante(hAccion))
@@ -103,19 +105,15 @@ func main() {
 	mux.HandleFunc("DELETE /api/admin/salas/{sala}", conAdmin(hAdminBorrarSala))
 	mux.HandleFunc("GET /api/admin/salas/{sala}/participantes", conAdmin(hAdminParticipantes))
 	mux.HandleFunc("POST /api/admin/usuarios", conAdmin(hAdminCrearUsuario))
-	mux.HandleFunc("GET /api/admin/mumble", conAdmin(hAdminObtenerMumble))
-	mux.HandleFunc("POST /api/admin/mumble", conAdmin(hAdminGuardarMumble))
-	mux.HandleFunc("POST /api/admin/mumble/probar", conAdmin(hAdminProbarMumble))
 
 	// --- SPA embebida ---
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", spaHandler(sub))
 
 	go barrerParticipantes()
+	go barrerSegmentos()
 
-	cfgM := store.ObtenerMumble()
-	log.Printf("conferencia-mumble escuchando en :%s (servidor Mumble [%s]: %s)",
-		port, cfgM.Modo, direccionMumbleEfectiva(cfgM))
+	log.Printf("conferencia escuchando en :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
 
@@ -296,53 +294,10 @@ func hMe(w http.ResponseWriter, r *http.Request) {
 }
 
 func hConfig(w http.ResponseWriter, r *http.Request) {
-	cfgM := store.ObtenerMumble()
 	escribirJSON(w, 200, map[string]any{
-		"wsUrl":      wsURLMedia(r),
-		"protocolo":  "mumble",
-		"mumbleModo": cfgM.Modo,
-		"mumbleHost": direccionMumbleEfectiva(cfgM),
+		"wsUrl":     wsURLMedia(r),
+		"protocolo": "conferencia",
 	})
-}
-
-// ---------- administración del servidor Mumble (local o público remoto) ----------
-
-func hAdminObtenerMumble(w http.ResponseWriter, r *http.Request) {
-	cfg := store.ObtenerMumble()
-	escribirJSON(w, 200, map[string]any{
-		"config":    cfg,
-		"direccion": direccionMumbleEfectiva(cfg),
-		"localAddr": mumbleLocalAddr,
-	})
-}
-
-func hAdminGuardarMumble(w http.ResponseWriter, r *http.Request) {
-	var req MumbleConfig
-	if leerJSON(r, &req) != nil {
-		escribirJSON(w, 400, map[string]string{"error": "datos inválidos"})
-		return
-	}
-	req.Host = strings.TrimSpace(req.Host)
-	if req.Modo == "remoto" && req.Host == "" {
-		escribirJSON(w, 400, map[string]string{"error": "indica el host o dominio del servidor Mumble remoto"})
-		return
-	}
-	guardado := store.GuardarMumble(req)
-	estado := ProbarConexionMumble(guardado)
-	escribirJSON(w, 200, map[string]any{
-		"ok":     true,
-		"config": guardado,
-		"estado": estado,
-	})
-}
-
-func hAdminProbarMumble(w http.ResponseWriter, r *http.Request) {
-	var req MumbleConfig
-	if leerJSON(r, &req) != nil {
-		req = store.ObtenerMumble()
-	}
-	estado := ProbarConexionMumble(req)
-	escribirJSON(w, 200, estado)
 }
 
 // ---------- acceso a salas ----------
@@ -481,7 +436,6 @@ func hObtenerAcceso(w http.ResponseWriter, r *http.Request) {
 		escribirJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	cfgM := store.ObtenerMumble()
 	escribirJSON(w, 200, map[string]any{
 		"token":         tok,
 		"url":           wsURLMedia(r),
@@ -489,8 +443,6 @@ func hObtenerAcceso(w http.ResponseWriter, r *http.Request) {
 		"admin":         roomAdmin,
 		"grupo":         grupo,
 		"nombreVisible": sl.Visible(),
-		"mumbleModo":    cfgM.Modo,
-		"mumbleHost":    direccionMumbleEfectiva(cfgM),
 	})
 }
 
@@ -603,9 +555,10 @@ func marshalEstadoPara(sv *salaViva, ev *Evento, id string) ([]byte, error) {
 			miVoto = v
 		}
 	}
-	cfgM := store.ObtenerMumble()
+	pcfg := pisoCfgDe(store.BuscarSala(sv.nombre))
 	return json.Marshal(map[string]any{
 		"estado":         &copia,
+		"pisoCfg":        map[string]int{"admin": pcfg.admin, "anfitrion": pcfg.anfitrion, "palabra": pcfg.palabra, "usuario": pcfg.usuario},
 		"votos":          map[string]any{"aFavor": aFavor, "enContra": enContra, "mi": miVoto},
 		"instancia":      instanciaServidor,
 		"micProhibido":   sv.micBloq[id],
@@ -632,8 +585,6 @@ func marshalEstadoPara(sv *salaViva, ev *Evento, id string) ([]byte, error) {
 		"lobby":          lobbyLista,
 		"acceso":         acceso,
 		"nombreVisible":  nombreVisible,
-		"mumbleModo":     cfgM.Modo,
-		"mumbleHost":     direccionMumbleEfectiva(cfgM),
 	})
 }
 
@@ -708,6 +659,8 @@ func hAccion(w http.ResponseWriter, r *http.Request, g *Claims) {
 	revisar := map[string]bool{}
 	var mutarMicID string
 	var mutarMicGrupo int
+	var pisoRobadoDe string
+	var cerrarSegDe string
 	sv.mu.Lock()
 	sv.nombres[id] = nombre
 	e := sv.estadoDe(id)
@@ -769,6 +722,31 @@ func hAccion(w http.ResponseWriter, r *http.Request, g *Claims) {
 			idx = i
 		}
 		sentarEn(idx)
+
+	case "piso_tomar":
+		// PTT: tomar el piso exclusivo de voz. Si está ocupado, se tumba solo
+		// cuando ya pasó el tiempo mínimo de los roles del solicitante.
+		if !sv.puedeMic(id, soyMod) {
+			errStr = "sin permiso de micrófono"
+			break
+		}
+		res, faltan, anterior := sv.tomarPisoEn(e, id, nombre, soyMod)
+		holderNombre := e.PisoNombre
+		if res == pisoOcupadoR {
+			sv.mu.Unlock()
+			escribirJSON(w, 409, map[string]any{
+				"error": "piso_ocupado", "faltan": faltan, "holder": holderNombre,
+			})
+			return
+		}
+		pisoRobadoDe = anterior
+		cerrarSegDe = id // cerrar su frase abierta al tomar/soltar el piso
+		ev.Tipo = "piso"
+
+	case "piso_soltar":
+		sv.soltarPisoEn(e, id)
+		cerrarSegDe = id
+		ev.Tipo = "piso"
 
 	case "levantarse":
 		if idx := asientoEn(e, id); idx >= 0 {
@@ -898,6 +876,25 @@ func hAccion(w http.ResponseWriter, r *http.Request, g *Claims) {
 	}
 	if mutarMicID != "" {
 		mutearPistas(sala, mutarMicGrupo, mutarMicID, true, false)
+	}
+	if cerrarSegDe != "" || pisoRobadoDe != "" {
+		mr := media.room(sala)
+		if cerrarSegDe != "" {
+			if sg := mr.seg.cerrarHablante(cerrarSegDe, false); sg != nil {
+				mr.notificarSegFin(sg)
+			}
+		}
+		if pisoRobadoDe != "" {
+			// Al que le tumbamos el piso: su frase se cierra como interrumpida
+			// y se le avisa para que suelte el PTT.
+			if sg := mr.seg.cerrarHablante(pisoRobadoDe, true); sg != nil {
+				mr.notificarSegFin(sg)
+			}
+			if oc := mr.clienteDe(pisoRobadoDe); oc != nil {
+				msg, _ := json.Marshal(map[string]any{"t": "piso_perdido", "por": nombre})
+				oc.enviarCtrl(append([]byte{1}, msg...))
+			}
+		}
 	}
 	escribirJSON(w, 200, map[string]any{"ok": true, "instancia": instanciaServidor})
 }
@@ -1311,6 +1308,30 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 		default:
 			errStr = "modo de acceso desconocido"
 		}
+
+	case "piso_cfg":
+		// Tiempos de interrupción del piso, en segundos, separados por comas:
+		// extra = "admin,anfitrion,palabra,usuario" (0 = interrumpir al instante)
+		var vs [4]int
+		partes := strings.Split(req.Extra, ",")
+		if len(partes) != 4 {
+			errStr = "formato: admin,anfitrion,palabra,usuario (segundos)"
+			break
+		}
+		ok4 := true
+		for i, p := range partes {
+			n, err := strconv.Atoi(strings.TrimSpace(p))
+			if err != nil || n < 0 {
+				ok4 = false
+				break
+			}
+			vs[i] = n
+		}
+		if !ok4 {
+			errStr = "formato: admin,anfitrion,palabra,usuario (segundos)"
+			break
+		}
+		store.FijarPisoCfg(sala, vs[0], vs[1], vs[2], vs[3])
 
 	case "lobby_admitir":
 		if req.Objetivo != "" {
@@ -1758,6 +1779,21 @@ func barrerParticipantes() {
 					e.PalabraFin = 0
 					limpiarVotos(e)
 					cambio = true
+				}
+				// Watchdog del piso: si el dueño lleva >6 s sin mandar tramas
+				// ni latidos de PTT (corte de WiFi, pestaña muerta), se libera.
+				if e.Piso != "" {
+					vivo := false
+					for _, p := range lista {
+						if p.identidad == e.Piso && ahora()-p.ultimoHabl < 6_000 {
+							vivo = true
+							break
+						}
+					}
+					if !vivo {
+						e.Piso, e.PisoNombre, e.PisoDesde = "", "", 0
+						cambio = true
+					}
 				}
 				sv.mu.Unlock()
 			}

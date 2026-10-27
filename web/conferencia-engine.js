@@ -1,5 +1,5 @@
 /* ============================================================================
- * Motor Mumble + WebSocket HTTPS/443 para Conferencias en Conexiones Lentas
+ * Motor de voz propio (WebSocket HTTPS/443) para Conferencias en Conexiones Lentas
  * Sustituye el SDK WebRTC de LiveKit por un único túnel WebSocket (puerto 443)
  * con voz ultraligera (µ-law + VAD) y video 240p exclusivo para Asiento 1 y
  * La Palabra, sin requerir UDP, STUN ni TURN.
@@ -342,11 +342,86 @@
     return out;
   }
 
+  // Remuestreo con fase continua entre bloques (estado externo en st)
+  function remuestrearA(st, samples, inRate, outRate) {
+    if (!samples || !samples.length) return new Float32Array(0);
+    if (inRate === outRate) {
+      st.last = samples[samples.length - 1];
+      st.has = true;
+      st.phase = 0;
+      return samples;
+    }
+    const nIn = samples.length;
+    const step = inRate / outRate;
+    if (!st.has) {
+      st.last = samples[0];
+      st.has = true;
+      st.phase = 0;
+    }
+    const tmp = new Float32Array(Math.ceil((nIn - st.phase) / step) + 2);
+    let o = 0;
+    while (st.phase < nIn) {
+      const idx = st.phase | 0;
+      const frac = st.phase - idx;
+      const s0 = idx === 0 ? st.last : samples[idx - 1];
+      const s1 = samples[idx];
+      tmp[o++] = s0 + frac * (s1 - s0);
+      st.phase += step;
+    }
+    st.phase -= nIn;
+    st.last = samples[nIn - 1];
+    return tmp.subarray(0, o);
+  }
+
+  // Parsea un archivo .seg del servidor (cabecera CSEG + tramas crudas).
+  // Espejo del formato de segmentos.go: magic+ver, u32 seq, u8 grupo, u8 flags,
+  // str de, str nombre, i64 inicioMs, u32 durMs, u32 numFrames,
+  // registros [u16 len][payload]. Devuelve {sg, frames} o null.
+  function parsearArchivoSeg(b) {
+    if (!b || b.length < 21 || b[0] !== 0x43 || b[1] !== 0x53 ||
+        b[2] !== 0x45 || b[3] !== 0x47 || b[4] !== 1) return null;
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const sg = {
+      seq: dv.getUint32(5),
+      grupo: b[9],
+      cortado: !!(b[10] & 1),
+      abierto: !!(b[10] & 2),
+    };
+    let i = 11;
+    const dec = new TextDecoder();
+    const leerStr = () => {
+      if (i + 2 > b.length) return null;
+      const n = dv.getUint16(i);
+      i += 2;
+      if (i + n > b.length) return null;
+      const s = dec.decode(b.subarray(i, i + n));
+      i += n;
+      return s;
+    };
+    sg.de = leerStr();
+    sg.nombre = leerStr();
+    if (sg.de === null || sg.nombre === null || i + 16 > b.length) return null;
+    sg.inicio = Number(dv.getBigUint64(i));
+    sg.durMs = dv.getUint32(i + 8);
+    const nf = dv.getUint32(i + 12);
+    i += 16;
+    const frames = [];
+    for (let k = 0; k < nf; k++) {
+      if (i + 2 > b.length) break;
+      const n = dv.getUint16(i);
+      i += 2;
+      if (i + n > b.length) break;
+      frames.push(b.slice(i, i + n));
+      i += n;
+    }
+    return { sg, frames };
+  }
+
   // AudioWorklet en hilo de tiempo real (128 muestras = 2.66 ms) para que la
   // reproducción de voz jamás sufra micro-cortes cuando el hilo principal de JS
   // renderiza la interfaz o procesa eventos.
   const WORKLET_RX_CODE = `
-class MumbleRxProcessor extends AudioWorkletProcessor {
+class VozRxProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     const rate = sampleRate || 48000;
@@ -364,6 +439,7 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
     this.fadeInPos = 0;
     this.fadeInLen = Math.ceil(rate * 0.005);
     this.readRate = 1.0;
+    this.velMax = 1.12;
     this.targetSamples = Math.ceil(rate * 0.06); // 60 ms: tiempo real instantáneo
     this.port.onmessage = (ev) => {
       const d = ev.data;
@@ -372,8 +448,29 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
         this.eosPending = true;
         return;
       }
+      if (d.t === 'limpiar') {
+        // "Ir al presente": vaciar todo el audio pendiente sin cortar el nodo
+        this.available = 0;
+        this.readPosF = this.writePos;
+        this.playing = false;
+        this.eosPending = false;
+        this.waitSamples = 0;
+        this.readRate = 1.0;
+        return;
+      }
+      if (d.t === 'vel' && typeof d.v === 'number') {
+        // Drenaje acelerado cuando hay historial atrasado (hasta ~1.35x)
+        this.velMax = Math.max(1.05, Math.min(1.4, d.v));
+        return;
+      }
       if (d.t === 'target' && typeof d.ms === 'number') {
         this.targetSamples = Math.ceil(this.rate * (Math.max(55, Math.min(180, d.ms)) / 1000));
+        return;
+      }
+      if (d.t === 'cap' && typeof d.ms === 'number') {
+        // Tope de cola configurable: música en vivo 260 ms; la tubería de
+        // notas de voz necesita ~1,4 s para no recortar frases al drenar
+        this.capMs = Math.max(0.1, Math.min(1.45, d.ms / 1000));
         return;
       }
       if (d.t === 'push' && d.pcm) {
@@ -381,9 +478,9 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
         const n = src.length;
         if (n === 0) return;
         this.eosPending = false;
-        // Tope estricto de tiempo real (260 ms): si llega una ráfaga atrasada tras
-        // un bache WiFi, saltar a los últimos 80 ms en vivo para que JAMÁS haya 3-5s de retraso.
-        const hardCap = this.rate * 0.26;
+        // Tope de la cola (capMs): por defecto 260 ms en vivo; la tubería de
+        // segmentos lo sube para guardar historial en espera de sonar
+        const hardCap = this.rate * (this.capMs || 0.26);
         if (this.available + n > hardCap) {
           const keep = Math.ceil(this.rate * 0.08);
           const drop = Math.max(0, (this.available + n) - keep);
@@ -431,11 +528,11 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Drenar cualquier micro-retraso rápidamente (+12%) para mantener tiempo real
+    // Drenar micro-retrasos deprisa (+12% normal, hasta +35% con historial atrasado)
     const over = this.available - this.targetSamples;
     let desired = 1.0;
     if (over > this.rate * 0.05) {
-      desired = Math.min(1.12, 1.0 + (over / this.rate) * 0.35);
+      desired = Math.min(this.velMax, 1.0 + (over / this.rate) * 0.35);
     } else if (!this.eosPending && this.available < this.targetSamples * 0.4) {
       desired = 0.96;
     }
@@ -477,9 +574,9 @@ class MumbleRxProcessor extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor('mumble-rx-worklet', MumbleRxProcessor);
+registerProcessor('conferencia-rx-worklet', VozRxProcessor);
 
-class MumbleTxProcessor extends AudioWorkletProcessor {
+class VozTxProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buf = new Float32Array(2048);
@@ -500,7 +597,7 @@ class MumbleTxProcessor extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
+registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 `;
   let workletBlobUrl = null;
   const ctxWorkletPromesas = new WeakMap();
@@ -516,10 +613,10 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           workletBlobUrl = URL.createObjectURL(blob);
         }
         await ctx.audioWorklet.addModule(workletBlobUrl);
-        ctx._mumbleWorkletReady = true;
+        ctx._workletListo = true;
         return true;
       } catch {
-        ctx._mumbleWorkletReady = false;
+        ctx._workletListo = false;
         return false;
       }
     })();
@@ -685,7 +782,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           this._room.emit(muted ? RoomEvent.TrackMuted : RoomEvent.TrackUnmuted, pub, this);
         };
         this.pubs.set(source, pub);
-        this._iniciarEnvioVozMumble(mediaStreamTrack, pub, opts);
+        this._iniciarEnvioVoz(mediaStreamTrack, pub, opts);
         this._room._enviarEstadoMedia();
         this._room.emit(RoomEvent.LocalTrackPublished, pub, this);
         return pub;
@@ -737,7 +834,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
       return false;
     }
 
-    _iniciarEnvioVozMumble(mediaStreamTrack, pub, opts) {
+    _iniciarEnvioVoz(mediaStreamTrack, pub, opts) {
       let maxBr = (opts && opts.audioPreset && opts.audioPreset.maxBitrate) || 18000;
       let pendingBr = null;
       let actx = null;
@@ -767,7 +864,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           if (!opusEncoder || opusEncoder.state === 'closed') {
             opusEncoder = new window.AudioEncoder({
               output: (chunk) => {
-                if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
+                if (!this._room) return;
                 const n = chunk.byteLength;
                 if (n <= 0) return;
                 const bytes = new Uint8Array(n);
@@ -793,7 +890,9 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
                   pkt[off2] = b2.length & 0xff;
                   pkt[off2 + 1] = (b2.length >> 8) & 0xff;
                   pkt.set(b2, off2 + 2);
-                  try { this._room._ws.send(pkt); } catch {}
+                  // Encolado confiable: nunca se pierde la voz del emisor
+                  // ante micro-cortes — sale en ráfaga al volver el socket
+                  this._room._enviarFrame(pkt);
                 }
               },
               error: () => {
@@ -845,22 +944,21 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
       // en caso de que el último paquete de voz se haya perdido en un WiFi débil.
       const enviarMarcadorEOS = () => {
         const sendOne = () => {
-          if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
+          if (!this._room) return;
           const s = (txSeq = (txSeq + 1) & 0xffff);
           const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
-          try { this._room._ws.send(eos); } catch {}
+          this._room._enviarFrame(eos);
         };
         sendOne();
         setTimeout(sendOne, 25);
         setTimeout(sendOne, 50);
       };
 
-      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz) en tiempo real.
-      // Tope estricto de 6 KB en bufferedAmount: jamás acumular segundos de audio
-      // viejo en el socket TCP del emisor cuando su WiFi tiene un micro-corte.
+      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz). Si el socket está
+      // caído o saturado se encola en vez de descartarse: la frase llega
+      // completa al servidor aunque el oyente la oiga con retraso.
       const enviarTrama40ms = (frame48k) => {
-        if (!this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) return;
-        if (this._room._ws.bufferedAmount > 6 * 1024) return;
+        if (!this._room) return;
         txSeq = (txSeq + 1) & 0xffff;
 
         let enviadoOpus = false;
@@ -905,7 +1003,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
             sub[i] = acc / decim;
           }
           const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode, txSeq);
-          try { this._room._ws.send(pkt); } catch {}
+          this._room._enviarFrame(pkt);
         }
       };
 
@@ -948,7 +1046,9 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         let noiseFloor = 0.0018;
 
         const procesarBloqueEntrada = (rawIn) => {
-          if (pub.isMuted || !this._room || !this._room._ws || this._room._ws.readyState !== WebSocket.OPEN) {
+          // Muteado o sin room: cierra la frase. Sin socket NO se cierra: las
+          // tramas se encolan y el servidor las archiva cuando la red vuelva.
+          if (pub.isMuted || !this._room) {
             if (hablandoActivo) {
               hablandoActivo = false;
               silencioCola = 0;
@@ -1038,7 +1138,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           if (micCerrado) return;
           if (ok && typeof window.AudioWorkletNode === 'function') {
             try {
-              txWorklet = new window.AudioWorkletNode(actx, 'mumble-tx-worklet', {
+              txWorklet = new window.AudioWorkletNode(actx, 'conferencia-tx-worklet', {
                 numberOfInputs: 1,
                 numberOfOutputs: 1,
                 outputChannelCount: [1],
@@ -1080,7 +1180,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           this._room._marcarHablandoLocal(false);
         };
       } catch (e) {
-        console.warn('Error iniciando codificador de voz Mumble:', e);
+        console.warn('Error iniciando codificador de voz:', e);
       }
     }
 
@@ -1359,6 +1459,35 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
       this._jitterMs = 15;
       this._calidadActual = ConnectionQuality.Good;
       this._buenasSeguidas = 0;
+      // Cola TX confiable: con un micro-corte la voz del emisor se encola y
+      // sale en ráfaga cuando el socket vuelve — nunca se descarta
+      this._txCola = [];
+      this._txBytes = 0;
+      this._txFlushT = null;
+      // Piso exclusivo (PTT): el servidor garantiza un solo hablante
+      this._quieroPiso = false;
+      this._tengoPiso = false;
+      this._pisoHoldT = null;
+      // Cola ordenada de segmentos de voz ("notas de voz en vivo"): las
+      // frases se reproducen en orden; las que faltan se descargan por HTTP
+      this._vozSegs = new Map();        // seq -> segmento
+      this._vozOrden = [];              // segmentos ordenados por seq
+      this._segPorHablante = new Map(); // identidad -> seq del segmento abierto
+      this._ultimoSeg = 0;
+      this._vozBase = false;            // la 1ª bienvenida fija la base
+      this._vozPipe = null;             // reproductor único ordenado
+      this._vozBufMs = 0;               // ms de PCM ya empujados al reproductor
+      this._vozRate = 48000;
+      this._feedT = null;
+      this._feedUltimo = 0;
+      this._fetchSegs = new Set();      // seqs con descarga en curso
+      this._replayQ = [];               // notas re-escuchadas (prioridad)
+      this._volPorId = new Map();       // identidad -> volumen directo
+      this._retrasoAviso = 0;
+      this._drenando = false;
+      this._pseudoN = 0;
+      this._vozHeadSeq = null;
+      this._autoPresente = false;
     }
 
     _asegurarRxAudioCtx() {
@@ -1370,8 +1499,8 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           if (window.S) window.S.salidaCtx = this._rxAudioCtx;
         }
         asegurarWorkletEnCtx(this._rxAudioCtx);
-        if (!window._mumbleAudioUnlockBound) {
-          window._mumbleAudioUnlockBound = true;
+        if (!window._audioDesbloqueado) {
+          window._audioDesbloqueado = true;
           const unlock = () => {
             if (window.S && window.S.salidaCtx && window.S.salidaCtx.state === 'suspended') {
               window.S.salidaCtx.resume().catch(() => {});
@@ -1419,6 +1548,665 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
       if (clave === this._ultSpeakersClave) return;
       this._ultSpeakersClave = clave;
       this.emit(RoomEvent.ActiveSpeakersChanged, activos);
+    }
+
+    // ---------- envío confiable (voz del emisor) ----------
+    // La voz nunca se descarta en el emisor: si el socket está caído o la
+    // cola TCP creció, la trama espera en _txCola y sale en ráfaga al
+    // reconectar. El servidor la archiva en el segmento igualmente.
+    _enviarJson(obj) {
+      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+      try { this._ws.send(JSON.stringify(obj)); } catch {}
+    }
+
+    _enviarFrame(pkt) {
+      if (this._ws && this._ws.readyState === WebSocket.OPEN && this._ws.bufferedAmount < 12 * 1024) {
+        try { this._ws.send(pkt); return; } catch {}
+      }
+      // ~1.5 MB ≈ 2-3 min de voz a 10 kbps: por encima la red lleva muerta
+      // demasiado y encolar más solo infla la memoria del teléfono
+      if (this._txBytes + pkt.length <= 1572864) {
+        this._txCola.push(pkt);
+        this._txBytes += pkt.length;
+        this._programarFlushTx();
+      }
+    }
+
+    _programarFlushTx() {
+      if (this._txFlushT) return;
+      this._txFlushT = setTimeout(() => { this._txFlushT = null; this._drenarTx(); }, 300);
+    }
+
+    _drenarTx() {
+      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+      // Drenar por debajo de 12 KB en bufferedAmount para no disparar el
+      // watchdog de socket congelado (que reemplaza el socket a los 14 KB)
+      while (this._txCola.length && this._ws.bufferedAmount < 12 * 1024) {
+        const p = this._txCola.shift();
+        this._txBytes -= p.length;
+        try { this._ws.send(p); } catch {
+          this._txCola.unshift(p);
+          this._txBytes += p.length;
+          break;
+        }
+      }
+      if (this._txCola.length) this._programarFlushTx();
+    }
+
+    // ---------- piso exclusivo (PTT) ----------
+    tomarPiso() {
+      this._quieroPiso = true;
+      this._enviarJson({ t: 'piso_tomar' });
+      this._latidoPiso();
+    }
+
+    soltarPiso() {
+      this._quieroPiso = false;
+      this._tengoPiso = false;
+      if (this._pisoHoldT) { clearInterval(this._pisoHoldT); this._pisoHoldT = null; }
+      this._enviarJson({ t: 'piso_soltar' });
+    }
+
+    // Latido mientras se tiene el piso: el watchdog del servidor lo suelta a
+    // los 6 s sin tramas ni latidos (corte de WiFi o pestaña muerta)
+    _latidoPiso() {
+      if (this._pisoHoldT) return;
+      this._pisoHoldT = setInterval(() => {
+        if (!this._quieroPiso) {
+          clearInterval(this._pisoHoldT);
+          this._pisoHoldT = null;
+          return;
+        }
+        this._enviarJson({ t: 'piso_hold' });
+      }, 2500);
+    }
+
+    // ---------- segmentos de voz ordenados ----------
+    _segMeta(seg) {
+      return seg ? {
+        seq: seg.seq, de: seg.de, nombre: seg.nombre, durMs: seg.durMs,
+        inicio: seg.inicio, interrumpida: seg.interrumpida,
+      } : null;
+    }
+
+    _vozSegNuevo(seq, de, nombre, abierto, meta) {
+      let seg = this._vozSegs.get(seq);
+      if (!seg) {
+        seg = {
+          seq, de: de || '', nombre: nombre || de || '',
+          abierto: !!abierto, completo: !abierto, finLocal: !abierto,
+          pseudo: false,
+          durMs: (meta && meta.durMs) || 0,
+          interrumpida: !!(meta && (meta.interrumpida || meta.cortado)),
+          inicio: (meta && meta.inicio) || Date.now(),
+          bloques: [], vistos: new Set(), ultTx: -1, huecos: false,
+          alimentado: 0, bajando: false, descargado: false, perdido: false,
+          saltado: false, reproducido: false, finAvisado: false, bajaDesde: 0,
+          _repT: null, raw: [], rawBytes: 0,
+        };
+        this._vozSegs.set(seq, seg);
+        let i = this._vozOrden.length;
+        while (i > 0 && (this._vozOrden[i - 1].pseudo ? Infinity : this._vozOrden[i - 1].seq) > seq) i--;
+        this._vozOrden.splice(i, 0, seg);
+      } else {
+        if (de && !seg.de) seg.de = de;
+        if (nombre) seg.nombre = nombre;
+        if (!abierto) seg.completo = true;
+        if (meta && meta.durMs) seg.durMs = meta.durMs;
+        if (meta && (meta.interrumpida || meta.cortado)) seg.interrumpida = true;
+        if (meta && meta.inicio) seg.inicio = meta.inicio;
+      }
+      if (abierto && de) this._segPorHablante.set(de, seq);
+      if (typeof seq === 'number' && seq > 0) this._ultimoSeg = Math.max(this._ultimoSeg, seq);
+      return seg;
+    }
+
+    // Segmento implícito: llegaron tramas antes que el seg_ini (reorden del
+    // canal de control). Se re-etiqueta con su seq real cuando llega seg_ini.
+    _segImplicito(fromId) {
+      const cur = this._segPorHablante.get(fromId);
+      if (cur != null) {
+        const seg = this._vozSegs.get(cur);
+        if (seg) return seg;
+      }
+      const seq = -(++this._pseudoN);
+      const p = this.remoteParticipants.get(fromId);
+      const seg = {
+        seq, pseudo: true, de: fromId,
+        nombre: (p && (p.name || p.identity)) || fromId,
+        abierto: true, completo: false, finLocal: false,
+        durMs: 0, interrumpida: false, inicio: Date.now(),
+        bloques: [], vistos: new Set(), ultTx: -1, huecos: false,
+        alimentado: 0, bajando: false, descargado: false, perdido: false,
+        saltado: false, reproducido: false, finAvisado: false, bajaDesde: 0,
+        _repT: null, raw: [], rawBytes: 0,
+      };
+      this._vozSegs.set(seq, seg);
+      this._segPorHablante.set(fromId, seq);
+      this._vozOrden.push(seg); // los pseudo van al final
+      return seg;
+    }
+
+    // Inserta un bloque decodificado en el segmento, ordenado por txSeq
+    // (los huecos reparados se insertan en su posición correcta)
+    _insertarBloque(seg, bl) {
+      if (typeof bl.tx !== 'number' || bl.tx < 0) {
+        seg.bloques.push(bl);
+        return;
+      }
+      let i = seg.bloques.length;
+      while (i > 0 && ((seg.bloques[i - 1].tx - bl.tx) & 0xffff) < 30000) i--;
+      seg.bloques.splice(i, 0, bl);
+      if (i < seg.alimentado) seg.alimentado = i; // reposición de un hueco
+      if (seg.reproducido && i < seg.bloques.length) seg.reproducido = false;
+    }
+
+    _programarReparacion(seg) {
+      if (seg._repT || seg.bajando || seg.descargado) return;
+      seg._repT = setTimeout(() => {
+        seg._repT = null;
+        if (seg.seq > 0) this._bajarSeg(seg.seq);
+      }, 500);
+    }
+
+    // Trama de voz en vivo ya decodificada y remuestreada: entra a la cola
+    // ordenada del segmento del hablante (no directo al altavoz)
+    _alimentarSegVoz(fromId, pcm, txSeq, crudo) {
+      if (!pcm || !pcm.length) return;
+      let seg = null;
+      const seq = this._segPorHablante.get(fromId);
+      if (seq != null) seg = this._vozSegs.get(seq) || null;
+      if (!seg) seg = this._segImplicito(fromId);
+
+      if (typeof txSeq === 'number' && txSeq >= 0) {
+        if (seg.vistos.has(txSeq)) return;
+        seg.vistos.add(txSeq);
+        if (seg.ultTx >= 0) {
+          const diff = (txSeq - seg.ultTx) & 0xffff;
+          if (diff > 1 && diff < 30000) {
+            seg.huecos = true;
+            this._programarReparacion(seg);
+          }
+        }
+        if (seg.ultTx < 0 || ((txSeq - seg.ultTx) & 0xffff) < 30000) seg.ultTx = txSeq;
+      }
+      this._insertarBloque(seg, { tx: txSeq, pcm });
+      if (crudo && seg.rawBytes < 4194304) {
+        seg.raw.push(crudo.slice());
+        seg.rawBytes += crudo.length;
+      }
+      // nivel RMS para el marcador de "hablando"
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i += 8) sum += pcm[i] * pcm[i];
+      if (Math.sqrt(sum / Math.max(1, Math.ceil(pcm.length / 8))) > 0.006) {
+        this._speakers.set(fromId, Date.now() + 650);
+        this._actualizarSpeakers();
+      }
+      this._programarFeedOn();
+    }
+
+    // ---------- reproductor único ordenado ----------
+    _asegurarVozPipe() {
+      if (this._vozPipe) return this._vozPipe;
+      const ctx = this._asegurarRxAudioCtx();
+      const ctxRate = ctx.sampleRate || 48000;
+      this._vozRate = ctxRate;
+      const cap = Math.ceil(ctxRate * 8);
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 1.0;
+      gainNode.connect(ctx.destination);
+      const pipe = {
+        ctx, ctxRate, gainNode, worklet: null, proc: null,
+        ring: new Float32Array(cap), cap,
+        writePos: 0, readPosF: 0, available: 0, playing: false,
+        eosPending: true, waitSamples: 0, underrunSamples: 0,
+        lastOut: 0, fadeInPos: 0, fadeInLen: Math.ceil(ctxRate * 0.005),
+        readRate: 1.0, velMax: 1.12, eosSent: true,
+        targetSamples: Math.ceil(ctxRate * 0.06),
+      };
+      this._vozPipe = pipe;
+
+      const conectarWorklet = () => {
+        if (pipe.worklet || !ctx._workletListo || typeof window.AudioWorkletNode !== 'function') return false;
+        try {
+          const wn = new window.AudioWorkletNode(ctx, 'conferencia-rx-worklet', {
+            numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1],
+          });
+          wn.connect(gainNode);
+          pipe.worklet = wn;
+          // esta tubería lleva notas de voz e historial: cola amplia (1,4 s)
+          // para que el drenaje acelerado no recorte frases
+          try { wn.port.postMessage({ t: 'cap', ms: 1400 }); } catch {}
+          if (pipe.proc) { try { pipe.proc.disconnect(); } catch {} pipe.proc = null; }
+          return true;
+        } catch { return false; }
+      };
+
+      if (!conectarWorklet()) {
+        const proc = ctx.createScriptProcessor(2048, 1, 1);
+        proc.onaudioprocess = (ev) => {
+          const out = ev.outputBuffer.getChannelData(0);
+          const n = out.length;
+          if (!pipe.playing) {
+            if (pipe.available > 0) {
+              pipe.waitSamples += n;
+              if (pipe.available >= pipe.targetSamples || pipe.eosPending ||
+                  pipe.waitSamples >= pipe.ctxRate * 0.08) {
+                pipe.playing = true; pipe.waitSamples = 0;
+                pipe.underrunSamples = 0; pipe.fadeInPos = 0;
+              }
+            } else {
+              pipe.waitSamples = 0;
+            }
+            if (!pipe.playing) { for (let i = 0; i < n; i++) out[i] = 0; return; }
+          }
+          const over = pipe.available - pipe.targetSamples;
+          let desired = 1.0;
+          if (over > pipe.ctxRate * 0.05) {
+            desired = Math.min(pipe.velMax, 1.0 + (over / pipe.ctxRate) * 0.35);
+          } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.4) {
+            desired = 0.96;
+          }
+          pipe.readRate += (desired - pipe.readRate) * 0.15;
+          for (let i = 0; i < n; i++) {
+            if (pipe.available > 1.05) {
+              const idx0 = pipe.readPosF | 0;
+              const frac = pipe.readPosF - idx0;
+              const idx1 = (idx0 + 1) % pipe.cap;
+              let s = pipe.ring[idx0] + frac * (pipe.ring[idx1] - pipe.ring[idx0]);
+              pipe.readPosF = (pipe.readPosF + pipe.readRate) % pipe.cap;
+              pipe.available -= pipe.readRate;
+              if (pipe.fadeInPos < pipe.fadeInLen) { s *= pipe.fadeInPos / pipe.fadeInLen; pipe.fadeInPos++; }
+              out[i] = s; pipe.lastOut = s; pipe.underrunSamples = 0;
+            } else {
+              pipe.lastOut *= 0.982;
+              if (Math.abs(pipe.lastOut) < 0.0001) pipe.lastOut = 0;
+              out[i] = pipe.lastOut;
+              pipe.underrunSamples++;
+              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.045) {
+                pipe.playing = false; pipe.eosPending = false;
+                pipe.waitSamples = 0; pipe.available = 0;
+                pipe.readPosF = pipe.writePos;
+                for (let k = i + 1; k < n; k++) out[k] = 0;
+                return;
+              }
+            }
+          }
+        };
+        proc.connect(gainNode);
+        pipe.proc = proc;
+        asegurarWorkletEnCtx(ctx).then((ok) => {
+          if (ok && this._vozPipe === pipe) conectarWorklet();
+        });
+      }
+      return pipe;
+    }
+
+    _vozEmpujar(pcm) {
+      const pipe = this._vozPipe;
+      if (!pipe) return;
+      this._vozBufMs += (pcm.length / pipe.ctxRate) * 1000;
+      if (pipe.worklet) {
+        try {
+          // sin transferencia: el bloque sigue vivo en el segmento para
+          // poder re-escucharlo o subirlo al historial local
+          pipe.worklet.port.postMessage({ t: 'push', pcm });
+          return;
+        } catch {}
+      }
+      // fallback: ring buffer del ScriptProcessor — la tubería de notas de
+      // voz conserva hasta 1,4 s de cola (historial) antes de recortar
+      if (pipe.available + pcm.length > pipe.cap) {
+        const drop = (pipe.available + pcm.length) - Math.ceil(pipe.ctxRate * 1.4);
+        if (drop > 0) {
+          pipe.readPosF = (pipe.readPosF + drop) % pipe.cap;
+          pipe.available = Math.max(0, pipe.available - drop);
+          pipe.fadeInPos = 0;
+        }
+      }
+      const ring = pipe.ring, cap = pipe.cap;
+      for (let i = 0; i < pcm.length && pipe.available < cap; i++) {
+        ring[pipe.writePos] = pcm[i];
+        pipe.writePos = (pipe.writePos + 1) % cap;
+        pipe.available++;
+      }
+    }
+
+    // Corazón de la reproducción ordenada: corre cada 60 ms. Alimenta el
+    // reproductor único primero con notas re-escuchadas, luego con el
+    // segmento más antiguo pendiente (las descargas bloquean en orden).
+    _feedVoz() {
+      const ahoraMs = performance.now();
+      const dt = Math.min(250, ahoraMs - (this._feedUltimo || ahoraMs));
+      this._feedUltimo = ahoraMs;
+      const pipe = this._asegurarVozPipe();
+      this._vozBufMs = Math.max(0, this._vozBufMs - dt * (this._drenando ? 1.3 : 1.05));
+
+      // 1. Notas re-escuchadas tienen prioridad
+      while (this._replayQ.length && this._vozBufMs < 550) {
+        const rp = this._replayQ[0];
+        while (rp.alimentado < rp.bloques.length && this._vozBufMs < 550) {
+          this._vozEmpujar(rp.bloques[rp.alimentado++].pcm);
+        }
+        if (rp.alimentado >= rp.bloques.length) {
+          this._replayQ.shift();
+          this.emit('seg_replay_fin', rp.seq);
+        } else break;
+      }
+
+      // 2. Cabeza de la cola ordenada por seq
+      let seg = null;
+      for (const s of this._vozOrden) {
+        if (s.saltado || s.reproducido) continue;
+        seg = s;
+        break;
+      }
+      if (seg) {
+        if (seg.bajando) {
+          // esperar la descarga; si se atascó >8 s se declara perdida
+          if (ahoraMs - seg.bajaDesde > 8000) {
+            seg.bajando = false;
+            seg.perdido = true;
+            seg.saltado = true;
+            this.emit('seg_perdido', seg.seq);
+          }
+        } else {
+          if (this._vozHeadSeq !== seg.seq) {
+            this._vozHeadSeq = seg.seq;
+            const vf = typeof window.volEfectivo === 'function'
+              ? window.volEfectivo(seg.de)
+              : (this._volPorId.get(seg.de) || 1);
+            try { pipe.gainNode.gain.value = Math.max(0, Math.min(3, vf)); } catch {}
+            this.emit('seg_reproduciendo', this._segMeta(seg));
+          }
+          while (seg.alimentado < seg.bloques.length && this._vozBufMs < 550) {
+            this._vozEmpujar(seg.bloques[seg.alimentado++].pcm);
+          }
+          if (seg.alimentado >= seg.bloques.length &&
+              (seg.completo || seg.finLocal) && !seg.finAvisado) {
+            seg.finAvisado = true;
+            seg.reproducido = true;
+            this.emit('seg_reproducido', this._segMeta(seg));
+          }
+        }
+      }
+
+      // 3. Velocidad de drenaje + estimación del retraso respecto al presente
+      const retraso = this._retrasoMs();
+      const vel = retraso > 4000 ? 1.33 : 1.12;
+      if (vel !== pipe.velMax) {
+        pipe.velMax = vel;
+        if (pipe.worklet) {
+          try { pipe.worklet.port.postMessage({ t: 'vel', v: vel }); } catch {}
+        }
+      }
+      this._drenando = vel > 1.2;
+      if (retraso !== this._retrasoAviso) {
+        this._retrasoAviso = retraso;
+        this.emit('voz_retraso', Math.round(retraso));
+      }
+
+      // 4. Cola vacía: marcar EOS para que el reproductor termine limpio
+      const vacio = !seg && !this._replayQ.length;
+      if (vacio && !pipe.eosSent) {
+        pipe.eosSent = true;
+        if (pipe.worklet) {
+          try { pipe.worklet.port.postMessage({ t: 'eos' }); } catch {}
+        } else {
+          pipe.eosPending = true;
+        }
+      } else if (!vacio) {
+        pipe.eosSent = false;
+      }
+
+      // 5. Liberar memoria de segmentos ya escuchados hace >10 min
+      const viejo = Date.now() - 600000;
+      for (const s of this._vozOrden) {
+        if ((s.reproducido || s.saltado) && s.inicio < viejo && s.bloques.length) {
+          s.bloques = [];
+          s.vistos.clear();
+        }
+      }
+    }
+
+    _programarFeedOn() {
+      if (this._feedT) return;
+      this._feedUltimo = performance.now();
+      this._feedT = setInterval(() => this._feedVoz(), 60);
+    }
+
+    _retrasoMs() {
+      let ms = this._vozBufMs;
+      for (const s of this._vozOrden) {
+        if (s.saltado || s.reproducido) continue;
+        for (let i = s.alimentado; i < s.bloques.length; i++) {
+          ms += (s.bloques[i].pcm.length / this._vozRate) * 1000;
+        }
+      }
+      return ms;
+    }
+
+    // Salta todo el historial pendiente y sigue en la frase que está en vivo
+    saltarAlPresente() {
+      for (const s of this._vozOrden) {
+        if (s.reproducido || s.saltado) continue;
+        if (!s.completo && !s.finLocal) {
+          s.alimentado = s.bloques.length; // seguir la frase actual desde su borde
+        } else {
+          s.saltado = true;
+        }
+      }
+      this._replayQ.length = 0;
+      this._vozBufMs = 0;
+      const pipe = this._vozPipe;
+      if (pipe) {
+        if (pipe.worklet) {
+          try { pipe.worklet.port.postMessage({ t: 'limpiar' }); } catch {}
+        } else {
+          pipe.writePos = 0; pipe.readPosF = 0; pipe.available = 0;
+          pipe.playing = false; pipe.eosPending = false; pipe.waitSamples = 0;
+        }
+      }
+      this._retrasoAviso = 0;
+      this.emit('voz_retraso', 0);
+    }
+
+    retrasoMs() { return this._retrasoMs(); }
+
+    setAutoPresente(v) { this._autoPresente = !!v; }
+
+    // ---------- descarga de segmentos por HTTP (relleno de huecos) ----------
+    async _bajarSeg(seq) {
+      if (seq <= 0 || this._fetchSegs.has(seq) || !window.S || !window.S.sala) return;
+      this._fetchSegs.add(seq);
+      const seg = this._vozSegs.get(seq);
+      if (seg) { seg.bajando = true; seg.bajaDesde = performance.now(); }
+      try {
+        const r = await fetch(
+          `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seq}`,
+          { headers: { Authorization: 'Bearer ' + (window.S.token || '') } });
+        if (!r.ok) {
+          if (seg) { seg.bajando = false; seg.perdido = true; }
+          return;
+        }
+        const buf = new Uint8Array(await r.arrayBuffer());
+        const parsed = parsearArchivoSeg(buf);
+        if (!parsed) {
+          if (seg) seg.bajando = false;
+          return;
+        }
+        const sg = seg || this._vozSegNuevo(
+          parsed.sg.seq, parsed.sg.de, parsed.sg.nombre, parsed.sg.abierto, parsed.sg);
+        if (parsed.sg.de && parsed.sg.abierto) this._segPorHablante.set(parsed.sg.de, sg.seq);
+        const nuevos = await this._decodificarFramesSeg(parsed.frames, sg);
+        for (const b of nuevos) this._insertarBloque(sg, b);
+        sg.bajando = false;
+        sg.descargado = true;
+        if (!parsed.sg.abierto) sg.completo = true;
+        if (parsed.sg.durMs) sg.durMs = parsed.sg.durMs;
+        if (parsed.sg.cortado) sg.interrumpida = true;
+        if (parsed.sg.inicio) sg.inicio = parsed.sg.inicio;
+      } catch {
+        if (seg) seg.bajando = false;
+      } finally {
+        this._fetchSegs.delete(seq);
+      }
+    }
+
+    // Tras una reconexión: pide al servidor el manifiesto de segmentos que
+    // se perdieron durante el corte y los descarga en orden
+    async _rellenarHuecos(hasta) {
+      const sala = (window.S && window.S.sala) || '';
+      if (!sala) return;
+      const g = (window.S && window.S.grupoActual) || 0;
+      try {
+        const r = await fetch(
+          `/api/salas/${encodeURIComponent(sala)}/audio?desde=${this._ultimoSeg + 1}&g=${g}`,
+          { headers: { Authorization: 'Bearer ' + ((window.S && window.S.token) || '') } });
+        if (!r.ok) return;
+        const man = await r.json();
+        for (const meta of man.segmentos || []) {
+          const seg = this._vozSegs.get(meta.seq);
+          if (seg && (seg.descargado || seg.reproducido)) continue;
+          this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
+          // mis propias frases no se descargan: no se escuchan a uno mismo
+          if (meta.de !== this.localParticipant.identity) this._bajarSeg(meta.seq);
+        }
+        if (man.abierto && !this._vozSegs.get(man.abierto.seq)) {
+          this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
+          this._bajarSeg(man.abierto.seq);
+        }
+        this._ultimoSeg = Math.max(this._ultimoSeg, man.ultimo || 0, hasta);
+      } catch {}
+    }
+
+    // Decodifica las tramas crudas de un segmento (Opus, ADPCM o µ-law) a
+    // bloques PCM a la tasa del AudioContext — para backfill y re-escucha
+    async _decodificarFramesSeg(frames, seg) {
+      const ctx = this._asegurarRxAudioCtx();
+      const ctxRate = ctx.sampleRate || 48000;
+      const rsPorRate = new Map(); // inRate -> estado de remuestreo
+      const rsDe = (sr) => {
+        let st = rsPorRate.get(sr);
+        if (!st) { st = { has: false, last: 0, phase: 0 }; rsPorRate.set(sr, st); }
+        return st;
+      };
+      const out = [];
+      const ops = [];
+      for (const fr of frames) {
+        const rc = fr[0];
+        if (rc === 0 || fr.length < 2) continue;
+        const tx = fr[1] | (fr[2] << 8);
+        if (seg && seg.vistos.has(tx)) continue;
+        if (rc >= 10 && rc <= 19) {
+          ops.push({ tx, fr, nSub: (fr.length > 8 && fr[3] === 0xA5) ? 2 : 1 });
+        } else if (rc >= 20 && rc <= 39) {
+          const base = rc >= 30 ? rc - 10 : rc;
+          const esV2 = fr.length >= 7 && fr[6] === 0x5A;
+          const sr = esV2
+            ? (base === 21 ? 8000 : (base === 22 ? 12000 : 16000))
+            : (base === 21 ? 6000 : (base === 22 ? 8000 : (base === 23 ? 12000 : 16000)));
+          const { pcm } = decodificarBloqueADPCM(fr);
+          if (pcm.length) out.push({ tx, pcm: remuestrearA(rsDe(sr), pcm, sr, ctxRate) });
+        } else if (rc === 1 || rc === 2) {
+          const sr = rc === 1 ? 8000 : 12000;
+          const pcm = new Float32Array(fr.length - 1);
+          for (let i = 1; i < fr.length; i++) pcm[i - 1] = ulawDecodeTable[fr[i]];
+          out.push({ tx, pcm: remuestrearA(rsDe(sr), pcm, sr, ctxRate) });
+        }
+      }
+      if (ops.length && SOPORTE_OPUS_RX && typeof window.AudioDecoder === 'function') {
+        const outs = [];
+        try {
+          const dec = new window.AudioDecoder({
+            output: (ad) => { outs.push(extraerFloat32DeAudioData(ad)); ad.close(); },
+            error: () => { outs.push(new Float32Array(960)); },
+          });
+          dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+          let ts = 0;
+          for (const o of ops) {
+            const fr = o.fr;
+            if (o.nSub === 2) {
+              const len1 = fr[4] | (fr[5] << 8);
+              const off1 = 6;
+              if (off1 + len1 <= fr.length && len1 > 0) {
+                dec.decode(new window.EncodedAudioChunk({
+                  type: 'key', timestamp: ts, duration: 20000,
+                  data: fr.subarray(off1, off1 + len1),
+                }));
+                ts += 20000;
+              }
+              const off2 = off1 + len1;
+              if (off2 + 2 <= fr.length) {
+                const len2 = fr[off2] | (fr[off2 + 1] << 8);
+                if (off2 + 2 + len2 <= fr.length && len2 > 0) {
+                  dec.decode(new window.EncodedAudioChunk({
+                    type: 'key', timestamp: ts, duration: 20000,
+                    data: fr.subarray(off2 + 2, off2 + 2 + len2),
+                  }));
+                  ts += 20000;
+                }
+              }
+            } else {
+              dec.decode(new window.EncodedAudioChunk({
+                type: 'key', timestamp: ts, duration: 20000, data: fr.subarray(3),
+              }));
+              ts += 20000;
+            }
+          }
+          await dec.flush().catch(() => {});
+          try { dec.close(); } catch {}
+        } catch {}
+        let oi = 0;
+        for (const o of ops) {
+          const partes = outs.slice(oi, oi + o.nSub);
+          oi += o.nSub;
+          if (!partes.length) continue;
+          const total = partes.reduce((a, p) => a + p.length, 0);
+          const pcm = new Float32Array(total);
+          let w = 0;
+          for (const p of partes) { pcm.set(p, w); w += p.length; }
+          out.push({ tx: o.tx, pcm: remuestrearA(rsDe(48000), pcm, 48000, ctxRate) });
+        }
+      }
+      return out;
+    }
+
+    // ---------- re-escucha de notas de voz ----------
+    reproducirSeg(seq) {
+      const seg = this._vozSegs.get(seq);
+      if (!seg || !seg.bloques.length) return false;
+      this._replayQ.push({ seq, bloques: seg.bloques.slice(), alimentado: 0 });
+      this._programarFeedOn();
+      return true;
+    }
+
+    async reproducirRaw(raw, seq) {
+      if (!raw || !raw.length) return false;
+      const frames = raw.map((b) => (b instanceof Uint8Array ? b : new Uint8Array(b)));
+      const bl = await this._decodificarFramesSeg(frames, null);
+      this._replayQ.push({ seq: seq || ('r' + Date.now()), bloques: bl, alimentado: 0 });
+      this._programarFeedOn();
+      return true;
+    }
+
+    // Re-escucha directa de un archivo .seg del servidor (formato CSEG)
+    async reproducirArchivo(buf, seq) {
+      const parsed = parsearArchivoSeg(buf instanceof Uint8Array ? buf : new Uint8Array(buf));
+      if (!parsed || !parsed.frames.length) return false;
+      const bl = await this._decodificarFramesSeg(parsed.frames, null);
+      if (!bl.length) return false;
+      this._replayQ.push({ seq: seq || parsed.sg.seq || ('r' + Date.now()), bloques: bl, alimentado: 0 });
+      this._programarFeedOn();
+      return true;
+    }
+
+    datosSeg(seq) {
+      const s = this._vozSegs.get(seq);
+      return s ? {
+        seq: s.seq, de: s.de, nombre: s.nombre, durMs: s.durMs,
+        inicio: s.inicio, interrumpida: s.interrumpida, raw: s.raw,
+      } : null;
     }
 
     _enviarEstadoMedia() {
@@ -1622,10 +2410,19 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           if (!this._speakerTimer) {
             this._speakerTimer = setInterval(() => this._actualizarSpeakers(), 300);
           }
+          this._programarFeedOn();
           this._iniciarMonitorRed();
           this._enviarEstadoMedia();
           if (window.S && typeof window.S.grupoActual === 'number' && window.S.grupoActual > 0) {
             try { ws.send(JSON.stringify({ t: 'cambiar_grupo', grupo: window.S.grupoActual })); } catch {}
+          }
+          // Tras una reconexión: reclamar el piso (si seguía pisado) y luego
+          // soltar en ráfaga la voz encolada durante el corte
+          if (this._quieroPiso) {
+            this._enviarJson({ t: 'piso_tomar' });
+            setTimeout(() => this._drenarTx(), 350);
+          } else {
+            this._programarFlushTx();
           }
           this.emit(RoomEvent.ConnectionStateChanged, 'connected');
           if (resolveInicial) resolveInicial();
@@ -1702,6 +2499,29 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         clearInterval(this._pingTimer);
         this._pingTimer = null;
       }
+      if (this._feedT) { clearInterval(this._feedT); this._feedT = null; }
+      if (this._pisoHoldT) { clearInterval(this._pisoHoldT); this._pisoHoldT = null; }
+      if (this._txFlushT) { clearTimeout(this._txFlushT); this._txFlushT = null; }
+      this._txCola.length = 0;
+      this._txBytes = 0;
+      this._quieroPiso = false;
+      this._tengoPiso = false;
+      if (this._vozPipe) {
+        const vp = this._vozPipe;
+        this._vozPipe = null;
+        try { if (vp.worklet) vp.worklet.disconnect(); } catch {}
+        try { if (vp.proc) vp.proc.disconnect(); } catch {}
+        try { if (vp.gainNode) vp.gainNode.disconnect(); } catch {}
+      }
+      this._vozSegs.clear();
+      this._vozOrden.length = 0;
+      this._segPorHablante.clear();
+      this._vozBase = false;
+      this._ultimoSeg = 0;
+      this._replayQ.length = 0;
+      this._fetchSegs.clear();
+      this._vozBufMs = 0;
+      this._retrasoAviso = 0;
       const navConn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
       if (navConn && this._onNetChange && typeof navConn.removeEventListener === 'function') {
         navConn.removeEventListener('change', this._onNetChange);
@@ -1740,6 +2560,95 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
           this._canMic = !!m.canMic;
           this._canCam = !!m.canCam;
           this._canPan = !!m.canPan;
+          if (typeof m.ultimoSeg === 'number') {
+            if (!this._vozBase) {
+              // Primera conexión: la base del historial es el último segmento
+              // cerrado — el oyente entra "al presente" (el pasado está en el
+              // historial, no se descarga solo)
+              this._vozBase = true;
+              this._ultimoSeg = Math.max(this._ultimoSeg, m.ultimoSeg);
+            } else if (m.ultimoSeg > this._ultimoSeg) {
+              // Reconexión tras micro-corte: descargar las frases perdidas
+              this._rellenarHuecos(m.ultimoSeg);
+            }
+          }
+          break;
+
+        case 'seg_ini': {
+          // Aviso de que alguien empezó una frase (segmento abierto)
+          const de = m.de || '';
+          if (de === this.localParticipant.identity) break;
+          const cur = this._segPorHablante.get(de);
+          let seg;
+          if (cur != null && cur < 0) {
+            // Ya llegaban tramas en vivo con seq pseudo: re-etiquetar al real
+            seg = this._vozSegs.get(cur);
+            this._vozSegs.delete(cur);
+            const oi = this._vozOrden.indexOf(seg);
+            if (oi >= 0) this._vozOrden.splice(oi, 1);
+            seg.seq = m.seq;
+            seg.pseudo = false;
+            if (m.nombre) seg.nombre = m.nombre;
+            this._vozSegs.set(m.seq, seg);
+            let i = this._vozOrden.length;
+            while (i > 0 && (this._vozOrden[i - 1].pseudo ? Infinity : this._vozOrden[i - 1].seq) > m.seq) i--;
+            this._vozOrden.splice(i, 0, seg);
+            this._segPorHablante.set(de, m.seq);
+          } else {
+            seg = this._vozSegNuevo(m.seq, de, m.nombre, true);
+          }
+          this._ultimoSeg = Math.max(this._ultimoSeg, m.seq);
+          // Opción "ir al presente automático": si la frase nueva empieza y
+          // llevamos mucho atraso, saltar directo al audio en vivo
+          if (this._autoPresente && this._retrasoMs() > 5000) {
+            this.saltarAlPresente();
+          }
+          this.emit('seg_ini', this._segMeta(seg));
+          break;
+        }
+
+        case 'seg_fin': {
+          // La frase terminó (EOS): el segmento es una nota de voz cerrada
+          let seg = this._vozSegs.get(m.seq);
+          if (seg) {
+            seg.completo = true;
+            seg.abierto = false;
+            seg.finLocal = true;
+            if (m.durMs) seg.durMs = m.durMs;
+            if (m.interrumpida) seg.interrumpida = true;
+            if (m.nombre) seg.nombre = m.nombre;
+            if (this._segPorHablante.get(m.de) === m.seq) {
+              this._segPorHablante.delete(m.de);
+            }
+            // Huecos detectados en vivo: descargar el segmento completo para
+            // rellenar las tramas que el micro-corte se llevó
+            if (seg.huecos && !seg.descargado) this._bajarSeg(m.seq);
+          } else {
+            // Nunca vimos la frase (corte largo): crearla y descargarla —
+            // salvo si es mía: mi propia voz no se reproduce ni se descarga
+            seg = this._vozSegNuevo(m.seq, m.de, m.nombre, false, m);
+            if (m.de !== this.localParticipant.identity) this._bajarSeg(m.seq);
+          }
+          this._ultimoSeg = Math.max(this._ultimoSeg, m.seq);
+          this.emit('seg_fin', this._segMeta(seg));
+          break;
+        }
+
+        case 'piso_ok':
+          this._tengoPiso = true;
+          this.emit('piso', { estado: 'mio' });
+          break;
+
+        case 'piso_ocupado':
+          this._tengoPiso = false;
+          this.emit('piso_ocupado', {
+            nombre: m.nombre || '', faltan: m.faltan || 0, error: m.error || '',
+          });
+          break;
+
+        case 'piso_perdido':
+          this._tengoPiso = false;
+          this.emit('piso_perdido', { por: m.por || '' });
           break;
 
         case 'permisos':
@@ -1921,9 +2830,13 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
 
       const msTrack = dest.stream.getAudioTracks()[0];
       const track = new MediaTrack('audio', source, msTrack);
+      const room = this;
       track.setDirectOutput = (vol, sinkId) => {
         if (typeof vol === 'number' && !Number.isNaN(vol)) {
           gainNode.gain.value = Math.max(0, Math.min(3, vol));
+          // la voz suena por el reproductor único: recordar el factor por
+          // hablante para que _feedVoz lo aplique al cambiar de frase
+          room._volPorId.set(p.identity, Math.max(0, Math.min(3, vol)));
         }
         if (sinkId && typeof ctx.setSinkId === 'function') {
           ctx.setSinkId(sinkId).catch(() => {});
@@ -1974,12 +2887,13 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         opusTimestampUs: 0,
       };
 
+      const esVoz = source === TrackSource.Microphone;
       const conectarWorkletSiListo = () => {
-        if (pipe.worklet || !ctx._mumbleWorkletReady || typeof window.AudioWorkletNode !== 'function') {
+        if (esVoz || pipe.worklet || !ctx._workletListo || typeof window.AudioWorkletNode !== 'function') {
           return false;
         }
         try {
-          const wn = new window.AudioWorkletNode(ctx, 'mumble-rx-worklet', {
+          const wn = new window.AudioWorkletNode(ctx, 'conferencia-rx-worklet', {
             numberOfInputs: 0,
             numberOfOutputs: 1,
             outputChannelCount: [1],
@@ -1996,7 +2910,10 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         }
       };
 
-      if (!conectarWorkletSiListo()) {
+      // La voz no crea reproductor por hablante: suena por el reproductor
+      // único ordenado (_asegurarVozPipe). El pipe solo guarda el estado del
+      // decodificador/remuestreo por hablante.
+      if (!esVoz && !conectarWorkletSiListo()) {
         // Fallback inmediato con ScriptProcessor(2048) conectado directo a gainNode -> ctx.destination
         const proc = ctx.createScriptProcessor(2048, 1, 1);
         proc.onaudioprocess = (ev) => {
@@ -2094,7 +3011,9 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
     }
 
     // Remuestrea continuamente y empuja un bloque decodificado al reproductor.
-    _empujarMuestrasRemotas(pipe, samples, inRate, fromId, ftipo, seq) {
+    // La voz (FRAME_AUDIO) va a la cola ordenada de segmentos; el audio
+    // compartido (música) sigue yendo directo al reproductor del hablante.
+    _empujarMuestrasRemotas(pipe, samples, inRate, fromId, ftipo, seq, crudo) {
       if (!samples || samples.length === 0) return;
       const nowMs = performance.now();
 
@@ -2168,6 +3087,12 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         pipe.rxPhase -= nIn;
         pipe.rxLastInSample = samples[nIn - 1];
         outPcm = tmp.subarray(0, outIdx);
+      }
+
+      // Voz: a la cola ordenada de segmentos (notas de voz en vivo)
+      if (ftipo === FRAME_AUDIO) {
+        this._alimentarSegVoz(fromId, outPcm, seq, crudo);
+        return;
       }
 
       if (pipe.worklet) {
@@ -2249,7 +3174,21 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         // 0. Marcador explícito de fin de frase (EOS): reproduce de inmediato
         // cualquier sílaba corta pendiente y apaga la frase sin PLC ni retraso.
         if (rateCode === 0) {
-          this._marcarFinHablaRemota(pipe);
+          if (ftipo === FRAME_AUDIO) {
+            // fin de la nota de voz en vivo: el segmento queda listo para
+            // cerrarse cuando se agoten sus bloques (seg_fin lo confirma)
+            const oseq = this._segPorHablante.get(fromId);
+            const sg = oseq != null ? this._vozSegs.get(oseq) : null;
+            if (sg) {
+              sg.finLocal = true;
+              this._segPorHablante.delete(fromId);
+            }
+            pipe.rxHasLast = false;
+            pipe.rxPhase = 0;
+            pipe.lastSeq = -1;
+          } else {
+            this._marcarFinHablaRemota(pipe);
+          }
           return;
         }
 
@@ -2265,7 +3204,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
                   const seqOut = pipe._pendingOpusSeq;
                   pipe._pendingOpusSeq = -1;
                   audioData.close();
-                  this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo, seqOut);
+                  this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo, seqOut, payload);
                 },
                 error: () => {},
               });
@@ -2332,7 +3271,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
             ? (baseCode === 21 ? 8000 : (baseCode === 22 ? 12000 : 16000))
             : (baseCode === 21 ? 6000 : (baseCode === 22 ? 8000 : (baseCode === 23 ? 12000 : 16000)));
           const { pcm, seq } = decodificarBloqueADPCM(payload);
-          this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo, seq);
+          this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo, seq, payload);
           return;
         }
 
@@ -2343,7 +3282,7 @@ registerProcessor('mumble-tx-worklet', MumbleTxProcessor);
         for (let i = 0; i < samples.length; i++) {
           pcm[i] = ulawDecodeTable[samples[i]];
         }
-        this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo, -1);
+        this._empujarMuestrasRemotas(pipe, pcm, sampleRate, fromId, ftipo, -1, payload);
         return;
       }
 

@@ -12,8 +12,8 @@
 <meta name="apple-mobile-web-app-title" content="Conferencia">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
-<link rel="stylesheet" href="/styles.css?v=116">
-<script src="/mumble-engine.js?v=116"></script>
+<link rel="stylesheet" href="/styles.css?v=117">
+<script src="/conferencia-engine.js?v=117"></script>
 </head>
 <body>
 
@@ -66,31 +66,6 @@
     </div>
     <div class="fila">
       <button id="a-salas-btn" class="btn prim">🚪 Administrar salas</button>
-    </div>
-    <hr>
-    <h2>Servidor de Voz Mumble (Local o Público Remoto)</h2>
-    <p class="muted" style="font-size:.85rem">Elige si las salas usan el servidor Mumble local (instalado en este equipo/Docker) o cualquier servidor Mumble público gratuito en Internet.</p>
-    <div class="fila" style="flex-wrap:wrap;gap:.5rem">
-      <label style="flex:1;min-width:210px">Modo de conexión Mumble
-        <select id="mumble-modo">
-          <option value="local">🏠 Servidor Mumble Local (en este servidor)</option>
-          <option value="remoto">🌐 Servidor Mumble Público / Remoto en Internet</option>
-        </select>
-      </label>
-      <label id="mumble-host-wrap" style="flex:2;min-width:220px">Host / Dominio Mumble remoto
-        <input id="mumble-host" placeholder="ej: mumble.ejemplo.org">
-      </label>
-      <label id="mumble-puerto-wrap" style="width:110px">Puerto
-        <input id="mumble-puerto" type="number" min="1" max="65535" value="64738">
-      </label>
-      <label id="mumble-clave-wrap" style="flex:1;min-width:160px">Contraseña (opcional)
-        <input id="mumble-clave" type="password" placeholder="vacío si es público">
-      </label>
-    </div>
-    <div class="fila" style="margin-top:.5rem;flex-wrap:wrap;gap:.5rem;align-items:center">
-      <button id="mumble-guardar" class="btn prim" type="button">💾 Guardar servidor Mumble</button>
-      <button id="mumble-probar" class="btn" type="button">🔌 Probar conexión</button>
-      <span id="mumble-estado" class="muted" style="font-size:.85rem"></span>
     </div>
     <hr>
     <h2>Crear usuario administrador</h2>
@@ -180,6 +155,8 @@
       <button id="st-manos" class="chip-ico oculto" title="Manos levantadas — toca para ver solicitudes">✋ <span id="st-manos-n">0</span></button>
       <button id="st-cola" class="chip-ico oculto" title="Gente en la cola para sentarse — ver solicitudes">🪑 <span id="st-cola-n">0</span></button>
       <button id="st-lobby" class="chip-ico oculto" title="Gente esperando en la sala de espera — abrir moderación">🚪 <span id="st-lobby-n">0</span></button>
+      <button id="st-piso" class="chip-ico oculto" title="Quién tiene el piso de voz">🎙️ <span id="st-piso-n"></span></button>
+      <button id="st-retraso" class="chip-ico oculto" title="Vas con retraso respecto al audio en vivo — toca para ponerte al día">⏪ <span id="st-retraso-n"></span> · Ir al presente</button>
     </div>
     <div class="fila top-identidad">
       <strong id="st-nombre-sala"></strong>
@@ -342,6 +319,12 @@
         <div id="mic-pop" class="popmenu oculto">
           <span class="muted">Micrófono</span>
           <select id="mic-sel"></select>
+          <span class="muted">Modo para hablar</span>
+          <select id="mic-modo">
+            <option value="auto">Siempre abierto (habla libre)</option>
+            <option value="hold">Pulsar y mantener para hablar (PTT)</option>
+            <option value="lock">Tocar para hablar / tocar para soltar</option>
+          </select>
           <button id="mic-mas" class="btn mini" type="button">Más ajustes…</button>
         </div>
       </span>
@@ -402,6 +385,16 @@
         <span class="acciones"><button id="mod-lobby-todos" class="btn mini prim">Admitir a todos</button>
         <button id="mod-lobby-ninguno" class="btn mini peligro">Rechazar a todos</button></span></div>
       <div id="mod-lobby" class="lista"></div>
+    </div>
+    <div id="piso-cfg" style="margin:.6rem 0;border-top:1px solid rgba(255,255,255,.12);padding-top:.5rem">
+      <span class="muted" style="font-size:.78rem">Interrupción del piso — segundos que debe llevar hablando quien tiene el piso antes de poder tumbárselo (0 = al instante). Si alguien tiene varios roles, vale el tiempo menor.</span>
+      <div class="fila" style="gap:.4rem;flex-wrap:wrap;align-items:center;margin-top:.3rem">
+        <label class="mini" style="display:flex;align-items:center;gap:.25rem">Admin <input id="piso-admin" type="number" min="0" max="3600" style="width:58px"></label>
+        <label class="mini" style="display:flex;align-items:center;gap:.25rem">Anfitrión <input id="piso-anfitrion" type="number" min="0" max="3600" style="width:58px"></label>
+        <label class="mini" style="display:flex;align-items:center;gap:.25rem">Palabra <input id="piso-palabra" type="number" min="0" max="3600" style="width:58px"></label>
+        <label class="mini" style="display:flex;align-items:center;gap:.25rem">Usuario <input id="piso-usuario" type="number" min="0" max="3600" style="width:58px"></label>
+        <button id="piso-guardar" class="btn mini prim">Guardar</button>
+      </div>
     </div>
     <button id="mod-terminar" class="btn mini peligro" style="margin-top:.5rem">🔴 Terminar la reunión para todos</button>
     <label class="fila" style="align-items:center">Calidad de audio de la sala
@@ -472,6 +465,13 @@
     <label class="check"><input type="checkbox" id="aj-ns" checked> Supresión de ruido</label>
     <label class="check"><input type="checkbox" id="aj-ec" checked> Cancelación de eco</label>
     <label class="check"><input type="checkbox" id="aj-agc" checked> Control automático de ganancia</label>
+    <label class="check"><input type="checkbox" id="aj-presente"> Saltar al audio en vivo cuando empiece otra nota</label>
+    <label>Historial de voz en este equipo
+      <span class="fila" style="gap:.4rem;align-items:center">
+        <input id="aj-hist-mb" type="number" min="10" max="2000" step="10" style="width:70px"> <span class="muted">MB</span>
+        <button id="aj-hist-vaciar" class="btn mini peligro" type="button">Vaciar</button>
+      </span>
+    </label>
     <p class="muted" style="font-size:.8rem">Cambiar micro o filtros reinicia tu audio brevemente.</p>
   </div>
 </div>
@@ -505,6 +505,6 @@
   <button id="nav-tip-x" class="btn mini" aria-label="Cerrar">✕</button>
 </div>
 <div id="toast-wrap"></div>
-<script src="/app.js?v=116"></script>
+<script src="/app.js?v=117"></script>
 </body>
 </html>

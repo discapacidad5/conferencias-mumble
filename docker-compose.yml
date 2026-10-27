@@ -1,27 +1,13 @@
 services:
-  mumble-server:
-    image: mumblevoip/mumble-server:latest
-    container_name: mumble-server
-    restart: unless-stopped
-    ports:
-      - "64738:64738/tcp"
-      - "64738:64738/udp"
-    volumes:
-      - ./murmur.ini:/etc/mumble/config.ini:ro
-      - mumble-data:/data
-
-  conferencia-mumble:
+  conferencia:
     build: .
-    container_name: conferencia-mumble
+    container_name: conferencia
     restart: unless-stopped
-    depends_on:
-      - mumble-server
     environment:
       PORT: "3000"
       DATA_DIR: "/data"
-      MUMBLE_LOCAL_ADDR: "${MUMBLE_LOCAL_ADDR:-mumble-server:64738}"
       PUBLIC_HOST: "${PUBLIC_HOST:-}"
-      APP_SECRET: "${APP_SECRET:-mumble-conferencias-secret-0123456789abcdef}"
+      APP_SECRET: "${APP_SECRET:-conferencia-secret-0123456789abcdef}"
       ADMIN_USER: "${ADMIN_USER:-admin}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin123}"
     ports:
@@ -30,5 +16,4 @@ services:
       - conf-data:/data
 
 volumes:
-  mumble-data:
   conf-data:

@@ -32,6 +32,17 @@ const S = {
   wb: { strokes: [], mios: [], trazoId: '', cargado: false, dibujando: false, color: '#ffffff', grosor: 3,
         herramienta: 'lapiz', laser: {}, relleno: false },
   audio: { pub: null, ctx: null, ganancia: esIOS ? 2 : 1, ns: true, ec: true, agc: !esIOS, on: false },
+  // PTT / piso exclusivo: modo 'auto' (micro libre), 'hold' (mantener
+  // pisado) o 'lock' (tocar para bloquear/soltar). quiero = dedo/intención
+  // pisada; tengo = el servidor confirmó el piso
+  ptt: { modo: localStorage.getItem('lk_ptt_modo') || 'auto', quiero: false, tengo: false },
+  pisoCfg: null, pisoFaltan: 0,
+  // historial local de notas de voz (IndexedDB): tope en MB y auto-salto
+  segCapMB: +(localStorage.getItem('lk_seg_mb') || 100),
+  autoPresente: localStorage.getItem('lk_auto_presente') === '1',
+  _nvEls: new Map(),  // seq -> elemento del chat (chip de nota de voz)
+  _nvSeqs: [],        // seqs en orden (encadenado al re-escuchar)
+  _nvRepro: 0,        // seq que se está re-escuchando ahora
   prefAudio: localStorage.getItem('lk_audio_pref') || 'auto', // auto | telefono | voz | musica
   calidadMala: false,        // última lectura de ConnectionQuality del propio cliente
   calidadRed: 'media',       // 'mala' (~10 kbps) | 'media' (~18 kbps) | 'buena' (~28 kbps)
@@ -48,6 +59,8 @@ const S = {
   musica: null, volMusica: 1, musicaBase: 1,
   ultLobby: 0,
 };
+// el motor (conferencia-engine.js) accede al estado como window.S
+window.S = S;
 const flotantes = new Map();
 let flotanteOrden = 0;
 const avisosPalabra = new Set(); // umbrales ya avisados (2', 1', 30")
@@ -509,79 +522,9 @@ async function iniciarAdmin() {
       toast('Usuario creado');
     } catch (e) { toast(e.message); }
   };
-  await cargarConfigMumbleAdmin();
   listarSalasAdmin();
 }
 
-async function cargarConfigMumbleAdmin() {
-  const modoEl = $('#mumble-modo');
-  if (!modoEl) return;
-  const hostWrap = $('#mumble-host-wrap');
-  const puertoWrap = $('#mumble-puerto-wrap');
-  const claveWrap = $('#mumble-clave-wrap');
-  const estEl = $('#mumble-estado');
-  const actualizarVisibilidad = () => {
-    const esRemoto = modoEl.value === 'remoto';
-    hostWrap.classList.toggle('oculto', !esRemoto);
-    puertoWrap.classList.toggle('oculto', !esRemoto);
-    claveWrap.classList.toggle('oculto', !esRemoto);
-  };
-  modoEl.onchange = actualizarVisibilidad;
-  try {
-    const r = await api('/api/admin/mumble');
-    const cfg = r.config || {};
-    modoEl.value = cfg.modo || 'local';
-    $('#mumble-host').value = cfg.host || '';
-    $('#mumble-puerto').value = cfg.puerto || 64738;
-    $('#mumble-clave').value = cfg.clave || '';
-    estEl.textContent = `Activo: ${r.direccion || ''} (${cfg.modo === 'remoto' ? 'remoto' : 'local'})`;
-  } catch {}
-  actualizarVisibilidad();
-
-  const leerFormMumble = () => ({
-    modo: modoEl.value,
-    host: $('#mumble-host').value.trim(),
-    puerto: +$('#mumble-puerto').value || 64738,
-    clave: $('#mumble-clave').value,
-  });
-
-  const pintarResultadoMumble = (st) => {
-    if (!st) return;
-    if (st.conectado) {
-      estEl.style.color = '#3ad29f';
-      estEl.textContent = `✅ Conectado a ${st.direccion} (${st.latenciaMs} ms${st.canales ? ' · ' + st.canales + ' canales' : ''})`;
-    } else {
-      estEl.style.color = '#ff6b6b';
-      estEl.textContent = `⚠️ Sin respuesta de ${st.direccion}: ${st.error || 'no disponible'} (el audio web entre participantes sigue funcionando por el servidor local)`;
-    }
-  };
-
-  $('#mumble-probar').onclick = async () => {
-    estEl.style.color = '';
-    estEl.textContent = 'Probando conexión Mumble…';
-    try {
-      const st = await api('/api/admin/mumble/probar', leerFormMumble());
-      pintarResultadoMumble(st);
-    } catch (e) {
-      estEl.style.color = '#ff6b6b';
-      estEl.textContent = 'Error: ' + e.message;
-    }
-  };
-
-  $('#mumble-guardar').onclick = async () => {
-    estEl.style.color = '';
-    estEl.textContent = 'Guardando y verificando…';
-    try {
-      const r = await api('/api/admin/mumble', leerFormMumble());
-      toast('Servidor Mumble actualizado');
-      pintarResultadoMumble(r.estado);
-    } catch (e) {
-      toast(e.message);
-      estEl.style.color = '#ff6b6b';
-      estEl.textContent = 'Error: ' + e.message;
-    }
-  };
-}
 async function listarSalasAdmin() {
   const salas = await api('/api/admin/salas');
   $('#ms-lista').innerHTML = salas.map(s => {
@@ -904,7 +847,7 @@ function ajustarSalida(sid) {
   const g = s.musica
     ? Math.min(3, Math.max(0, S.volMaster * S.volMusica * S.musicaBase * (S.volPor[s.id] || 1)))
     : volEfectivo(s.id);
-  // Si la pista viene del motor Mumble, ya tiene su propio GainNode directo
+  // Si la pista viene del motor de voz, ya tiene su propio GainNode directo
   // en el AudioContext nativo de recepción: ajustarlo directo evita cruzar un
   // MediaStream entre dos AudioContext distintos (que causa cortes y ruido).
   if (s.track && typeof s.track.setDirectOutput === 'function') {
@@ -999,7 +942,7 @@ async function entrar() {
     cablearRoom(room);
     await conectarRoom(room, r.url, r.token);
 
-    // En modo Mumble (bajo consumo), la cámara solo se enciende si ya está en
+    // En modo bajo consumo, la cámara solo se enciende si ya está en
     // el Asiento 1 o tiene La Palabra; si entra de pie, S.camQuerida guarda
     // su intención y se activa sola al ocupar el Asiento 1 o recibir La Palabra.
     if (!S.sinCam && S.room._canCam) {
@@ -1074,6 +1017,7 @@ function entrarVistaSala() {
     if (S.audio.on && mp && mp.isMuted && puedoHablar()) mp.unmute().catch(() => {});
   });
   conectarSSE();
+  precargarNotasVoz(); // notas de voz guardadas localmente vuelven al chat
   cablearControles();
   cablearPizarra();
   cablearDocs();
@@ -1319,6 +1263,7 @@ function aplicarEstado(d, fuente = 'http') {
   S.docProhibidos = d.docProhibidos || [];
   S.lobbyLista = d.lobby || [];
   S.accesoSala = d.acceso || 'abierto';
+  if (d.pisoCfg) S.pisoCfg = d.pisoCfg;
   // nombre para mostrar: si el admin renombra con gente dentro se ve al instante
   if (d.nombreVisible !== undefined) {
     S.salaNombre = d.nombreVisible || S.sala;
@@ -1379,7 +1324,7 @@ async function refrescarEstado() {
 let sseTimer = null;
 function abrirEventSource() {
   if (S.evt) { try { S.evt.close(); } catch {} S.evt = null; }
-  // En la versión Mumble el estado en tiempo real viaja dentro del mismo
+  // En esta versión el estado en tiempo real viaja dentro del mismo
   // WebSocket (/media -> estado_push), evitando abrir una conexión SSE extra
   // que en proxies HTTP/2 o Cloudflare produce ERR_HTTP2_PROTOCOL_ERROR.
 }
@@ -1491,7 +1436,7 @@ const puedoHablar = () => !S.micProhibido && (tengoPalabra() || S.micPerm ||
     ? (miAsiento() === 0 || !(S.estado && S.estado.micAsientos))
     : !(S.estado && S.estado.silencio)));
 
-// cámara permitida en modo Mumble (bajo consumo): SOLO quien ocupa el
+// cámara permitida en modo bajo consumo: SOLO quien ocupa el
 // Asiento 1 (Anfitrión) o quien tiene La Palabra (o excepción de moderador)
 const puedoCam = () => !S.camProhibido && (tengoPalabra() || miAsiento() === 0 || S.camPerm);
 
@@ -1509,10 +1454,10 @@ function intentarAutoMic() {
   if (!S.micProhibido && !S.audio.retirando) {
     if (S.audio.autoPalabra && tengoPalabra()) {
       S.audio.autoPalabra = false;
-      activarMic(true);
+      if (modoPtt()) prepararMicPtt(); else activarMic(true);
     } else if (S.audio.autoAsiento && estoySentado()) {
       S.audio.autoAsiento = false;
-      if (puedoHablar()) activarMic(true);
+      if (puedoHablar()) { if (modoPtt()) prepararMicPtt(); else activarMic(true); }
     }
   }
   if (S.camQuerida && puedoCam() && !S.room.localParticipant.isCameraEnabled) {
@@ -1573,6 +1518,72 @@ async function dejarPalabra() {
     await activarMic(false);
     await refrescarEstado();
   } catch (e) { toast(e.message); }
+}
+
+/* ---------- piso exclusivo / PTT ---------- */
+const modoPtt = () => S.ptt.modo !== 'auto';
+
+// Espejo de la regla del servidor: puedes interrumpir cuando el dueño del
+// piso lleva hablando el MÍNIMO de los tiempos de todos tus roles
+function miTiempoPiso() {
+  const c = S.pisoCfg || { admin: 0, anfitrion: 0, palabra: 10, usuario: 60 };
+  let m = c.usuario;
+  if (esMod()) m = Math.min(m, c.admin);
+  if (miAsiento() === 0) m = Math.min(m, c.anfitrion);
+  if (tengoPalabra()) m = Math.min(m, c.palabra);
+  return m;
+}
+
+// En modo PTT el micrófono queda publicado pero silenciado para que el
+// primer toque sea instantáneo (sin esperar a getUserMedia)
+async function prepararMicPtt() {
+  if (S.audio.pub || !puedoHablar() || S.audio.retirando || !S.room) return;
+  try {
+    const track = await construirMicTrack();
+    S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+    await S.audio.pub.mute();
+  } catch {}
+}
+
+async function pttOn() {
+  if (!S.room || S.ptt.quiero) return;
+  if (!puedoHablar()) {
+    const razon = S.micProhibido
+      ? 'Un moderador te prohibió activar el micrófono.'
+      : estoySentado()
+      ? 'Los micrófonos de los asientos están bloqueados.'
+      : 'La audiencia tiene el micrófono deshabilitado.';
+    genModal('Micrófono deshabilitado',
+      `<p>${razon}</p><p>Solo puedes hablar desde el puesto de la palabra. ¿Quieres levantar la mano para pedirla?</p>`,
+      () => accion('levantar_mano')
+        .then(() => toast('Mano levantada: espera la aprobación del moderador'))
+        .catch(e => toast(e.message)),
+      '✋ Levantar la mano');
+    return;
+  }
+  S.ptt.quiero = true;
+  S.room.tomarPiso();
+  try {
+    if (!S.audio.pub) {
+      const track = await construirMicTrack();
+      S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+    }
+    await S.audio.pub.unmute();
+    S.audio.on = true;
+  } catch (e) {
+    S.ptt.quiero = false;
+    toast('No se pudo hablar: ' + e.message);
+  }
+  renderControles();
+}
+
+async function pttOff() {
+  S.ptt.quiero = false;
+  if (S.room) S.room.soltarPiso();
+  const pub = S.audio.pub;
+  if (pub && !pub.isMuted) await pub.mute().catch(() => {});
+  S.audio.on = false;
+  renderControles();
 }
 
 /* ---------- salas de discusión ---------- */
@@ -1929,6 +1940,37 @@ function cablearRoom(room) {
     let d;
     try { d = JSON.parse(new TextDecoder().decode(payload)); } catch { return; }
     manejarData(d, participant);
+  });
+  // --- notas de voz en vivo (segmentos confiables) ---
+  room.on('seg_fin', (m) => {
+    if (!m) return;
+    agregarNotaVoz(m);
+    idbGuardarSeg(m.seq);
+  });
+  room.on('seg_perdido', (seq) => marcarNotaVoz(seq, 'perdida'));
+  room.on('seg_reproduciendo', (m) => { if (m) marcarNotaVoz(m.seq, 'sonando'); });
+  room.on('seg_reproducido', (m) => { if (m) marcarNotaVoz(m.seq, 'oido'); });
+  room.on('seg_replay_fin', (seq) => reproducirSiguienteNota(seq));
+  room.on('voz_retraso', (ms) => renderRetraso(ms));
+  // --- piso exclusivo (PTT) ---
+  room.on('piso', (m) => {
+    if (m && m.estado === 'mio') { S.ptt.tengo = true; renderControles(); }
+  });
+  room.on('piso_ocupado', (m) => {
+    S.ptt.tengo = false;
+    S.pisoFaltan = (m && m.faltan) || 0;
+    if (m && m.error) toast(m.error);
+    else toast(`🎙️ ${(m && m.nombre) || 'Otra persona'} tiene el piso — podrás interrumpir en ${S.pisoFaltan} s`, 4500);
+    renderControles();
+  });
+  room.on('piso_perdido', (m) => {
+    S.ptt.tengo = false;
+    S.ptt.quiero = false;
+    S.audio.on = false;
+    const pub = S.audio.pub;
+    if (pub && !pub.isMuted) pub.mute().catch(() => {});
+    toast(`⚠️ ${(m && m.por) || 'Otra persona'} tomó el piso`, 4500);
+    renderControles();
   });
   room.on(LC.RoomEvent.Disconnected, (razon) => {
     // no reconectar si salimos a propósito, si este Room ya fue reemplazado
@@ -2916,6 +2958,17 @@ function renderListas() {
     if ($('#mod-vista-fija')) $('#mod-vista-fija').classList.toggle('on', !!S.estado.vistaFija);
     if ($('#mod-audio')) $('#mod-audio').value = S.estado.audioPerfil || 'auto';
     if ($('#mod-acceso')) $('#mod-acceso').value = S.accesoSala || 'abierto';
+    // tiempos de interrupción del piso por rol — solo se sobrescriben si el
+    // moderador no los está editando ahora mismo
+    if (S.pisoCfg && $('#piso-admin') && document.activeElement?.id !== 'piso-admin'
+      && document.activeElement?.id !== 'piso-anfitrion'
+      && document.activeElement?.id !== 'piso-palabra'
+      && document.activeElement?.id !== 'piso-usuario') {
+      $('#piso-admin').value = S.pisoCfg.admin;
+      $('#piso-anfitrion').value = S.pisoCfg.anfitrion;
+      $('#piso-palabra').value = S.pisoCfg.palabra;
+      $('#piso-usuario').value = S.pisoCfg.usuario;
+    }
     // sala de espera: quién espera admisión + botón por persona
     const lw = $('#mod-lobby-wrap');
     if (lw) {
@@ -3101,19 +3154,46 @@ function renderControles() {
   // igual con la cámara: sin permiso se desactiva y libera el hardware
   if (!puedoCam() && camPub)
     S.room.localParticipant.setCameraEnabled(false).catch(() => {});
-  // con la palabra el micro debe seguir activo: si quedó muteado, se reactiva
-  if (tengoPalabra() && micPub && micPub.isMuted && !S.audio.retirando)
+  // con la palabra el micro debe seguir activo: si quedó muteado, se
+  // reactiva — salvo en modo PTT, donde el propio usuario manda con el botón
+  if (!modoPtt() && tengoPalabra() && micPub && micPub.isMuted && !S.audio.retirando)
     micPub.unmute().catch(() => {});
 
   const bm = $('#ctl-mic');
-  bm.className = 'btn ctl ' + (micOn ? 'on' : 'off');
+  const pisoOcupado = S.estado && S.estado.piso && S.estado.piso !== S.identidad;
+  bm.className = 'btn ctl ' + (micOn ? 'on' : 'off') + (modoPtt() && S.ptt.quiero ? ' ptt' : '');
   const bloqueado = !puedoHablar() && !micOn;
   bm.disabled = !!S.audio.retirando;
   bm.title = bloqueado
     ? 'Micrófono deshabilitado: pulsa para pedir la palabra'
+    : modoPtt()
+    ? (S.ptt.modo === 'hold'
+      ? 'Mantén pisado para hablar — si hay alguien hablando lo interrumpes cuando cumpla su tiempo'
+      : 'Toca para hablar / toca para soltar el piso')
     : tengoPalabra()
     ? 'Con la palabra el micro no se puede silenciar — déjala primero'
+    : pisoOcupado
+    ? `Hablando: ${S.estado.pisoNombre || S.estado.piso} — tu voz le interrumpe pasado tu tiempo`
     : 'Micrófono';
+
+  // chip del piso: quién está hablando ahora y cuánto falta para poder
+  // interrumpirlo según el menor de mis tiempos por rol
+  const chipPiso = $('#st-piso');
+  if (chipPiso) {
+    if (S.estado && S.estado.piso) {
+      chipPiso.classList.remove('oculto');
+      const soyYo = S.estado.piso === S.identidad;
+      let t = soyYo ? 'TÚ' : (S.estado.pisoNombre || S.estado.piso);
+      if (!soyYo && S.estado.pisoDesde) {
+        const falta = Math.max(0, miTiempoPiso() - Math.floor((Date.now() - S.estado.pisoDesde) / 1000));
+        if (falta > 0) t += ' · ⏳' + falta + 's';
+      }
+      $('#st-piso-n').textContent = t;
+      chipPiso.classList.toggle('rec', soyYo);
+    } else {
+      chipPiso.classList.add('oculto');
+    }
+  }
 
   $('#ctl-cam').className = 'btn ctl ' + (camOn ? 'on' : '');
   $('#ctl-pantalla').className = 'btn ctl ' + (scrOn ? 'on' : '');
@@ -3160,8 +3240,18 @@ function renderControles() {
 }
 
 function cablearControles() {
-  $('#ctl-mic').onclick = () => {
+  // Botón del micro según el modo de habla elegido:
+  //  - auto: comportamiento clásico (activar/silenciar, piso implícito)
+  //  - hold: PTT puro — mantener pisado para hablar, soltar para cerrar
+  //  - lock: un toque toma el piso, otro toque lo suelta
+  const bmPtt = $('#ctl-mic');
+  bmPtt.onclick = () => {
     if (S.audio.retirando) return;
+    if (S.ptt.modo === 'hold') return; // usa pointerdown/up
+    if (S.ptt.modo === 'lock') {
+      if (S.ptt.quiero) pttOff(); else pttOn();
+      return;
+    }
     const p = S.room.localParticipant.getTrackPublication(LC.Track.Source.Microphone);
     const on = p && !p.isMuted;
     if (!on && !puedoHablar()) {
@@ -3185,6 +3275,60 @@ function cablearControles() {
       return;
     }
     activarMic(!on);
+  };
+  // PTT "mantener pisado": eventos de puntero, no clic — funciona con dedo,
+  // ratón o lápiz sin arrastrar ni seleccionar
+  if (!bmPtt._pttWired) {
+    bmPtt._pttWired = true;
+    bmPtt.addEventListener('pointerdown', (e) => {
+      if (S.ptt.modo !== 'hold' || S.audio.retirando) return;
+      e.preventDefault();
+      pttOn();
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
+      bmPtt.addEventListener(ev, () => {
+        if (S.ptt.modo === 'hold' && S.ptt.quiero) pttOff();
+      }));
+  }
+  // cambio de modo de habla desde el menú del micro
+  const selModo = $('#mic-modo');
+  if (selModo) {
+    selModo.value = S.ptt.modo;
+    selModo.onchange = () => {
+      S.ptt.modo = selModo.value;
+      localStorage.setItem('lk_ptt_modo', S.ptt.modo);
+      $('#mic-pop').classList.add('oculto');
+      if (S.ptt.modo === 'auto' && S.ptt.quiero) pttOff();
+      else if (modoPtt() && puedoHablar()) prepararMicPtt();
+      toast(S.ptt.modo === 'auto' ? 'Micrófono libre' :
+        S.ptt.modo === 'hold' ? 'PTT: mantén pisado el micrófono para hablar' :
+        'PTT: toca el micrófono para hablar y tócalo otra vez para soltar');
+      renderControles();
+    };
+  }
+  // chips de piso y de retraso de audio
+  const chipRetraso = $('#st-retraso');
+  if (chipRetraso) chipRetraso.onclick = () => {
+    if (S.room && S.room.saltarAlPresente) S.room.saltarAlPresente();
+    toast('Te pusiste al día con el audio en vivo');
+  };
+  const chipPiso = $('#st-piso');
+  if (chipPiso) chipPiso.onclick = () => {
+    const e = S.estado;
+    if (!e || !e.piso) return;
+    const yo = e.piso === S.identidad;
+    toast(yo ? 'Tienes el piso: estás hablando' :
+      `Habla ${e.pisoNombre || e.piso} — puedes interrumpir cuando cumpla ${miTiempoPiso()} s`, 4500);
+  };
+  // panel de moderación: tiempos de interrupción del piso por rol
+  const pisoGuardar = $('#piso-guardar');
+  if (pisoGuardar) pisoGuardar.onclick = () => {
+    const v = (id, def) => Math.max(0, Math.min(3600, (+$(id).value || def)));
+    moderar('piso_cfg', {
+      extra: [v('#piso-admin', 0), v('#piso-anfitrion', 0),
+              v('#piso-palabra', 10), v('#piso-usuario', 60)].join(','),
+    }).then(() => toast('Tiempos de interrupción guardados'))
+      .catch(e => toast(e.message));
   };
   $('#ctl-cam').onclick = async () => {
     const p = S.room.localParticipant.getTrackPublication(LC.Track.Source.Camera);
@@ -3517,6 +3661,25 @@ function cablearAjustes() {
     localStorage.setItem('lk_audio_pref', S.prefAudio);
     try { actualizarCalidadAudioEnVivo(); } catch (x) { toast(x.message); }
   };
+  // historial de voz: auto-salto al presente, tope de almacenamiento, vaciar
+  if ($('#aj-presente')) $('#aj-presente').onchange = (e) => {
+    S.autoPresente = e.target.checked;
+    localStorage.setItem('lk_auto_presente', S.autoPresente ? '1' : '0');
+    if (S.room && S.room.setAutoPresente) S.room.setAutoPresente(S.autoPresente);
+  };
+  if ($('#aj-hist-mb')) $('#aj-hist-mb').onchange = (e) => {
+    S.segCapMB = Math.max(10, Math.min(2000, +e.target.value || 100));
+    e.target.value = S.segCapMB;
+    localStorage.setItem('lk_seg_mb', String(S.segCapMB));
+    idbEvict().catch(() => {});
+  };
+  if ($('#aj-hist-vaciar')) $('#aj-hist-vaciar').onclick = () =>
+    confirmar('¿Vaciar el historial de notas de voz guardado en este equipo?', async () => {
+      await idbVaciar();
+      S._nvEls.forEach(el => el.remove());
+      S._nvEls.clear(); S._nvSeqs = []; S._nvRepro = 0;
+      toast('Historial de voz vaciado');
+    });
 }
 
 // Cambiar de cámara en caliente: setCameraEnabled(true) sobre un track ya
@@ -3545,6 +3708,8 @@ async function poblarSelectsAjustes() {
   $('#aj-ec').checked = S.audio.ec;
   $('#aj-agc').checked = S.audio.agc;
   $('#aj-calidad').value = S.prefAudio || 'auto';
+  if ($('#aj-presente')) $('#aj-presente').checked = S.autoPresente;
+  if ($('#aj-hist-mb')) $('#aj-hist-mb').value = S.segCapMB;
   await llenarDisp($('#aj-cam'), 'videoinput', S.dev.cam);
   await llenarDisp($('#aj-mic'), 'audioinput', S.dev.mic);
   await llenarDisp($('#aj-spk'), 'audiooutput', S.dev.spk);
@@ -3790,6 +3955,10 @@ async function activarMic(on) {
       // pipeline (al entrar con setMicrophoneEnabled) y también hay que soltarlo.
       await retirarMic();
       S.audio.liberar = true;
+      // apagar el micro también suelta el piso y la intención PTT
+      S.ptt.quiero = false;
+      S.ptt.tengo = false;
+      if (S.room && S.room.soltarPiso) S.room.soltarPiso();
     }
     renderControles();
   } catch (e) {
@@ -3884,6 +4053,224 @@ function agregarChat(quien, texto, propio) {
   lista.appendChild(el);
   while (lista.children.length > 200) lista.firstChild.remove();
   lista.scrollTop = lista.scrollHeight;
+}
+
+/* ---------- notas de voz (historial de audio en el chat) ---------- */
+const fmtDurSeg = (ms) => {
+  const s = Math.max(1, Math.round((ms || 0) / 1000));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+};
+
+// Cada frase cerrada queda como nota de voz en el historial del chat:
+// reproducible, con indicador de sonando/escuchada
+function agregarNotaVoz(meta) {
+  if (!meta || meta.seq <= 0 || S._nvEls.has(meta.seq)) return;
+  const lista = $('#chat-lista');
+  const el = document.createElement('div');
+  el.className = 'msg nota-voz';
+  const hora = meta.inicio ? new Date(meta.inicio).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  el.innerHTML = `<div class="quien">🎙️ ${esc(meta.nombre || meta.de)}${hora ? ` · <span class="muted">${hora}</span>` : ''}${meta.interrumpida ? ' <span class="muted">(interrumpida)</span>' : ''}</div>` +
+    `<button class="nv-play btn mini" data-seq="${meta.seq}">▶ ${fmtDurSeg(meta.durMs)}</button>`;
+  lista.appendChild(el);
+  while (lista.children.length > 200) {
+    const viejo = lista.firstChild;
+    if (viejo && viejo.classList.contains('nota-voz')) {
+      const seq = +(viejo.querySelector('.nv-play')?.dataset.seq || 0);
+      if (seq) { S._nvEls.delete(seq); const i = S._nvSeqs.indexOf(seq); if (i >= 0) S._nvSeqs.splice(i, 1); }
+    }
+    viejo.remove();
+  }
+  lista.scrollTop = lista.scrollHeight;
+  S._nvEls.set(meta.seq, el);
+  S._nvSeqs.push(meta.seq);
+  S._nvSeqs.sort((a, b) => a - b);
+  el.querySelector('.nv-play').onclick = () => reproducirNota(meta.seq);
+}
+
+function marcarNotaVoz(seq, est) {
+  const el = S._nvEls.get(seq);
+  if (!el) return;
+  const b = el.querySelector('.nv-play');
+  if (!b) return;
+  if (est === 'sonando') { b.classList.add('sonando'); b.classList.remove('oido'); }
+  if (est === 'oido') { b.classList.add('oido'); b.classList.remove('sonando'); }
+  if (est === 'perdida') { b.disabled = true; b.textContent = '⚠️ no recuperada'; }
+}
+
+// Re-escuchar una nota: primero en la RAM del motor; si ya se limpió, en el
+// historial local (IndexedDB); por último en el servidor (retención 1 h)
+async function reproducirNota(seq) {
+  if (!S.room) return;
+  S._nvRepro = seq;
+  marcarNotaVoz(seq, 'sonando');
+  if (S.room.reproducirSeg && S.room.reproducirSeg(seq)) return;
+  try {
+    const rec = await idbCargarSeg(seq);
+    if (rec && rec.raw && rec.raw.length) {
+      await S.room.reproducirRaw(rec.raw, seq);
+      return;
+    }
+  } catch {}
+  try {
+    const r = await fetch(`/api/salas/${S.sala}/audio/${seq}`,
+      { headers: { Authorization: 'Bearer ' + S.token } });
+    if (r.ok) {
+      await S.room.reproducirArchivo(await r.arrayBuffer(), seq);
+      return;
+    }
+  } catch {}
+  marcarNotaVoz(seq, 'perdida');
+  toast('Esa nota de voz ya no está disponible (el servidor la guarda 1 hora)');
+}
+
+// Al terminar de re-escuchar una nota, sigue con la siguiente del historial
+function reproducirSiguienteNota(seq) {
+  const el = S._nvEls.get(seq);
+  if (el) { const b = el.querySelector('.nv-play'); if (b) b.classList.remove('sonando'); }
+  if (S._nvRepro !== seq) return;
+  const i = S._nvSeqs.indexOf(seq);
+  if (i >= 0 && i + 1 < S._nvSeqs.length) reproducirNota(S._nvSeqs[i + 1]);
+  else S._nvRepro = 0;
+}
+
+// Chip "vas con retraso": indica cuánto audio falta por escuchar respecto
+// al presente y permite saltar directo al audio en vivo
+function renderRetraso(ms) {
+  const chip = $('#st-retraso');
+  if (!chip) return;
+  if (ms > 1500) {
+    chip.classList.remove('oculto');
+    $('#st-retraso-n').textContent = '+' + Math.round(ms / 1000) + ' s';
+  } else {
+    chip.classList.add('oculto');
+  }
+}
+
+/* ---------- historial local de voz (IndexedDB) ---------- */
+let _idbP = null;
+function idbAbrir() {
+  if (_idbP) return _idbP;
+  _idbP = new Promise((res, rej) => {
+    const r = indexedDB.open('conferencia-notas-voz', 1);
+    r.onupgradeneeded = () => {
+      const os = r.result.createObjectStore('segs', { keyPath: 'k' });
+      os.createIndex('sala', 'sala');
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  _idbP.then(db => idbMigrarLegado(db)).catch(() => {});
+  return _idbP;
+}
+
+// Migra el historial que haya quedado guardado bajo el nombre antiguo de la
+// base de datos, si existe, y luego la elimina.
+async function idbMigrarLegado(db) {
+  try {
+    const viejo = 'mumble-notas-voz';
+    if (indexedDB.databases) {
+      const dbs = await indexedDB.databases();
+      if (!dbs.some(d => d.name === viejo)) return;
+    }
+    const dbV = await new Promise((res, rej) => {
+      const r = indexedDB.open(viejo, 1);
+      r.onsuccess = () => res(r.result);
+      r.onerror = r.onupgradeneeded = () => rej(r.error);
+    });
+    const recs = await new Promise((res, rej) => {
+      const rq = dbV.transaction('segs', 'readonly').objectStore('segs').getAll();
+      rq.onsuccess = () => res(rq.result || []);
+      rq.onerror = () => rej(rq.error);
+    });
+    dbV.close();
+    if (recs.length) {
+      await new Promise((res, rej) => {
+        const tx = db.transaction('segs', 'readwrite');
+        const os = tx.objectStore('segs');
+        recs.forEach(rec => os.put(rec));
+        tx.oncomplete = res;
+        tx.onerror = () => rej(tx.error);
+      });
+    }
+    indexedDB.deleteDatabase(viejo);
+  } catch {}
+}
+
+async function idbGuardarSeg(seq) {
+  if (!S.room || typeof S.room.datosSeg !== 'function') return;
+  const d = S.room.datosSeg(seq);
+  if (!d || !d.raw || !d.raw.length) return;
+  try {
+    const raw = d.raw.map(u => u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
+    const rec = {
+      k: S.sala + '|' + seq, sala: S.sala, seq,
+      de: d.de, nombre: d.nombre, durMs: d.durMs,
+      inicio: d.inicio || Date.now(), interrumpida: !!d.interrumpida,
+      bytes: d.raw.reduce((a, u) => a + u.length, 0), raw,
+    };
+    const db = await idbAbrir();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('segs', 'readwrite');
+      tx.objectStore('segs').put(rec);
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+    idbEvict().catch(() => {});
+  } catch {}
+}
+
+async function idbCargarSeg(seq) {
+  const db = await idbAbrir();
+  return new Promise((res, rej) => {
+    const rq = db.transaction('segs').objectStore('segs').get(S.sala + '|' + seq);
+    rq.onsuccess = () => res(rq.result || null);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+
+async function idbListarSala() {
+  try {
+    const db = await idbAbrir();
+    const recs = await new Promise((res, rej) => {
+      const rq = db.transaction('segs').objectStore('segs').index('sala').getAll(S.sala);
+      rq.onsuccess = () => res(rq.result || []);
+      rq.onerror = () => rej(rq.error);
+    });
+    return recs.sort((a, b) => a.seq - b.seq);
+  } catch { return []; }
+}
+
+// Evicción FIFO: borra las notas más viejas hasta caber bajo el tope
+async function idbEvict() {
+  const recs = await idbListarSala();
+  const cap = Math.max(10, S.segCapMB) * 1048576;
+  let total = recs.reduce((a, r) => a + (r.bytes || 0), 0);
+  if (total <= cap) return;
+  const db = await idbAbrir();
+  const tx = db.transaction('segs', 'readwrite');
+  const os = tx.objectStore('segs');
+  for (const r of recs) {
+    if (total <= cap) break;
+    os.delete(r.k);
+    total -= r.bytes || 0;
+  }
+}
+
+async function idbVaciar() {
+  const recs = await idbListarSala();
+  const db = await idbAbrir();
+  await new Promise((res, rej) => {
+    const tx = db.transaction('segs', 'readwrite');
+    const os = tx.objectStore('segs');
+    for (const r of recs) os.delete(r.k);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+
+// Al entrar a la sala: el historial de notas vuelve a verse en el chat
+async function precargarNotasVoz() {
+  const recs = await idbListarSala();
+  for (const r of recs.slice(-80)) agregarNotaVoz(r);
 }
 
 // chat: "leído" = panel abierto en la pestaña Chat. Si está cerrado, los
