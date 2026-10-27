@@ -1122,6 +1122,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         let autoPre = null; // pre-roll guardado esperando el piso
         const tramaMuda = new Float32Array(1920); // colchón de silencio al abrir frase
         let autoPreTs = 0;
+        let vozSeg = 0; // tramas seguidas sobre el umbral (debounce de ataque)
 
         const procesarBloqueEntrada = (rawIn) => {
           // Muteado o sin room: cierra la frase. Sin socket NO se cierra: las
@@ -1166,8 +1167,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               if (!hablandoActivo && rms < noiseFloor * 1.5) {
                 noiseFloor = Math.max(0.0008, Math.min(0.0032, noiseFloor * 0.95 + rms * 0.05));
               }
-              const umbralAbrir = Math.max(0.0032, noiseFloor * 2.0);
+              const sens = (window.S && S.ptt && S.ptt.sens) || 2.0;
+              const umbralAbrir = Math.max(0.0032, noiseFloor * sens);
               const umbralMantener = Math.max(0.0014, noiseFloor * 1.15);
+              // ataque: N tramas seguidas de voz antes de activar (evita que
+              // un golpe o ruido ambiente aislado "pise el botón" en auto)
+              const ataqueN = Math.max(1, Math.round(((window.S && S.ptt && S.ptt.ataque) || 0.12) / 0.04));
+              if (rms >= umbralAbrir) vozSeg++; else vozSeg = 0;
+              const vozOk = rms >= (hablandoActivo ? umbralMantener : umbralAbrir)
+                && (hablandoActivo || vozSeg >= ataqueN);
 
               // En modo PTT el botón manda, no el VAD: mientras se tenga el
               // piso se transmite TODO (una pulsación = una nota de voz
@@ -1195,8 +1203,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   enviarMarcadorEOS();
                   this._room._marcarHablandoLocal(false);
                 }
-              } else if (rms >= (hablandoActivo ? umbralMantener : umbralAbrir)
-                         || (window.S && S.ptt && S.ptt.quiero)) {
+              } else if (vozOk || (window.S && S.ptt && S.ptt.quiero)) {
                 // Modo automático: la voz pisa el botón. El micro escucha en
                 // local SIEMPRE, pero al servidor solo se transmite cuando el
                 // piso ya es mío (S.ptt.tengo): sin piso no se gasta subida.
@@ -1211,8 +1218,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   // piso para conservar el ataque de la primera sílaba
                   autoPre = tienePrevFrame ? new Float32Array(prevFrame48k) : null;
                 }
-                // Cola de silencio configurable ("Soltar tras N s de silencio")
-                silencioCola = Math.max(8, Math.round(((window.S && S.ptt && S.ptt.silencio) || 2.2) / 0.04));
+                // Cola de silencio configurable ("Soltar tras N s", tope 5 s)
+                const silSeg = Math.min(5, (window.S && S.ptt && S.ptt.silencio) || 2.2);
+                silencioCola = Math.max(8, Math.round(silSeg / 0.04));
                 this._room._marcarHablandoLocal(true);
                 if (tengo) {
                   if (autoPre) {

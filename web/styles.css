@@ -138,6 +138,30 @@ label.check input { width: auto; }
 }
 @keyframes pttBorde { 50% { border-color: var(--peligro); } }
 
+/* Gestos del pulsador (estilo nota de voz): al mantener pisado aparecen
+   🔒 arriba (arrastra hasta él para bloquear) y A a la izquierda
+   (automático). Se encienden al acercarse el dedo */
+#ptt-gestos { position: fixed; z-index: 60; pointer-events: none; }
+#ptt-gestos span {
+  position: absolute; display: grid; place-items: center;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: rgba(0,0,0,.72); border: 2px solid var(--borde);
+  font-size: 1.05rem; opacity: .5; transform: scale(.85);
+  transition: transform .12s, opacity .12s, border-color .12s;
+}
+#ptt-gestos .pg-lock { left: -20px; top: -78px; }
+#ptt-gestos .pg-auto { left: -78px; top: -20px; font-weight: 700; }
+#ptt-gestos span.ready {
+  opacity: 1; transform: scale(1.25);
+  border-color: var(--ambar); box-shadow: 0 0 14px rgba(255,196,0,.55);
+}
+/* botón con el candado puesto: sigue hablando sin mantener el dedo */
+.ptt-sup { position: relative; }
+.ptt-sup.ptt-bloqueado::after {
+  content: '🔒'; position: absolute; top: -8px; right: -8px; z-index: 6;
+  font-size: .85rem; filter: drop-shadow(0 1px 2px rgba(0,0,0,.7));
+}
+
 /* Selección de mensajes del chat: marcar para borrar o exportar audios */
 #chat-sel.tab { flex: 0 0 auto; }
 #chat-sel.tab.on { background: var(--acento); color: #fff; }

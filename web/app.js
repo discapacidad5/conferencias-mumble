@@ -35,7 +35,13 @@ const S = {
   // PTT / piso exclusivo: modo 'auto' (micro libre), 'hold' (mantener
   // pisado) o 'lock' (tocar para bloquear/soltar). quiero = dedo/intención
   // pisada; tengo = el servidor confirmó el piso
-  ptt: { modo: localStorage.getItem('lk_ptt_modo') || 'hold', quiero: false, tengo: false, desde: 0, silencio: +(localStorage.getItem('lk_ptt_silencio')) || 2.2 },
+  ptt: {
+    modo: localStorage.getItem('lk_ptt_modo') || 'hold',
+    quiero: false, tengo: false, desde: 0, _bloqueado: false, _gesto: null,
+    silencio: Math.min(5, +(localStorage.getItem('lk_ptt_silencio')) || 2.2),
+    sens: +(localStorage.getItem('lk_ptt_sens')) || 2.0,
+    ataque: +(localStorage.getItem('lk_ptt_ataque')) || 0.12,
+  },
   pisoCfg: null, pisoFaltan: 0,
   // historial local de notas de voz (IndexedDB): tope en MB y auto-salto
   segCapMB: +(localStorage.getItem('lk_seg_mb') || 100),
@@ -1609,6 +1615,8 @@ async function pttOff(inmediato) {
   if (tengoPalabra() && !inmediato) return;
   S.ptt.quiero = false;
   S.ptt.tengo = false;
+  S.ptt._bloqueado = false;
+  ocultarGestosPtt();
   if (S.room) S.room.soltarPiso();
   const resta = S.ptt.desde ? Math.max(0, 900 - (Date.now() - S.ptt.desde)) : 0;
   S.ptt.desde = 0;
@@ -1639,16 +1647,59 @@ function wirePttButton(el, gate) {
     if (S.audio.retirando || S.ptt.modo === 'lock' || !libre()) return;
     e.preventDefault();
     e.stopPropagation();
+    // si quedó bloqueado, un toque lo desbloquea y suelta
+    if (S.ptt._bloqueado) { S.ptt._bloqueado = false; pttOff(); return; }
     pttOn();
+    // gesto estilo nota de voz: arrastrar ARRIBA = candado (queda hablando),
+    // arrastrar a la IZQUIERDA = activar/desactivar el modo automático
+    S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, lock: false, auto: false };
+    mostrarGestosPtt(el);
+  });
+  el.addEventListener('pointermove', (e) => {
+    const g = S.ptt._gesto;
+    if (!g || g.el !== el || !S.ptt.quiero || S.ptt._bloqueado) return;
+    g.lock = (g.y0 - e.clientY) > 56;          // arrastre hacia arriba
+    g.auto = (g.x0 - e.clientX) > 56 && !g.lock; // arrastre hacia la izquierda
+    marcarGestosPtt(g);
   });
   ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
     el.addEventListener(ev, (e) => {
-      if (S.ptt.modo !== 'lock' && S.ptt.quiero) {
+      const g = S.ptt._gesto;
+      ocultarGestosPtt();
+      if (g && g.el === el && S.ptt.quiero) {
+        S.ptt._gesto = null;
+        if (g.lock) {
+          // candado: sigue hablando sin mantener el dedo; un toque suelta
+          S.ptt._bloqueado = true;
+          e.stopPropagation();
+          toast('🔒 Bloqueado — toca el botón de nuevo para soltar');
+          renderControles();
+          return;
+        }
+        if (g.auto) {
+          // modo automático al vuelo: al entrar la frase actual la cierra
+          // el VAD cuando calles; al salir se suelta como una pulsación
+          S.ptt._gesto = null;
+          e.stopPropagation();
+          const aAuto = S.ptt.modo !== 'auto';
+          if (aAuto) S.ptt.quiero = false;
+          cambiarModoPtt(aAuto ? 'auto' : 'hold');
+          return;
+        }
+        S.ptt._gesto = null;
+      }
+      if (S.ptt.modo !== 'lock' && S.ptt.quiero && !S.ptt._bloqueado) {
         e.stopPropagation();
         pttOff();
       }
     }));
   el.addEventListener('click', (e) => {
+    if (S.ptt._bloqueado) {
+      S.ptt._bloqueado = false;
+      e.preventDefault(); e.stopPropagation();
+      pttOff();
+      return;
+    }
     // el click que sigue a soltar en "hold" no debe activar menús ajenos
     if (S.ptt.modo === 'hold') { e.preventDefault(); e.stopPropagation(); return; }
     if (S.audio.retirando || !libre()) return;
@@ -1656,6 +1707,28 @@ function wirePttButton(el, gate) {
     e.stopPropagation();
     if (S.ptt.quiero) pttOff(); else pttOn();
   });
+}
+
+// Indicadores flotantes del gesto: 🔒 arriba del botón, A a la izquierda
+function mostrarGestosPtt(el) {
+  const g = $('#ptt-gestos');
+  if (!g) return;
+  const r = el.getBoundingClientRect();
+  g.style.left = (r.left + r.width / 2) + 'px';
+  g.style.top = (r.top + r.height / 2) + 'px';
+  g.querySelector('.pg-lock').classList.remove('ready');
+  g.querySelector('.pg-auto').classList.remove('ready');
+  g.classList.remove('oculto');
+}
+function marcarGestosPtt(g) {
+  const ge = $('#ptt-gestos');
+  if (!ge) return;
+  ge.querySelector('.pg-lock').classList.toggle('ready', g.lock);
+  ge.querySelector('.pg-auto').classList.toggle('ready', g.auto);
+}
+function ocultarGestosPtt() {
+  const g = $('#ptt-gestos');
+  if (g) g.classList.add('oculto');
 }
 
 // Color compartido de todos los pulsadores PTT:
@@ -1677,7 +1750,8 @@ function renderPttEstados() {
   $$('.ptt-sup').forEach(el => {
     el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso', 'ptt-conectando');
     el.classList.add('ptt-' + st);
-    el.title = tit;
+    el.classList.toggle('ptt-bloqueado', !!S.ptt._bloqueado);
+    el.title = S.ptt._bloqueado ? 'Bloqueado: toca para soltar' : tit;
   });
   const me = $('#mic-estado');
   if (me) me.textContent = st === 'hablando' ? 'Estás hablando'
@@ -3483,7 +3557,7 @@ function cambiarModoPtt(modo) {
   const sm = $('#mic-modo'), sp = $('#aj-ptt');
   if (sm) sm.value = modo;
   if (sp) sp.value = modo;
-  const silWrap = $('#mic-silencio-wrap'), silAj = $('#aj-ptt-sil-wrap');
+  const silWrap = $('#mic-silencio-wrap'), silAj = $('#aj-auto-cfg');
   if (silWrap) silWrap.classList.toggle('oculto', modo !== 'auto');
   if (silAj) silAj.classList.toggle('oculto', modo !== 'auto');
   if (modo === 'auto') {
@@ -3511,8 +3585,10 @@ function cablearControles() {
       silWrap.classList.toggle('oculto', S.ptt.modo !== 'auto');
       silIn.value = S.ptt.silencio;
       silIn.onchange = () => {
-        S.ptt.silencio = Math.max(0.5, Math.min(10, +silIn.value || 2.2));
+        S.ptt.silencio = Math.max(0.5, Math.min(5, +silIn.value || 2.2));
+        silIn.value = S.ptt.silencio;
         localStorage.setItem('lk_ptt_silencio', String(S.ptt.silencio));
+        const sa = $('#aj-ptt-sil'); if (sa) sa.value = S.ptt.silencio;
       };
     }
     selModo.onchange = () => {
@@ -3922,10 +3998,22 @@ function cablearAjustes() {
   // modo de hablar (mismo selector que el menú "Micro ▾")
   if ($('#aj-ptt')) $('#aj-ptt').onchange = (e) => cambiarModoPtt(e.target.value);
   if ($('#aj-ptt-sil')) $('#aj-ptt-sil').onchange = (e) => {
-    S.ptt.silencio = Math.max(0.5, Math.min(10, +e.target.value || 2.2));
+    S.ptt.silencio = Math.max(0.5, Math.min(5, +e.target.value || 2.2));
     e.target.value = S.ptt.silencio;
     localStorage.setItem('lk_ptt_silencio', String(S.ptt.silencio));
     const sil = $('#mic-silencio'); if (sil) sil.value = S.ptt.silencio;
+  };
+  // automático: sensibilidad de voz (cuánto por encima del ruido ambiente
+  // hay que hablar para que el VAD "pise el botón") y debounce de ataque
+  if ($('#aj-sens')) $('#aj-sens').oninput = (e) => {
+    S.ptt.sens = +e.target.value;
+    $('#aj-sens-val').textContent = '×' + S.ptt.sens.toFixed(1);
+    localStorage.setItem('lk_ptt_sens', String(S.ptt.sens));
+  };
+  if ($('#aj-ataque')) $('#aj-ataque').oninput = (e) => {
+    S.ptt.ataque = +e.target.value;
+    $('#aj-ataque-val').textContent = Math.round(S.ptt.ataque * 1000) + ' ms';
+    localStorage.setItem('lk_ptt_ataque', String(S.ptt.ataque));
   };
   // historial de voz: auto-salto al presente, tope de almacenamiento, vaciar
   if ($('#aj-presente')) $('#aj-presente').onchange = (e) => {
@@ -3978,7 +4066,15 @@ async function poblarSelectsAjustes() {
   if ($('#aj-hist-mb')) $('#aj-hist-mb').value = S.segCapMB;
   if ($('#aj-ptt')) $('#aj-ptt').value = S.ptt.modo;
   if ($('#aj-ptt-sil')) $('#aj-ptt-sil').value = S.ptt.silencio;
-  if ($('#aj-ptt-sil-wrap')) $('#aj-ptt-sil-wrap').classList.toggle('oculto', S.ptt.modo !== 'auto');
+  if ($('#aj-auto-cfg')) $('#aj-auto-cfg').classList.toggle('oculto', S.ptt.modo !== 'auto');
+  if ($('#aj-sens')) {
+    $('#aj-sens').value = S.ptt.sens;
+    $('#aj-sens-val').textContent = '×' + (+S.ptt.sens).toFixed(1);
+  }
+  if ($('#aj-ataque')) {
+    $('#aj-ataque').value = S.ptt.ataque;
+    $('#aj-ataque-val').textContent = Math.round(S.ptt.ataque * 1000) + ' ms';
+  }
   await llenarDisp($('#aj-cam'), 'videoinput', S.dev.cam);
   await llenarDisp($('#aj-mic'), 'audioinput', S.dev.mic);
   await llenarDisp($('#aj-spk'), 'audiooutput', S.dev.spk);

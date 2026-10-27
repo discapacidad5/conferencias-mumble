@@ -12,8 +12,8 @@
 <meta name="apple-mobile-web-app-title" content="Conferencia">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
-<link rel="stylesheet" href="/styles.css?v=122">
-<script src="/conferencia-engine.js?v=122"></script>
+<link rel="stylesheet" href="/styles.css?v=123">
+<script src="/conferencia-engine.js?v=123"></script>
 </head>
 <body>
 
@@ -305,6 +305,8 @@
     <input type="range" id="panel-opacidad" min="35" max="100" value="100">
   </div>
 
+  <!-- gestos del pulsador PTT: 🔒 arriba = bloquear, A a la izquierda = automático -->
+  <div id="ptt-gestos" class="oculto"><span class="pg-auto" title="Modo automático">A</span><span class="pg-lock">🔒</span></div>
   <div id="flotantes"></div>
   <div id="hablas-aviso" class="oculto"><span id="hablas-txt"></span></div>
   <div id="reacciones-panel" class="oculto">
@@ -333,7 +335,7 @@
             <option value="auto">Automático: la voz pisa el botón por ti</option>
           </select>
           <label id="mic-silencio-wrap" class="muted oculto">Soltar tras
-            <input id="mic-silencio" type="number" min="0.5" max="10" step="0.5" value="2.2" style="width:56px"> s de silencio</label>
+            <input id="mic-silencio" type="number" min="0.5" max="5" step="0.5" value="2.2" style="width:56px"> s de silencio</label>
           <button id="mic-mas" class="btn mini" type="button">Más ajustes…</button>
         </div>
       </span>
@@ -480,8 +482,14 @@
         <option value="auto">Automático: la voz pisa el botón por ti</option>
       </select>
     </label>
-    <label id="aj-ptt-sil-wrap" class="muted oculto">En automático, soltar tras
-      <input id="aj-ptt-sil" type="number" min="0.5" max="10" step="0.5" value="2.2" style="width:56px"> s de silencio</label>
+    <div id="aj-auto-cfg" class="oculto">
+      <label class="muted">En automático, soltar tras
+        <input id="aj-ptt-sil" type="number" min="0.5" max="5" step="0.5" value="2.2" style="width:56px"> s de silencio</label>
+      <label class="muted">Sensibilidad de voz <span id="aj-sens-val"></span>
+        <input type="range" id="aj-sens" min="0.8" max="6" step="0.2" value="2"></label>
+      <label class="muted">Voz continua para activar <span id="aj-ataque-val"></span>
+        <input type="range" id="aj-ataque" min="0" max="1" step="0.04" value="0.12"></label>
+    </div>
     <label class="check"><input type="checkbox" id="aj-ns" checked> Supresión de ruido</label>
     <label class="check"><input type="checkbox" id="aj-ec" checked> Cancelación de eco</label>
     <label class="check"><input type="checkbox" id="aj-agc" checked> Control automático de ganancia</label>
@@ -525,6 +533,6 @@
   <button id="nav-tip-x" class="btn mini" aria-label="Cerrar">✕</button>
 </div>
 <div id="toast-wrap"></div>
-<script src="/app.js?v=122"></script>
+<script src="/app.js?v=123"></script>
 </body>
 </html>
