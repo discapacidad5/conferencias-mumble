@@ -1817,7 +1817,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           bloques: [], vistos: new Set(), ultTx: -1, huecos: false,
           alimentado: 0, bajando: false, descargado: false, perdido: false,
           saltado: false, reproducido: false, finAvisado: false, bajaDesde: 0,
-          _repT: null, raw: [], rawBytes: 0,
+          _repT: null, raw: [], rawBytes: 0, ultRxT: performance.now(),
         };
         this._vozSegs.set(seq, seg);
         let i = this._vozOrden.length;
@@ -1826,7 +1826,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       } else {
         if (de && !seg.de) seg.de = de;
         if (nombre) seg.nombre = nombre;
-        if (!abierto) seg.completo = true;
+        // el servidor la da por cerrada: también el borde local, o la frase
+        // queda abierta bloqueando la cabeza de la cola en vivo para siempre
+        if (!abierto) { seg.completo = true; seg.finLocal = true; }
         if (meta && meta.durMs) seg.durMs = meta.durMs;
         if (meta && (meta.interrumpida || meta.cortado)) seg.interrumpida = true;
         if (meta && meta.inicio) seg.inicio = meta.inicio;
@@ -1865,6 +1867,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     // Inserta un bloque decodificado en el segmento, ordenado por txSeq
     // (los huecos reparados se insertan en su posición correcta)
     _insertarBloque(seg, bl) {
+      seg.ultRxT = performance.now(); // watchdog de frase abierta
       if (typeof bl.tx !== 'number' || bl.tx < 0) {
         seg.bloques.push(bl);
         return;
@@ -2178,7 +2181,16 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
       // 5. Liberar memoria de segmentos ya escuchados hace >10 min
       const viejo = Date.now() - 600000;
+      const ahoraPerf = performance.now();
       for (const s of this._vozOrden) {
+        // Frase abierta sin tramas hace >4 s: su EOS/seg_fin se perdió (el
+        // servidor ya la cerró por inactividad a ~1,6 s). Cerrarla en local
+        // — si no, queda en la cabeza y mata TODO el audio en vivo detrás
+        if (!s.saltado && !s.reproducido && !s.completo && !s.finLocal &&
+            ahoraPerf - (s.ultRxT || 0) > 4000) {
+          s.finLocal = true;
+          if (this._segPorHablante.get(s.de) === s.seq) this._segPorHablante.delete(s.de);
+        }
         if ((s.reproducido || s.saltado) && s.inicio < viejo && s.bloques.length) {
           s.bloques = [];
           s.vistos.clear();
@@ -2285,21 +2297,39 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (!sala) return;
       const g = (window.S && window.S.grupoActual) || 0;
       try {
+        // ventana con solape: no solo lo nuevo — también repara frases
+        // abiertas en local cuyo seg_fin se perdió durante el corte
         const r = await fetch(
-          `/api/salas/${encodeURIComponent(sala)}/audio?desde=${this._ultimoSeg + 1}&g=${g}`,
+          `/api/salas/${encodeURIComponent(sala)}/audio?desde=${Math.max(0, this._ultimoSeg - 40)}&g=${g}`,
           { headers: { Authorization: 'Bearer ' + ((window.S && window.S.token) || '') } });
         if (!r.ok) return;
         const man = await r.json();
+        const vivos = new Set(); // seq que el servidor conoce (cerradas o abiertas)
         for (const meta of man.segmentos || []) {
+          vivos.add(meta.seq);
           const seg = this._vozSegs.get(meta.seq);
           if (seg && (seg.descargado || seg.reproducido)) continue;
           this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
           // mis propias frases no se descargan: no se escuchan a uno mismo
           if (meta.de !== this.localParticipant.identity) this._bajarSeg(meta.seq);
         }
-        if (man.abierto && !this._vozSegs.get(man.abierto.seq)) {
-          this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
-          this._bajarSeg(man.abierto.seq);
+        if (man.abierto) {
+          vivos.add(man.abierto.seq);
+          if (!this._vozSegs.get(man.abierto.seq)) {
+            this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
+            this._bajarSeg(man.abierto.seq);
+          }
+        }
+        // frases abiertas en local que el servidor ya no tiene ni abiertas:
+        // su cierre se perdió en el corte — se cierran para destrabar la
+        // cola en vivo (si el servidor la tiene cerrada _vozSegNuevo ya la
+        // marcó completo+finLocal)
+        for (const s of this._vozOrden) {
+          if (!s.pseudo && s.seq > 0 && !s.completo && !s.finLocal &&
+              !vivos.has(s.seq)) {
+            s.completo = true; s.finLocal = true;
+            if (this._segPorHablante.get(s.de) === s.seq) this._segPorHablante.delete(s.de);
+          }
         }
         this._ultimoSeg = Math.max(this._ultimoSeg, man.ultimo || 0, hasta);
       } catch {}
