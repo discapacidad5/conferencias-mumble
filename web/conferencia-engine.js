@@ -1118,6 +1118,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         let tienePrevFrame = false;
         let silencioCola = 0;
         let noiseFloor = 0.0018;
+        let rmsMedia = 0, rmsDev = 0, planoN = 0; // detector de ruido sostenido
         let ultimoPedirPiso = 0;
         let autoPre = null; // pre-roll guardado esperando el piso
         const tramaMuda = new Float32Array(1920); // colchón de silencio al abrir frase
@@ -1178,6 +1179,19 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               if (rms < noiseFloor * 1.5 || (hablandoActivo && rms < umbralAbrir)) {
                 noiseFloor = Math.max(0.0008, Math.min(0.01, noiseFloor * 0.96 + rms * 0.04));
               }
+              // Ruido sostenido: con la frase abierta, un nivel ALTO y PLANO
+              // (poca variación = ventilador/eco/calle, no habla que es a
+              // ráfagas) sube el piso hasta ese nivel — el ruido constante
+              // que superaba el umbral deja de contar como voz y la frase
+              // cierra tras el silencio configurado
+              if (hablandoActivo) {
+                planoN++;
+                rmsMedia = rmsMedia ? rmsMedia * 0.94 + rms * 0.06 : rms;
+                rmsDev = rmsDev ? rmsDev * 0.94 + Math.abs(rms - rmsMedia) * 0.06 : 0;
+                if (planoN > 25 && rmsMedia > noiseFloor * 1.1 && rmsDev < rmsMedia * 0.3) {
+                  noiseFloor = Math.min(0.02, noiseFloor * 0.95 + rmsMedia * 0.05);
+                }
+              } else { planoN = 0; rmsMedia = 0; rmsDev = 0; }
 
               // En modo PTT el botón manda, no el VAD: mientras se tenga el
               // piso se transmite TODO (una pulsación = una nota de voz
@@ -1628,6 +1642,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._replayPendMs = 0;           // ms de nota ya en el reproductor sin sonar
       this._replayPlayedMs = 0;         // ms acumulados de nota ya escuchados
       this._replayProg = [];            // {seq, msTotal, finMs} para progreso/fin
+      this._replayPausas = new Map();   // seq → {posMs, msTotal, bloques} pausadas
       this._progUltimo = 0;
       this._volPorId = new Map();       // identidad -> volumen directo
       this._retrasoAviso = 0;
@@ -2181,7 +2196,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._replayProg.length = 0;
       this._replayPendMs = 0;
       this._replayPlayedMs = 0;
-      this._replayPausa = null;
+      // "Ir al presente" también suelta las notas pausadas
+      if (this._replayPausas) {
+        for (const seq of this._replayPausas.keys()) this.emit('seg_replay_fin', seq);
+        this._replayPausas.clear();
+      }
       this._vozBufMs = 0;
       const pipe = this._vozPipe;
       if (pipe) {
@@ -2388,7 +2407,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._replayPlayedMs = 0;
         this._vaciarPipeVoz();
       }
-      this._replayPausa = null; // otra nota reemplaza a la pausada
+      this._replayPausas.delete(seq); // re-escucharla desde 0 olvida su pausa
       const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
       const msTotal = bloques.reduce((m, b) => m + (b.pcm.length / rate) * 1000, 0);
       this._replaySrc = { seq, bloques }; // fuente para pausar/reanudar
@@ -2407,11 +2426,13 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         (rp.baseMs || 0) + Math.max(0, this._replayPlayedMs - (rp.finMs - rp.remMs)));
       const enCola = this._replayQ.length && this._replayQ[0].seq === seq
         ? this._replayQ[0] : null;
-      const bloques = enCola ? enCola.bloques
-        : (this._replaySrc && this._replaySrc.seq === seq ? this._replaySrc.bloques
+      const bloques = (this._replaySrc && this._replaySrc.seq === seq ? this._replaySrc.bloques
+        : enCola ? enCola.bloques
         : (this._vozSegs.get(seq) && this._vozSegs.get(seq).bloques) || null);
       if (!bloques || !bloques.length) return false;
-      this._replayPausa = { seq, posMs, msTotal: rp.msTotal, bloques };
+      // la pausa sobrevive a otras notas: queda guardada por seq hasta
+      // reanudarla, re-escucharla desde el inicio o saltar al presente
+      this._replayPausas.set(seq, { seq, posMs, msTotal: rp.msTotal, bloques });
       this._replayQ.length = 0;
       this._replayProg.length = 0;
       this._replayPendMs = 0;
@@ -2420,12 +2441,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return true;
     }
 
+    // Quita la marca de pausa sin sonar: la próxima re-escucha empieza
+    // desde el inicio (opción "↺ desde el inicio" del menú ⋮)
+    reiniciarReplay(seq) {
+      this._replayPausas.delete(seq);
+    }
+
     // Reanuda la nota pausada desde donde quedó (salta los bloques ya
     // escuchados según la posición guardada; precisión de ~40 ms)
-    reanudarReplay() {
-      const p = this._replayPausa;
+    reanudarReplay(seq) {
+      const p = this._replayPausas.get(seq);
       if (!p) return false;
-      this._replayPausa = null;
       const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
       let ms = 0, i = 0;
       while (i < p.bloques.length &&
@@ -2439,7 +2465,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         return true;
       }
       const remMs = p.msTotal - ms;
-      this._replayPausa = { seq: p.seq, posMs: ms, msTotal: p.msTotal, bloques: p.bloques };
+      this._replayPausas.delete(p.seq); // ya suena: la pausa quedó consumida
       this._replayQ.push({ seq: p.seq, bloques: resto, alimentado: 0, msTotal: remMs });
       this._replayProg.push({ seq: p.seq, msTotal: p.msTotal, remMs, baseMs: ms, finMs: remMs });
       this._programarFeedOn();

@@ -4509,8 +4509,10 @@ function menuMensaje(el, x, y) {
       el.classList.add('sel');
     } },
   ];
-  if (seq && !grabando)
+  if (seq && !grabando) {
+    items.push({ label: '↺ Escuchar desde el inicio', fn: () => reiniciarNota(seq) });
     items.push({ label: '⬇️ Descargar audio', fn: () => exportarNotas([seq]) });
+  }
   items.push({ label: '🗑️ Eliminar', peligro: true, fn: () =>
     confirmar(seq
       ? '¿Eliminar esta nota de voz? No volverá a aparecer al sincronizar.'
@@ -4735,6 +4737,7 @@ function borrarMensajes(els) {
     const seq = +(el.querySelector('.nv-play')?.dataset.seq || 0);
     if (seq) {
       nvBorrarSeq(seq);
+      if (S._nvPausas) S._nvPausas.delete(seq);
       clearInterval(el._recTimer);
       S._nvEls.delete(seq);
       const i = S._nvSeqs.indexOf(seq); if (i >= 0) S._nvSeqs.splice(i, 1);
@@ -4799,20 +4802,25 @@ function pcmAWav(pcm, rate) {
 
 async function reproducirNota(seq) {
   if (!S.room) return;
-  // La nota que está sonando se PAUSA al pisarla de nuevo; si quedó en
-  // pausa, otro toque la reanuda desde donde iba (nunca reinicia sola)
-  if (S._nvPausa === seq && S.room.reanudarReplay && S.room.reanudarReplay()) {
-    S._nvPausa = 0;
-    S._nvRepro = seq;
-    marcarNotaVoz(seq, 'sonando');
-    return;
+  if (!S._nvPausas) S._nvPausas = new Set();
+  if (S._nvForzarIni === seq) {
+    S._nvForzarIni = 0; // "↺ desde el inicio": ni pausa ni reanudar
+  } else {
+    // La nota que está sonando se PAUSA al pisarla de nuevo; si quedó en
+    // pausa, otro toque la reanuda desde donde iba — aunque hayas
+    // escuchado otras notas entremedio, la marca no se pierde
+    if (S._nvPausas.has(seq) && S.room.reanudarReplay && S.room.reanudarReplay(seq)) {
+      S._nvPausas.delete(seq);
+      S._nvRepro = seq;
+      marcarNotaVoz(seq, 'sonando');
+      return;
+    }
+    if (S.room.pausarReplay && S.room.pausarReplay(seq)) {
+      S._nvPausas.add(seq);
+      marcarNotaVoz(seq, 'pausa');
+      return;
+    }
   }
-  if (S.room.pausarReplay && S.room.pausarReplay(seq)) {
-    S._nvPausa = seq;
-    marcarNotaVoz(seq, 'pausa');
-    return;
-  }
-  S._nvPausa = 0;
   S._nvRepro = seq;
   marcarNotaVoz(seq, 'cargando'); // feedback inmediato mientras decodifica/descarga
   if (S.room.reproducirSeg && S.room.reproducirSeg(seq)) return;
@@ -4835,9 +4843,20 @@ async function reproducirNota(seq) {
   toast('Esa nota de voz ya no está disponible (el servidor la guarda 1 hora)');
 }
 
+// "↺ desde el inicio" (menú ⋮): olvida la pausa guardada y la nota
+// empieza a sonar desde el principio, aunque esté sonando o pausada
+function reiniciarNota(seq) {
+  if (!S.room) return;
+  if (S._nvPausas) S._nvPausas.delete(seq);
+  if (S.room.reiniciarReplay) S.room.reiniciarReplay(seq);
+  S._nvForzarIni = seq;
+  reproducirNota(seq);
+}
+
 // Al terminar de re-escuchar una nota, sigue con la siguiente del historial
 function reproducirSiguienteNota(seq) {
   marcarNotaVoz(seq, 'oido');
+  if (S._nvPausas) S._nvPausas.delete(seq);
   if (S._nvRepro !== seq) return;
   const i = S._nvSeqs.indexOf(seq);
   if (i >= 0 && i + 1 < S._nvSeqs.length) reproducirNota(S._nvSeqs[i + 1]);
