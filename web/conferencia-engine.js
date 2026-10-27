@@ -2386,6 +2386,29 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       } : null;
     }
 
+    // PCM decodificado de un segmento (para exportar notas a un WAV):
+    // RAM → bloques ya decodificados; si no, decodifica sus tramas crudas
+    async bloquesDeSeg(seq) {
+      const seg = this._vozSegs.get(seq);
+      if (!seg) return null;
+      if (seg.bloques && seg.bloques.length) return seg.bloques.slice();
+      if (seg.raw && seg.raw.length)
+        return this._decodificarFramesSeg(seg.raw.map(b => b instanceof Uint8Array ? b : new Uint8Array(b)), null);
+      return null;
+    }
+
+    async bloquesDeRaw(raw) {
+      if (!raw || !raw.length) return null;
+      const frames = raw.map(b => b instanceof Uint8Array ? b : new Uint8Array(b));
+      return this._decodificarFramesSeg(frames, null);
+    }
+
+    async bloquesDeArchivo(buf) {
+      const parsed = parsearArchivoSeg(buf instanceof Uint8Array ? buf : new Uint8Array(buf));
+      if (!parsed || !parsed.frames.length) return null;
+      return this._decodificarFramesSeg(parsed.frames, null);
+    }
+
     _enviarEstadoMedia() {
       if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
       try {

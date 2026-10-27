@@ -3202,11 +3202,13 @@ function renderListas() {
     if (S.pisoCfg && $('#piso-admin') && document.activeElement?.id !== 'piso-admin'
       && document.activeElement?.id !== 'piso-anfitrion'
       && document.activeElement?.id !== 'piso-palabra'
-      && document.activeElement?.id !== 'piso-usuario') {
+      && document.activeElement?.id !== 'piso-usuario'
+      && document.activeElement?.id !== 'piso-tol') {
       $('#piso-admin').value = S.pisoCfg.admin;
       $('#piso-anfitrion').value = S.pisoCfg.anfitrion;
       $('#piso-palabra').value = S.pisoCfg.palabra;
       $('#piso-usuario').value = S.pisoCfg.usuario;
+      if ($('#piso-tol')) $('#piso-tol').value = S.pisoCfg.palabraTol ?? 60;
     }
     // sala de espera: quién espera admisión + botón por persona
     const lw = $('#mod-lobby-wrap');
@@ -3470,6 +3472,32 @@ function renderControles() {
   }
 }
 
+// Cambio del modo de hablar, compartido entre el menú del micro y los
+// ajustes personales: hold = mantener pisado · lock = tocar/soltar ·
+// auto = la voz pisa el botón. Al pasar a manual el hardware se libera;
+// al pasar a auto se abre solo para que el VAD escuche en local.
+function cambiarModoPtt(modo) {
+  if (!['hold', 'lock', 'auto'].includes(modo)) return;
+  S.ptt.modo = modo;
+  localStorage.setItem('lk_ptt_modo', modo);
+  const sm = $('#mic-modo'), sp = $('#aj-ptt');
+  if (sm) sm.value = modo;
+  if (sp) sp.value = modo;
+  const silWrap = $('#mic-silencio-wrap'), silAj = $('#aj-ptt-sil-wrap');
+  if (silWrap) silWrap.classList.toggle('oculto', modo !== 'auto');
+  if (silAj) silAj.classList.toggle('oculto', modo !== 'auto');
+  if (modo === 'auto') {
+    if (puedoHablar()) prepararMicPtt(); // abre el micro solo para el VAD
+  } else {
+    if (S.ptt.quiero) pttOff();
+    else if (S.audio.pub) retirarMic(); // manual: nada de micro abierto
+  }
+  toast(modo === 'auto' ? 'Voz automática: al hablar piso el botón por ti' :
+    modo === 'hold' ? 'PTT: mantén pisado el botón para hablar' :
+    'PTT: toca el botón para hablar y tócalo otra vez para soltar');
+  renderControles();
+}
+
 function cablearControles() {
   // El botón del micro ES el PTT — ya no hay "encender/apagar micrófono".
   // hold = mantener pisado · lock = tocar/soltar · auto = la voz lo pisa
@@ -3488,20 +3516,8 @@ function cablearControles() {
       };
     }
     selModo.onchange = () => {
-      S.ptt.modo = selModo.value;
-      localStorage.setItem('lk_ptt_modo', S.ptt.modo);
-      if (silWrap) silWrap.classList.toggle('oculto', S.ptt.modo !== 'auto');
+      cambiarModoPtt(selModo.value);
       $('#mic-pop').classList.add('oculto');
-      if (S.ptt.modo === 'auto') {
-        if (puedoHablar()) prepararMicPtt(); // abre el micro solo para el VAD
-      } else {
-        if (S.ptt.quiero) pttOff();
-        else if (S.audio.pub) retirarMic(); // manual: nada de micro abierto
-      }
-      toast(S.ptt.modo === 'auto' ? 'Voz automática: al hablar piso el botón por ti' :
-        S.ptt.modo === 'hold' ? 'PTT: mantén pisado el botón para hablar' :
-        'PTT: toca el botón para hablar y tócalo otra vez para soltar');
-      renderControles();
     };
   }
   // chips de piso y de retraso de audio
@@ -3524,7 +3540,8 @@ function cablearControles() {
     const v = (id, def) => Math.max(0, Math.min(3600, (+$(id).value || def)));
     moderar('piso_cfg', {
       extra: [v('#piso-admin', 0), v('#piso-anfitrion', 0),
-              v('#piso-palabra', 10), v('#piso-usuario', 60)].join(','),
+              v('#piso-palabra', 10), v('#piso-usuario', 60),
+              v('#piso-tol', 60)].join(','),
     }).then(() => toast('Tiempos de interrupción guardados'))
       .catch(e => toast(e.message));
   };
@@ -3831,6 +3848,44 @@ function cablearControles() {
     $('#tab-personas').classList.toggle('oculto', t.dataset.tab !== 'personas');
     if (t.dataset.tab === 'personas') renderPersonas();
   });
+
+  // selección de mensajes del chat: ☑️ entra al modo, la barra ofrece
+  // borrar marcados/todo y unir las notas elegidas en un solo audio
+  $('#chat-sel').onclick = () => toggleChatSel();
+  $('#cs-salir').onclick = () => toggleChatSel(false);
+  $('#cs-todo').onclick = () => {
+    const msgs = $$('#chat-lista .msg');
+    const todos = msgs.length > 0 && msgs.every(m => m.classList.contains('sel'));
+    msgs.forEach(m => m.classList.toggle('sel', !todos));
+  };
+  $('#cs-borrar').onclick = () => {
+    const sel = $$('#chat-lista .msg.sel');
+    if (!sel.length) { toast('Marca mensajes primero'); return; }
+    confirmar(`¿Borrar ${sel.length} mensaje(s) del historial? Las notas de voz no volverán a aparecer.`,
+      () => { borrarMensajes(sel); toggleChatSel(false); });
+  };
+  $('#cs-audios').onclick = () => {
+    const seqs = $$('#chat-lista .msg.sel .nv-play')
+      .map(b => +b.dataset.seq).filter(s => s > 0);
+    if (!seqs.length) { toast('Marca notas de voz para exportar'); return; }
+    exportarNotas(seqs);
+  };
+  // en modo selección el toque marca/desmarca; fuera de él, un toque largo
+  // (o clic derecho) entra al modo marcando ese mensaje
+  $('#chat-lista').addEventListener('click', (ev) => {
+    if (!chatSel) return;
+    const m = ev.target.closest('.msg');
+    if (!m) return;
+    ev.preventDefault(); ev.stopPropagation();
+    m.classList.toggle('sel');
+  }, true);
+  $('#chat-lista').addEventListener('contextmenu', (ev) => {
+    const m = ev.target.closest('.msg');
+    if (!m) return;
+    ev.preventDefault();
+    if (!chatSel) toggleChatSel(true);
+    m.classList.add('sel');
+  });
 }
 
 /* ---------- ajustes de audio ---------- */
@@ -3863,6 +3918,14 @@ function cablearAjustes() {
     S.prefAudio = e.target.value;
     localStorage.setItem('lk_audio_pref', S.prefAudio);
     try { actualizarCalidadAudioEnVivo(); } catch (x) { toast(x.message); }
+  };
+  // modo de hablar (mismo selector que el menú "Micro ▾")
+  if ($('#aj-ptt')) $('#aj-ptt').onchange = (e) => cambiarModoPtt(e.target.value);
+  if ($('#aj-ptt-sil')) $('#aj-ptt-sil').onchange = (e) => {
+    S.ptt.silencio = Math.max(0.5, Math.min(10, +e.target.value || 2.2));
+    e.target.value = S.ptt.silencio;
+    localStorage.setItem('lk_ptt_silencio', String(S.ptt.silencio));
+    const sil = $('#mic-silencio'); if (sil) sil.value = S.ptt.silencio;
   };
   // historial de voz: auto-salto al presente, tope de almacenamiento, vaciar
   if ($('#aj-presente')) $('#aj-presente').onchange = (e) => {
@@ -3913,6 +3976,9 @@ async function poblarSelectsAjustes() {
   $('#aj-calidad').value = S.prefAudio || 'auto';
   if ($('#aj-presente')) $('#aj-presente').checked = S.autoPresente;
   if ($('#aj-hist-mb')) $('#aj-hist-mb').value = S.segCapMB;
+  if ($('#aj-ptt')) $('#aj-ptt').value = S.ptt.modo;
+  if ($('#aj-ptt-sil')) $('#aj-ptt-sil').value = S.ptt.silencio;
+  if ($('#aj-ptt-sil-wrap')) $('#aj-ptt-sil-wrap').classList.toggle('oculto', S.ptt.modo !== 'auto');
   await llenarDisp($('#aj-cam'), 'videoinput', S.dev.cam);
   await llenarDisp($('#aj-mic'), 'audioinput', S.dev.mic);
   await llenarDisp($('#aj-spk'), 'audiooutput', S.dev.spk);
@@ -4262,6 +4328,20 @@ function agregarChat(quien, texto, propio) {
 }
 
 /* ---------- notas de voz (historial de audio en el chat) ---------- */
+// Lápidas: seqs de notas que el usuario borró. Persisten en localStorage
+// por sala para que la sincronización tras un corte no las resucite.
+function nvBorrados() {
+  if (!S._nvBorrados) {
+    S._nvBorrados = new Set();
+    try { JSON.parse(localStorage.getItem('nv_bor_' + S.sala) || '[]').forEach(s => S._nvBorrados.add(s)); } catch {}
+  }
+  return S._nvBorrados;
+}
+function nvBorrarSeq(seq) {
+  nvBorrados().add(seq);
+  try { localStorage.setItem('nv_bor_' + S.sala, JSON.stringify([...S._nvBorrados].slice(-500))); } catch {}
+}
+
 const fmtDurSeg = (ms) => {
   const s = Math.max(1, Math.round((ms || 0) / 1000));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
@@ -4274,7 +4354,7 @@ const fmtDurSeg = (ms) => {
 // pero tocarla te adelanta hasta el audio en tiempo real — igual que el
 // chip "Ir al presente" cuando vas atrasado.
 function agregarNotaVozEnVivo(meta) {
-  if (!meta || meta.seq <= 0 || S._nvEls.has(meta.seq)) return;
+  if (!meta || meta.seq <= 0 || S._nvEls.has(meta.seq) || nvBorrados().has(meta.seq)) return;
   const lista = $('#chat-lista');
   const el = document.createElement('div');
   el.className = 'msg nota-voz grabando';
@@ -4314,10 +4394,10 @@ async function sincronizarNotas() {
     if (!r.ok) return;
     const man = await r.json();
     for (const meta of (man.segmentos || [])) {
-      if (meta.seq && !S._nvEls.has(meta.seq))
+      if (meta.seq && !S._nvEls.has(meta.seq) && !nvBorrados().has(meta.seq))
         agregarNotaVoz({ seq: meta.seq, de: meta.de, nombre: meta.nombre, durMs: meta.durMs, inicio: meta.inicio, interrumpida: meta.interrumpida });
     }
-    if (man.abierto && man.abierto.seq && !S._nvEls.has(man.abierto.seq))
+    if (man.abierto && man.abierto.seq && !S._nvEls.has(man.abierto.seq) && !nvBorrados().has(man.abierto.seq))
       agregarNotaVozEnVivo({ seq: man.abierto.seq, de: man.abierto.de, nombre: man.abierto.nombre, inicio: man.abierto.inicio });
     if (man.ultimo) S._ultimoSeg = Math.max(S._ultimoSeg || 0, man.ultimo);
   } catch {}
@@ -4325,6 +4405,12 @@ async function sincronizarNotas() {
 
 function agregarNotaVoz(meta) {
   if (!meta || meta.seq <= 0) return;
+  if (nvBorrados().has(meta.seq)) {
+    // nota borrada por el usuario: si quedó una copia "grabando", fuera
+    const v = S._nvEls.get(meta.seq);
+    if (v) { clearInterval(v._recTimer); S._nvEls.delete(meta.seq); v.remove(); }
+    return;
+  }
   const viejo = S._nvEls.get(meta.seq);
   if (viejo) {
     // nota de tap accidental (<0,8 s): no queda en el historial, se borra
@@ -4417,6 +4503,86 @@ function marcarNotaVoz(seq, est, prog) {
 
 // Re-escuchar una nota: primero en la RAM del motor; si ya se limpió, en el
 // historial local (IndexedDB); por último en el servidor (retención 1 h)
+// --- selección de mensajes del chat: borrar o exportar audios ---
+let chatSel = false;
+function toggleChatSel(on) {
+  chatSel = on === undefined ? !chatSel : !!on;
+  $('#chat-lista').classList.toggle('seleccion', chatSel);
+  $('#chat-selbar').classList.toggle('oculto', !chatSel);
+  $('#chat-sel').classList.toggle('on', chatSel);
+  if (!chatSel) $$('#chat-lista .msg.sel').forEach(el => el.classList.remove('sel'));
+}
+
+// Borra mensajes del historial propio. Las notas de voz quedan con lápida
+// (nv_bor_<sala>) para que la sincronización no las vuelva a traer; los
+// mensajes de texto no se re-sincronizan y solo se quitan de la vista.
+function borrarMensajes(els) {
+  for (const el of els) {
+    const seq = +(el.querySelector('.nv-play')?.dataset.seq || 0);
+    if (seq) {
+      nvBorrarSeq(seq);
+      clearInterval(el._recTimer);
+      S._nvEls.delete(seq);
+      const i = S._nvSeqs.indexOf(seq); if (i >= 0) S._nvSeqs.splice(i, 1);
+    }
+    el.remove();
+  }
+}
+
+// Une las notas seleccionadas en un solo WAV y lo descarga — el audio ya
+// está en el equipo (RAM/IndexedDB) o se trae del servidor (retención 1 h)
+async function exportarNotas(seqs) {
+  if (!S.room) return;
+  toast('Preparando el audio…');
+  const rate = (S.room._asegurarRxAudioCtx && S.room._asegurarRxAudioCtx().sampleRate) || 48000;
+  const partes = []; let total = 0;
+  for (const seq of seqs) {
+    let bl = await S.room.bloquesDeSeg(seq).catch(() => null);
+    if (!bl) {
+      try {
+        const rec = await idbCargarSeg(seq);
+        if (rec && rec.raw && rec.raw.length) bl = await S.room.bloquesDeRaw(rec.raw);
+      } catch {}
+    }
+    if (!bl) {
+      try {
+        const r = await fetch(`/api/salas/${encodeURIComponent(S.sala)}/audio/${seq}`,
+          { headers: { Authorization: 'Bearer ' + S.token } });
+        if (r.ok) bl = await S.room.bloquesDeArchivo(await r.arrayBuffer());
+      } catch {}
+    }
+    if (!bl) continue;
+    for (const b of bl) { partes.push(b); total += b.length; }
+  }
+  if (!total) { toast('No se pudo armar el audio de las notas elegidas'); return; }
+  const pcm = new Float32Array(total);
+  let o = 0;
+  for (const b of partes) { pcm.set(b, o); o += b.length; }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(pcmAWav(pcm, rate));
+  a.download = `conferencia-${S.sala}-${seqs.length}-notas.wav`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 8000);
+  toast(`⬇️ ${seqs.length} nota(s) unidas en un solo audio`);
+}
+
+// WAV PCM de 16 bits mono: cabecera RIFF estándar + muestras
+function pcmAWav(pcm, rate) {
+  const buf = new ArrayBuffer(44 + pcm.length * 2);
+  const v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + pcm.length * 2, true); ws(8, 'WAVE');
+  ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, 'data'); v.setUint32(40, pcm.length * 2, true);
+  for (let i = 0; i < pcm.length; i++) {
+    const s = Math.max(-1, Math.min(1, pcm[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
 async function reproducirNota(seq) {
   if (!S.room) return;
   S._nvRepro = seq;

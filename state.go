@@ -506,13 +506,17 @@ func (sv *salaViva) asientoLibreEn(e *EstadoSala, id string, soyMod bool) int {
 // (segundos que debe llevar hablando el dueño antes de que cada rol pueda
 // tumbárselo). Sin config explícita: admin y anfitrión al instante, la
 // Palabra a los 10 s y el resto a los 60 s.
-type pisoCfg struct{ admin, anfitrion, palabra, usuario int }
+type pisoCfg struct{ admin, anfitrion, palabra, usuario, tol int }
 
 func pisoCfgDe(sl *Sala) pisoCfg {
 	if sl != nil && sl.PisoCfgOK {
-		return pisoCfg{sl.PisoIntAdminSeg, sl.PisoIntAnfitrionSeg, sl.PisoIntPalabraSeg, sl.PisoIntUsuarioSeg}
+		tol := sl.PalabraTolSeg
+		if tol <= 0 {
+			tol = 60
+		}
+		return pisoCfg{sl.PisoIntAdminSeg, sl.PisoIntAnfitrionSeg, sl.PisoIntPalabraSeg, sl.PisoIntUsuarioSeg, tol}
 	}
-	return pisoCfg{0, 0, 10, 60}
+	return pisoCfg{0, 0, 10, 60, 60}
 }
 
 // minSegPiso: segundos que debe llevar hablando el dueño del piso antes de que

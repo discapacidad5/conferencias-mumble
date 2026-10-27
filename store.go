@@ -33,6 +33,9 @@ type Sala struct {
 	PisoIntPalabraSeg   int  `json:"pisoIntPalabraSeg"`
 	PisoIntUsuarioSeg   int  `json:"pisoIntUsuarioSeg"`
 	PisoCfgOK           bool `json:"pisoCfgOK,omitempty"`
+	// Segundos que La Palabra tolera quedar interrumpida por otro hablante
+	// antes de retirarse sola. 0/vacío = 60 s por defecto.
+	PalabraTolSeg int `json:"palabraTolSeg,omitempty"`
 }
 
 // Visible: el nombre para mostrar — NombreVisible si hay, si no el slug.
@@ -138,8 +141,9 @@ func (s *Store) QuitarMod(sala, identidad string) {
 }
 
 // FijarPisoCfg guarda los 4 tiempos de interrupción de piso de una sala
-// (admin, anfitrión, palabra, usuario — en segundos, 0 = inmediato).
-func (s *Store) FijarPisoCfg(nombre string, admin, anfitrion, palabra, usuario int) {
+// (admin, anfitrión, palabra, usuario — en segundos, 0 = inmediato) más la
+// tolerancia de La Palabra interrumpida (tol = segundos; 0 = 60 por defecto).
+func (s *Store) FijarPisoCfg(nombre string, admin, anfitrion, palabra, usuario, tol int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	clamp := func(v int) int {
@@ -157,6 +161,7 @@ func (s *Store) FijarPisoCfg(nombre string, admin, anfitrion, palabra, usuario i
 			s.d.Salas[i].PisoIntAnfitrionSeg = clamp(anfitrion)
 			s.d.Salas[i].PisoIntPalabraSeg = clamp(palabra)
 			s.d.Salas[i].PisoIntUsuarioSeg = clamp(usuario)
+			s.d.Salas[i].PalabraTolSeg = clamp(tol)
 			s.d.Salas[i].PisoCfgOK = true
 			s.guardar()
 			return

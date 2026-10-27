@@ -558,7 +558,7 @@ func marshalEstadoPara(sv *salaViva, ev *Evento, id string) ([]byte, error) {
 	pcfg := pisoCfgDe(store.BuscarSala(sv.nombre))
 	return json.Marshal(map[string]any{
 		"estado":         &copia,
-		"pisoCfg":        map[string]int{"admin": pcfg.admin, "anfitrion": pcfg.anfitrion, "palabra": pcfg.palabra, "usuario": pcfg.usuario},
+		"pisoCfg":        map[string]int{"admin": pcfg.admin, "anfitrion": pcfg.anfitrion, "palabra": pcfg.palabra, "usuario": pcfg.usuario, "palabraTol": pcfg.tol},
 		"votos":          map[string]any{"aFavor": aFavor, "enContra": enContra, "mi": miVoto},
 		"instancia":      instanciaServidor,
 		"micProhibido":   sv.micBloq[id],
@@ -1315,11 +1315,13 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 
 	case "piso_cfg":
 		// Tiempos de interrupción del piso, en segundos, separados por comas:
-		// extra = "admin,anfitrion,palabra,usuario" (0 = interrumpir al instante)
-		var vs [4]int
+		// extra = "admin,anfitrion,palabra,usuario[,tolPalabra]"
+		// (0 = interrumpir al instante; tolPalabra = segundos que La Palabra
+		// aguanta interrumpida antes de retirarse — 0 = 60 por defecto)
+		var vs [5]int
 		partes := strings.Split(req.Extra, ",")
-		if len(partes) != 4 {
-			errStr = "formato: admin,anfitrion,palabra,usuario (segundos)"
+		if len(partes) != 4 && len(partes) != 5 {
+			errStr = "formato: admin,anfitrion,palabra,usuario[,tolPalabra] (segundos)"
 			break
 		}
 		ok4 := true
@@ -1332,10 +1334,10 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 			vs[i] = n
 		}
 		if !ok4 {
-			errStr = "formato: admin,anfitrion,palabra,usuario (segundos)"
+			errStr = "formato: admin,anfitrion,palabra,usuario[,tolPalabra] (segundos)"
 			break
 		}
-		store.FijarPisoCfg(sala, vs[0], vs[1], vs[2], vs[3])
+		store.FijarPisoCfg(sala, vs[0], vs[1], vs[2], vs[3], vs[4])
 
 	case "lobby_admitir":
 		if req.Objetivo != "" {
@@ -1810,9 +1812,11 @@ func barrerParticipantes() {
 						}
 					}
 				}
-				// La Palabra lleva >1 min interrumpida por otro hablante: se
-				// retira sola (quien la tenía puede volver a levantar la mano)
-				if e.Palabra != "" && e.PausadaDesde > 0 && ahora()-e.PausadaDesde > 60_000 {
+				// La Palabra lleva más de la tolerancia configurada
+				// interrumpida por otro hablante: se retira sola (quien la
+				// tenía puede volver a levantar la mano)
+				tolMs := int64(pisoCfgDe(store.BuscarSala(sv.nombre)).tol) * 1000
+				if e.Palabra != "" && e.PausadaDesde > 0 && ahora()-e.PausadaDesde > tolMs {
 					exPalabra := e.Palabra
 					e.Palabra = ""
 					e.PalabraPausada, e.PausadaDesde = 0, 0

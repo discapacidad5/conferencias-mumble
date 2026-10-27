@@ -137,6 +137,22 @@ label.check input { width: auto; }
   animation: pttBorde .55s steps(2, jump-none) infinite;
 }
 @keyframes pttBorde { 50% { border-color: var(--peligro); } }
+
+/* Selección de mensajes del chat: marcar para borrar o exportar audios */
+#chat-sel.tab { flex: 0 0 auto; }
+#chat-sel.tab.on { background: var(--acento); color: #fff; }
+#chat-selbar {
+  display: flex; gap: .4rem; align-items: center; justify-content: flex-end;
+  padding: .3rem .4rem; border-bottom: 1px solid var(--borde);
+  background: var(--bg3); position: sticky; top: 0; z-index: 3;
+}
+#chat-lista.seleccion .msg { cursor: pointer; padding-left: 1.7rem; position: relative; }
+#chat-lista.seleccion .msg::before {
+  content: '◯'; position: absolute; left: .35rem; top: 50%; transform: translateY(-50%);
+  color: var(--muted); font-size: .9rem;
+}
+#chat-lista.seleccion .msg.sel { background: rgba(88,141,255,.16); border-radius: 8px; }
+#chat-lista.seleccion .msg.sel::before { content: '◉'; color: var(--acento); }
 /* MI asiento entero es el pulsador PTT: el nombre queda dentro del botón
    y las esquinas guardan las acciones (⋮ opciones · ✕ salir · 📌 pin) */
 .asiento-mio { cursor: pointer; }
