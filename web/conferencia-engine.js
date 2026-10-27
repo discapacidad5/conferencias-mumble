@@ -2777,12 +2777,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           if (window.S && typeof window.S.grupoActual === 'number' && window.S.grupoActual > 0) {
             try { ws.send(JSON.stringify({ t: 'cambiar_grupo', grupo: window.S.grupoActual })); } catch {}
           }
-          // Tras una reconexión: reclamar el piso (si seguía pisado) y luego
-          // soltar en ráfaga la voz encolada durante el corte
+          // Tras una reconexión el estado LOCAL del PTT manda sobre el del
+          // servidor: si sigo pisado reclamo el piso; si ya solté (dedo
+          // levantado, sin candado, VAD callado) se lo declaro SUELTO para
+          // que cierre el piso y la frase que pueda conservar de antes
           if (this._quieroPiso) {
             this._enviarJson({ t: 'piso_tomar' });
             setTimeout(() => this._drenarTx(), 350);
           } else {
+            this._enviarJson({ t: 'piso_soltar' });
             this._programarFlushTx();
           }
           this.emit(RoomEvent.ConnectionStateChanged, 'connected');

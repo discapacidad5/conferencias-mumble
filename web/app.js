@@ -2232,6 +2232,15 @@ function cablearRoom(room) {
   // --- piso exclusivo (PTT) ---
   room.on('piso', (m) => {
     if (m && m.estado === 'mio') {
+      // El servidor me dio el piso pero yo ya lo solté (dedo levantado,
+      // sin candado, VAD callado): el estado LOCAL manda — suelta
+      // explícito para que cierre la frase que conserve de antes
+      if (!S.ptt.quiero && !(S.room && S.room._quieroPiso)) {
+        S.ptt.tengo = false;
+        S.room.soltarPiso();
+        renderControles();
+        return;
+      }
       S.ptt.tengo = true;
       // si el micro quedó muteado (p.ej. soy la palabra y me interrumpieron)
       // vuelve solo: con La Palabra el micro no se apaga con el botón
