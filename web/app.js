@@ -2166,6 +2166,12 @@ function cablearRoom(room) {
   room.on(LC.RoomEvent.ParticipantConnected, rerender);
   room.on(LC.RoomEvent.ParticipantDisconnected, rerender);
   room.on(LC.RoomEvent.ConnectionStateChanged, rerender);
+  // el socket de medios reconectó solo (sin reconectar la sala): resincroniza
+  // el historial — los cierres de frase perdidos llegan por el manifiesto
+  room.on('media_reconectada', () => {
+    sincronizarNotas();
+    refrescarEstado();
+  });
   room.on(LC.RoomEvent.ConnectionQualityChanged, (q, p) => {
     if (!p || !p.isLocal) return;
     const mala = q === LC.ConnectionQuality.Poor || q === LC.ConnectionQuality.Lost;

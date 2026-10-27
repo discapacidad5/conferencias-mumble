@@ -1716,9 +1716,22 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     // La voz nunca se descarta en el emisor: si el socket está caído o la
     // cola TCP creció, la trama espera en _txCola y sale en ráfaga al
     // reconectar. El servidor la archiva en el segmento igualmente.
-    _enviarJson(obj) {
-      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
-      try { this._ws.send(JSON.stringify(obj)); } catch {}
+    // Mensajes de control: los CRÍTICOS (tomar/soltar el piso = empezar o
+    // dejar de grabar) no se pierden con un corte — se encolan junto a las
+    // tramas y llegan al servidor cuando la red vuelva, como las notas del
+    // historial. Los latidos no se encolan: el siguiente sale solo.
+    _enviarJson(obj, critico) {
+      if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+        try { this._ws.send(JSON.stringify(obj)); return; } catch {}
+      }
+      if (critico) {
+        const s = JSON.stringify(obj);
+        if (this._txBytes + s.length <= 1572864) {
+          this._txCola.push(s);
+          this._txBytes += s.length;
+          this._programarFlushTx();
+        }
+      }
     }
 
     _enviarFrame(pkt) {
@@ -1758,7 +1771,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     // ---------- piso exclusivo (PTT) ----------
     tomarPiso() {
       this._quieroPiso = true;
-      this._enviarJson({ t: 'piso_tomar' });
+      this._enviarJson({ t: 'piso_tomar' }, true);
       this._latidoPiso();
     }
 
@@ -1766,7 +1779,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._quieroPiso = false;
       this._tengoPiso = false;
       if (this._pisoHoldT) { clearInterval(this._pisoHoldT); this._pisoHoldT = null; }
-      this._enviarJson({ t: 'piso_soltar' });
+      this._enviarJson({ t: 'piso_soltar' }, true);
     }
 
     // Latido mientras se tiene el piso: el watchdog del servidor lo suelta a
@@ -2759,6 +2772,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             this._programarFlushTx();
           }
           this.emit(RoomEvent.ConnectionStateChanged, 'connected');
+          // reconexión interna del socket de medios: la app resincroniza el
+          // historial (los seg_ini/seg_fin perdidos en el corte llegan por
+          // el manifiesto — igual que los audios faltantes)
+          if (!resolveInicial) this.emit('media_reconectada');
           if (resolveInicial) resolveInicial();
         };
 
