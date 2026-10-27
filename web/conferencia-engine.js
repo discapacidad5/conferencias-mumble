@@ -2184,12 +2184,19 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const ahoraPerf = performance.now();
       for (const s of this._vozOrden) {
         // Frase abierta sin tramas hace >4 s: su EOS/seg_fin se perdió (el
-        // servidor ya la cerró por inactividad a ~1,6 s). Cerrarla en local
-        // — si no, queda en la cabeza y mata TODO el audio en vivo detrás
+        // servidor ya la cerró por inactividad a ~1,6 s). Pedir al servidor
+        // el segmento completo: rellena la cola que faltó Y el archivo
+        // confirma el fin (abierto=false). Si no, queda en la cabeza y mata
+        // TODO el audio en vivo detrás. Si sigue abierta en el servidor, se
+        // reintenta en otros 4 s — la descarga marca ultRxT de nuevo
         if (!s.saltado && !s.reproducido && !s.completo && !s.finLocal &&
-            ahoraPerf - (s.ultRxT || 0) > 4000) {
-          s.finLocal = true;
-          if (this._segPorHablante.get(s.de) === s.seq) this._segPorHablante.delete(s.de);
+            !s.bajando && ahoraPerf - (s.ultRxT || 0) > 4000) {
+          if (!s.pseudo && s.seq > 0) {
+            this._bajarSeg(s.seq);
+          } else {
+            s.finLocal = true;
+            if (this._segPorHablante.get(s.de) === s.seq) this._segPorHablante.delete(s.de);
+          }
         }
         if ((s.reproducido || s.saltado) && s.inicio < viejo && s.bloques.length) {
           s.bloques = [];
@@ -2279,7 +2286,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         for (const b of nuevos) this._insertarBloque(sg, b);
         sg.bajando = false;
         sg.descargado = true;
-        if (!parsed.sg.abierto) sg.completo = true;
+        sg.ultRxT = performance.now(); // si sigue abierta, re-sondear en ~4 s
+        if (!parsed.sg.abierto) { sg.completo = true; sg.finLocal = true; }
         if (parsed.sg.durMs) sg.durMs = parsed.sg.durMs;
         if (parsed.sg.cortado) sg.interrumpida = true;
         if (parsed.sg.inicio) sg.inicio = parsed.sg.inicio;
