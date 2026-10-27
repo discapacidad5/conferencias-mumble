@@ -4576,7 +4576,14 @@ function agregarNotaVozEnVivo(meta) {
   S._nvSeqs.sort((a, b) => a - b);
   const t = el.querySelector('.nv-tiempo');
   el._recTimer = setInterval(() => {
-    t.textContent = '● ' + fmtDurSeg(Math.max(0, Date.now() - inicio));
+    const trans = Date.now() - inicio;
+    // el servidor cierra toda frase a los 90 s: si sigue "grabando" mucho
+    // más allá, su seg_fin se perdió — red de seguridad local
+    if (trans > 95000) {
+      marcarNotaVoz(meta.seq, 'perdida');
+      return;
+    }
+    t.textContent = '● ' + fmtDurSeg(trans);
   }, 500);
   // tocarla: saltar todo el retraso acumulado y escuchar desde el vivo
   el.querySelector('.nv-play').onclick = () => {
@@ -4599,11 +4606,23 @@ async function sincronizarNotas() {
     if (!r.ok) return;
     const man = await r.json();
     for (const meta of (man.segmentos || [])) {
-      if (meta.seq && !S._nvEls.has(meta.seq) && !nvBorrados().has(meta.seq))
+      const viejo = S._nvEls.get(meta.seq);
+      // las seq ya mostradas se saltan SALVO si quedaron como fantasma
+      // "grabando": el manifiesto las convierte en nota cerrada
+      if (meta.seq && !nvBorrados().has(meta.seq) &&
+          (!viejo || viejo.classList.contains('grabando')))
         agregarNotaVoz({ seq: meta.seq, de: meta.de, nombre: meta.nombre, durMs: meta.durMs, inicio: meta.inicio, interrumpida: meta.interrumpida });
     }
     if (man.abierto && man.abierto.seq && !S._nvEls.has(man.abierto.seq) && !nvBorrados().has(man.abierto.seq))
       agregarNotaVozEnVivo({ seq: man.abierto.seq, de: man.abierto.de, nombre: man.abierto.nombre, inicio: man.abierto.inicio });
+    // Fantasmas: notas "grabando" que el servidor ya no tiene ni abiertas
+    // ni archivadas (su seg_fin se perdió en un corte). Se eliminan.
+    const vivos = new Set((man.segmentos || []).map(m => m.seq));
+    if (man.abierto && man.abierto.seq) vivos.add(man.abierto.seq);
+    S._nvEls.forEach((el, seq) => {
+      if (el.classList.contains('grabando') && !vivos.has(seq))
+        marcarNotaVoz(seq, 'perdida');
+    });
     if (man.ultimo) S._ultimoSeg = Math.max(S._ultimoSeg || 0, man.ultimo);
   } catch {}
 }
