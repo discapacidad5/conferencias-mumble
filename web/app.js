@@ -1014,6 +1014,11 @@ function entrarVistaSala() {
     try { history.pushState({ capa: 'sala' }, ''); } catch {}
   };
   pedirWakeLock(); // la pantalla no se apaga mientras dure la reunión
+  // Historial siempre consistente con el servidor: al entrar y cada 45 s
+  // se compara con el manifiesto — las notas que falten aparecen y los
+  // "grabando" fantasma se convierten en cerradas o se eliminan
+  sincronizarNotas();
+  if (!S._nvSyncT) S._nvSyncT = setInterval(sincronizarNotas, 45000);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !S.room || S.saliendo) return;
     pedirWakeLock();
@@ -1193,6 +1198,7 @@ function beaconSalir() {
 
 async function salir() {
   S.saliendo = true; // evita que el hilo de reconexión intente volver
+  if (S._nvSyncT) { clearInterval(S._nvSyncT); S._nvSyncT = null; }
   try { await accion('levantarse'); } catch {}
   window.removeEventListener('beforeunload', beaconSalir);
   cerrarPipeline();
@@ -4611,7 +4617,9 @@ async function sincronizarNotas() {
       { headers: { Authorization: 'Bearer ' + S.token } });
     if (!r.ok) return;
     const man = await r.json();
-    for (const meta of (man.segmentos || [])) {
+    // al entrar (desde=0) solo se siembran las ~40 últimas notas: el chat
+    // no se inunda con el historial completo pero sí queda recuperable
+    for (const meta of (man.segmentos || []).slice(-40)) {
       const viejo = S._nvEls.get(meta.seq);
       // las seq ya mostradas se saltan SALVO si quedaron como fantasma
       // "grabando": el manifiesto las convierte en nota cerrada
