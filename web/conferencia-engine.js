@@ -2057,8 +2057,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (this._replayProg.length && ahoraMs - (this._progUltimo || 0) > 200) {
         this._progUltimo = ahoraMs;
         const rp = this._replayProg[0];
-        const pos = Math.max(0, Math.min(rp.msTotal,
-          this._replayPlayedMs - (rp.finMs - rp.msTotal)));
+        const pos = (rp.baseMs || 0) + Math.max(0, Math.min(rp.remMs,
+          this._replayPlayedMs - (rp.finMs - rp.remMs)));
         this.emit('seg_progreso',
           { seq: rp.seq, posMs: Math.round(pos), durMs: Math.round(rp.msTotal) });
       }
@@ -2181,6 +2181,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._replayProg.length = 0;
       this._replayPendMs = 0;
       this._replayPlayedMs = 0;
+      this._replayPausa = null;
       this._vozBufMs = 0;
       const pipe = this._vozPipe;
       if (pipe) {
@@ -2387,10 +2388,60 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._replayPlayedMs = 0;
         this._vaciarPipeVoz();
       }
+      this._replayPausa = null; // otra nota reemplaza a la pausada
       const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
       const msTotal = bloques.reduce((m, b) => m + (b.pcm.length / rate) * 1000, 0);
+      this._replaySrc = { seq, bloques }; // fuente para pausar/reanudar
       this._replayQ.push({ seq, bloques, alimentado: 0, msTotal });
-      this._replayProg.push({ seq, msTotal, finMs: msTotal });
+      this._replayProg.push({ seq, msTotal, remMs: msTotal, baseMs: 0, finMs: msTotal });
+      this._programarFeedOn();
+      return true;
+    }
+
+    // Pisar de nuevo la nota que está sonando la PAUSA (no la reinicia):
+    // se guarda la posición ya escuchada y se vacía el reproductor
+    pausarReplay(seq) {
+      const rp = this._replayProg && this._replayProg[0];
+      if (!rp || rp.seq !== seq) return false;
+      const posMs = Math.min(rp.msTotal,
+        (rp.baseMs || 0) + Math.max(0, this._replayPlayedMs - (rp.finMs - rp.remMs)));
+      const enCola = this._replayQ.length && this._replayQ[0].seq === seq
+        ? this._replayQ[0] : null;
+      const bloques = enCola ? enCola.bloques
+        : (this._replaySrc && this._replaySrc.seq === seq ? this._replaySrc.bloques
+        : (this._vozSegs.get(seq) && this._vozSegs.get(seq).bloques) || null);
+      if (!bloques || !bloques.length) return false;
+      this._replayPausa = { seq, posMs, msTotal: rp.msTotal, bloques };
+      this._replayQ.length = 0;
+      this._replayProg.length = 0;
+      this._replayPendMs = 0;
+      this._replayPlayedMs = 0;
+      this._vaciarPipeVoz();
+      return true;
+    }
+
+    // Reanuda la nota pausada desde donde quedó (salta los bloques ya
+    // escuchados según la posición guardada; precisión de ~40 ms)
+    reanudarReplay() {
+      const p = this._replayPausa;
+      if (!p) return false;
+      this._replayPausa = null;
+      const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
+      let ms = 0, i = 0;
+      while (i < p.bloques.length &&
+             ms + (p.bloques[i].pcm.length / rate) * 1000 <= p.posMs) {
+        ms += (p.bloques[i].pcm.length / rate) * 1000;
+        i++;
+      }
+      const resto = p.bloques.slice(i);
+      if (!resto.length) { // estaba pausada al filo del final: se da por oída
+        this.emit('seg_replay_fin', p.seq);
+        return true;
+      }
+      const remMs = p.msTotal - ms;
+      this._replayPausa = { seq: p.seq, posMs: ms, msTotal: p.msTotal, bloques: p.bloques };
+      this._replayQ.push({ seq: p.seq, bloques: resto, alimentado: 0, msTotal: remMs });
+      this._replayProg.push({ seq: p.seq, msTotal: p.msTotal, remMs, baseMs: ms, finMs: remMs });
       this._programarFeedOn();
       return true;
     }

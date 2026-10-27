@@ -4680,12 +4680,18 @@ function marcarNotaVoz(seq, est, prog) {
     b.textContent = '⏳';
   }
   if (est === 'sonando') {
-    b.classList.add('sonando'); b.classList.remove('oido', 'cargando');
+    b.classList.add('sonando'); b.classList.remove('oido', 'cargando', 'pausa');
     b.textContent = '🔊';
   }
+  if (est === 'pausa') {
+    b.classList.add('pausa'); b.classList.remove('sonando', 'oido', 'cargando');
+    b.textContent = '⏸️';
+    b.title = 'En pausa — toca para seguir escuchando';
+  }
   if (est === 'oido') {
-    b.classList.add('oido'); b.classList.remove('sonando', 'cargando');
+    b.classList.add('oido'); b.classList.remove('sonando', 'cargando', 'pausa');
     b.textContent = '▶';
+    b.title = '';
     if (r) r.style.width = '0%';
     if (t) t.textContent = fmtDurSeg(+el.dataset.durMs || 0);
   }
@@ -4793,6 +4799,20 @@ function pcmAWav(pcm, rate) {
 
 async function reproducirNota(seq) {
   if (!S.room) return;
+  // La nota que está sonando se PAUSA al pisarla de nuevo; si quedó en
+  // pausa, otro toque la reanuda desde donde iba (nunca reinicia sola)
+  if (S._nvPausa === seq && S.room.reanudarReplay && S.room.reanudarReplay()) {
+    S._nvPausa = 0;
+    S._nvRepro = seq;
+    marcarNotaVoz(seq, 'sonando');
+    return;
+  }
+  if (S.room.pausarReplay && S.room.pausarReplay(seq)) {
+    S._nvPausa = seq;
+    marcarNotaVoz(seq, 'pausa');
+    return;
+  }
+  S._nvPausa = 0;
   S._nvRepro = seq;
   marcarNotaVoz(seq, 'cargando'); // feedback inmediato mientras decodifica/descarga
   if (S.room.reproducirSeg && S.room.reproducirSeg(seq)) return;
