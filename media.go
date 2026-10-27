@@ -409,6 +409,7 @@ func liberarPisoDe(sala, id string, interrumpida bool) {
 	mr := media.room(sala)
 	if sg := mr.seg.cerrarHablante(id, interrumpida); sg != nil {
 		mr.notificarSegFin(sg)
+		mr.seg.pedirFaltantes(sg)
 	}
 	sv := hub.sala(sala)
 	sv.mu.Lock()
@@ -459,6 +460,7 @@ func (r *mediaRoom) tomarPisoWS(c *clienteWS) {
 		c.ultimoHabl = ahora()
 		if sg := r.seg.cerrarHablante(anterior, true); sg != nil {
 			r.notificarSegFin(sg)
+			r.seg.pedirFaltantes(sg)
 		}
 		if oc := r.clienteDe(anterior); oc != nil {
 			msg, _ := json.Marshal(map[string]any{"t": "piso_perdido", "por": c.nombre})
@@ -507,6 +509,7 @@ func (r *mediaRoom) pisoCheck(c *clienteWS, rc byte) bool {
 		c.ultimoHabl = ahora()
 		if sg := r.seg.cerrarHablante(anterior, true); sg != nil {
 			r.notificarSegFin(sg)
+			r.seg.pedirFaltantes(sg)
 		}
 		if oc := r.clienteDe(anterior); oc != nil {
 			msg, _ := json.Marshal(map[string]any{"t": "piso_perdido", "por": c.nombre})
@@ -823,6 +826,16 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					continue
 				}
 				rc := payload[0]
+				// Reparación anti-pérdida: si esta tx pertenece a un segmento
+				// ya cerrado que la espera, se archiva SIN fanout en vivo (los
+				// oyentes ya cerraron esa frase — repetirla sería un eco; su
+				// propio relleno baja el archivo ya completo)
+				if len(payload) >= 3 {
+					if sgR := mr.seg.reparar(c.identidad, payload); sgR != nil {
+						mr.seg.pedirFaltantes(sgR)
+						continue
+					}
+				}
 				// Piso exclusivo: solo pasa la voz del dueño del piso; hablar
 				// lo toma en automático y un tercero puede tumbártelo según los
 				// tiempos de interrupción configurados por rol.
@@ -855,13 +868,19 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				mr.mu.RUnlock()
 
 				// Historial confiable: la frase se archiva como segmento
-				// descargable para reparar micro-cortes y notas de voz.
-				nuevo, cerrado := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
+				// descargable para reparar micro-cortes y notas de voz. El
+				// servidor deduplica por tx, las inserta en orden y le pide
+				// al emisor ({t:'falta'}) las tramas que detecta perdidas.
+				nuevo, cerrado, faltan := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
 				if nuevo != nil {
 					mr.seg.notificarSegIni(nuevo)
 				}
 				if cerrado != nil {
 					mr.notificarSegFin(cerrado)
+				}
+				if len(faltan) > 0 {
+					msg, _ := json.Marshal(map[string]any{"t": "falta", "txs": faltan})
+					c.enviarCtrl(append([]byte{1}, msg...))
 				}
 
 			case frameTipoVideo:

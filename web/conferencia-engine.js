@@ -921,6 +921,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let opusTimestampUs = 0;
       let opusPending = [];
       let txSeq = 0;
+      // Nueva sesión de micro: el contador tx vuelve a 0 — las tramas
+      // pendientes de la sesión anterior ya no son atribuibles, se sueltan
+      if (this._room) this._room._resetVozTxPend();
       let hablandoActivo = false;
 
       // Estado ADPCM y filtro anti-aliasing para respaldo universal
@@ -1621,6 +1624,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._txCola = [];
       this._txBytes = 0;
       this._txFlushT = null;
+      // Buffer de retransmisión de MI voz (anti-pérdida simétrico a la
+      // descarga): el servidor pide por {t:'falta'} las tramas que no le
+      // llegaron y yo las reenvío. Se conserva la frase actual y la
+      // anterior (puedo soltar el PTT antes de que el servidor complete).
+      this._vozTxPend = new Map();   // (tx<<1|fam) -> Uint8Array
+      this._vozTxFases = [];         // [[clave,...], ...] últimas 2 frases
+      this._vozTxFaseAct = null;     // claves de la frase abierta
+      this._vozTxBytes = 0;
       // Piso exclusivo (PTT): el servidor garantiza un solo hablante
       this._quieroPiso = false;
       this._tengoPiso = false;
@@ -1735,6 +1746,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     }
 
     _enviarFrame(pkt) {
+      if (pkt && pkt[0] === 0x01 && pkt.length >= 4) this._registrarVozTx(pkt);
       if (this._ws && this._ws.readyState === WebSocket.OPEN && this._ws.bufferedAmount < 12 * 1024) {
         try { this._ws.send(pkt); return; } catch {}
       }
@@ -1750,6 +1762,83 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     _programarFlushTx() {
       if (this._txFlushT) return;
       this._txFlushT = setTimeout(() => { this._txFlushT = null; this._drenarTx(); }, 300);
+    }
+
+    // ---------- retransmisión de MI voz (el servidor pide lo que perdió) ----------
+    // Clave = (tx<<1)|familia: el mismo bloque de 40 ms puede ir en Opus y en
+    // respaldo ADPCM — se guardan las dos variantes por si el servidor
+    // recibió una y perdió la otra.
+    _registrarVozTx(pkt) {
+      const rc = pkt[1];
+      const tx = pkt[2] | (pkt[3] << 8);
+      const fam = (rc >= 10 && rc <= 19) ? 0 : 1;
+      const clave = (tx << 1) | fam;
+      if (this._vozTxPend.has(clave)) return; // reintento: ya registrada
+      if (!this._vozTxFaseAct) {
+        this._vozTxFaseAct = [];
+        this._vozTxFases.push(this._vozTxFaseAct);
+      }
+      this._vozTxFaseAct.push(clave);
+      this._vozTxPend.set(clave, pkt);
+      this._vozTxBytes += pkt.length;
+      if (rc === 0) {
+        // EOS: también se guarda — al reenviar tras un corte "sella" el
+        // final de la frase en el servidor. Cierra la frase local:
+        // quedan reenviables las 2 últimas
+        this._vozTxFaseAct = null;
+        while (this._vozTxFases.length > 2) this._soltarVozFase(this._vozTxFases[0]);
+        return;
+      }
+      // tope de seguridad ~4 MB (≈8 min de voz a 8 kbps): suelta la frase
+      // más vieja conservando siempre la actual
+      while (this._vozTxBytes > 4194304 && this._vozTxFases.length > 1) {
+        this._soltarVozFase(this._vozTxFases[0]);
+      }
+    }
+
+    _soltarVozFase(fase) {
+      const i = this._vozTxFases.indexOf(fase);
+      if (i >= 0) this._vozTxFases.splice(i, 1);
+      for (const c of fase) {
+        const p = this._vozTxPend.get(c);
+        if (p) { this._vozTxBytes -= p.length; this._vozTxPend.delete(c); }
+      }
+      if (this._vozTxFaseAct === fase) this._vozTxFaseAct = null;
+    }
+
+    // Nueva sesión de micro = txSeq vuelve a 0: las pendientes de la sesión
+    // vieja chocarían con los tx nuevos — se descartan (ya no atribuibles)
+    _resetVozTxPend() {
+      this._vozTxPend.clear();
+      this._vozTxFases.length = 0;
+      this._vozTxFaseAct = null;
+      this._vozTxBytes = 0;
+    }
+
+    // El servidor pide los txs que le faltan: se reenvían desde el buffer
+    _reenviosVoz(txs) {
+      if (!Array.isArray(txs)) return;
+      let n = 0;
+      for (const t of txs) {
+        const tx = Number(t) & 0xffff;
+        for (let fam = 0; fam < 2; fam++) {
+          const pkt = this._vozTxPend.get((tx << 1) | fam);
+          if (pkt) this._enviarFrame(pkt);
+        }
+        if (++n >= 96) break;
+      }
+    }
+
+    // Tras reconectar, TODO lo enviado que el servidor no llegó a confirmar
+    // puede haber muerto en el socket anterior — se reenvía completo; él
+    // deduplica por tx e inserta en orden, así no hay dobles ni desorden
+    _reenvioVozPendiente() {
+      if (!this._vozTxPend.size) return;
+      const claves = [...this._vozTxPend.keys()].sort((a, b) => {
+        const ta = a >> 1, tb = b >> 1;
+        return (((ta - tb) & 0xffff) < 30000) ? -1 : 1;
+      });
+      for (const c of claves) this._enviarFrame(this._vozTxPend.get(c));
     }
 
     _drenarTx() {
@@ -2826,6 +2915,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             this._enviarJson({ t: 'piso_soltar' });
             this._programarFlushTx();
           }
+          // Voz propia en vuelo cuando murió el socket anterior: la reenvío
+          // — el servidor la deduplica por tx y la inserta en su hueco
+          setTimeout(() => this._reenvioVozPendiente(), 500);
           this.emit(RoomEvent.ConnectionStateChanged, 'connected');
           // reconexión interna del socket de medios: la app resincroniza el
           // historial (los seg_ini/seg_fin perdidos en el corte llegan por
@@ -2910,6 +3002,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (this._txFlushT) { clearTimeout(this._txFlushT); this._txFlushT = null; }
       this._txCola.length = 0;
       this._txBytes = 0;
+      this._resetVozTxPend();
       this._quieroPiso = false;
       this._tengoPiso = false;
       if (this._vozPipe) {
@@ -3063,6 +3156,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         case 'piso_perdido':
           this._tengoPiso = false;
           this.emit('piso_perdido', { por: m.por || '' });
+          break;
+
+        case 'falta':
+          // El servidor detectó huecos en MI frase archivada: reenvío las
+          // tramas que conservo — grabación completa aunque haya cortes
+          this._reenviosVoz(m.txs);
           break;
 
         case 'permisos':

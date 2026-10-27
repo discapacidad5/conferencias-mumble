@@ -55,18 +55,28 @@ type segmento struct {
 	Abierto  bool   `json:"abierto"`
 	Cortado  bool   `json:"interrumpida,omitempty"`
 	ruta     string
-	frames   [][]byte // solo mientras Abierto
+	frames   [][]byte // solo mientras Abierto o reparable
 	ultFrame int64    // unix ms de la última trama recibida
+	// Anti-pérdida emisor->servidor: dedup y detección de huecos por número
+	// de trama tx (16 bits, lo pone el emisor en payload[1:3] little-endian)
+	vistos   map[uint32]struct{} // (tx<<1 | familia) ya archivados
+	faltan   map[uint16]struct{} // txs detectados como perdidos
+	ultTx    uint16              // tx más alto visto
+	tieneTx  bool                // ya llegó al menos una trama numerada
+	ultFalta int64               // último aviso "falta" enviado al emisor
+	reparaH  int64               // >0: cerrado pero reparable hasta este instante
+	eosVisto bool                // cerrado por EOS del emisor (no por corte)
 }
 
 type segStore struct {
-	mu       sync.Mutex
-	sala     string
-	proxSeq  uint32
-	abiertos map[string]*segmento // identidad -> segmento abierto
-	cerrados []*segmento          // ordenados por seq
-	dir      string
-	mr       *mediaRoom
+	mu        sync.Mutex
+	sala      string
+	proxSeq   uint32
+	abiertos  map[string]*segmento // identidad -> segmento abierto
+	cerrados  []*segmento          // ordenados por seq
+	recientes []*segmento          // cerrados aún reparables (rellenan huecos)
+	dir       string
+	mr        *mediaRoom
 }
 
 func nuevoSegStore(sala string, mr *mediaRoom) *segStore {
@@ -164,20 +174,94 @@ func leerCabeceraSeg(p string) *segmento {
 	return sg
 }
 
+// txDeTrama lee el número de trama del emisor (payload[1:3] little-endian).
+func txDeTrama(b []byte) uint16 {
+	if len(b) < 3 {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(b[1:3])
+}
+
+// txFamilia distingue las dos variantes del mismo bloque de voz (Opus /
+// respaldo ADPCM): comparten tx pero ambas se archivan para los oyentes
+// sin decodificador Opus. El dedup y el orden son por tx; la familia solo
+// evita descartar la variante hermana.
+func txFamilia(rc byte) uint32 {
+	if rc >= 10 && rc <= 19 {
+		return 0 // Opus
+	}
+	return 1 // ADPCM / µ-law
+}
+
+// insertarTrama añade una trama al segmento ordenada por tx: una
+// retransmisión que llega tarde rellena su hueco, no se pega al final.
+func insertarTrama(sg *segmento, tx uint16, tieneTx bool, cp []byte) {
+	ins := len(sg.frames)
+	if tieneTx {
+		for ins > 0 && ((int(txDeTrama(sg.frames[ins-1]))-int(tx))&0xffff) < 30000 {
+			ins--
+		}
+	}
+	sg.frames = append(sg.frames, nil)
+	copy(sg.frames[ins+1:], sg.frames[ins:])
+	sg.frames[ins] = cp
+}
+
+// marcarHuecos registra como perdidos los txs entre ultTx y tx (exclusivo).
+// Devuelve solo los huecos NUEVOS (para pedírselos al emisor).
+func marcarHuecos(sg *segmento, tx uint16) []uint16 {
+	if !sg.tieneTx {
+		return nil
+	}
+	diff := (int(tx) - int(sg.ultTx)) & 0xffff
+	if diff <= 1 || diff >= 30000 {
+		return nil
+	}
+	var nuevos []uint16
+	for k := 1; k < diff && k <= 64; k++ {
+		miss := uint16(int(sg.ultTx) + k)
+		if _, ok := sg.faltan[miss]; !ok {
+			sg.faltan[miss] = struct{}{}
+			nuevos = append(nuevos, miss)
+		}
+	}
+	return nuevos
+}
+
 // appendFrame acumula una trama de voz en el segmento abierto del hablante.
-// Devuelve (segmentoNuevo, segmentoCerrado) para notificar por ctrl.
-func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, forceEOS bool) (nuevo *segmento, cerrado *segmento) {
+// Devuelve (segmentoNuevo, segmentoCerrado, txsFaltantes) — el tercero se
+// envía al emisor como {t:'falta'} para que retransmita lo que se perdió.
+func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, forceEOS bool) (nuevo *segmento, cerrado *segmento, faltan []uint16) {
 	rc := payload[0]
+	tieneTx := len(payload) >= 3
+	var tx uint16
+	if tieneTx {
+		tx = txDeTrama(payload)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	sg := s.abiertos[id]
 	if rc == 0 || forceEOS {
-		// EOS: el hablante soltó la frase
+		// EOS: el hablante soltó la frase. Si el EOS saltó sobre tramas que
+		// nunca llegaron, se marcan: el segmento queda reparable unos
+		// segundos y se le piden al emisor.
 		if sg != nil {
+			if tieneTx {
+				faltan = marcarHuecos(sg, tx)
+			}
+			if len(sg.faltan) > 0 && len(faltan) == 0 {
+				for t := range sg.faltan {
+					faltan = append(faltan, t)
+					if len(faltan) >= 64 {
+						break
+					}
+				}
+			}
+			sg.eosVisto = true
 			cerrado = s.cerrarSeg(sg, false)
 		}
-		return nil, cerrado
+		return nil, cerrado, faltan
 	}
 
 	if sg == nil {
@@ -189,14 +273,52 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 			Inicio:   ahora(),
 			Abierto:  true,
 			ultFrame: ahora(),
+			vistos:   map[uint32]struct{}{},
+			faltan:   map[uint16]struct{}{},
+			ultTx:    tx,
+			tieneTx:  tieneTx,
 		}
 		s.proxSeq++
 		s.abiertos[id] = sg
 		nuevo = sg
 	}
+
+	if tieneTx {
+		key := uint32(tx)<<1 | txFamilia(rc)
+		if _, dup := sg.vistos[key]; dup {
+			return nuevo, cerrado, nil // retransmisión de algo ya archivado
+		}
+		sg.vistos[key] = struct{}{}
+		faltan = marcarHuecos(sg, tx)
+		if ((int(tx) - int(sg.ultTx)) & 0xffff) < 30000 {
+			sg.ultTx = tx
+		}
+		delete(sg.faltan, tx)
+		// Si lleva huecos sin rellenar >4 s, se los volvemos a pedir al
+		// emisor (el primer aviso pudo perderse con el mismo micro-corte)
+		if len(sg.faltan) > 0 && ahora()-sg.ultFalta > 4000 {
+			sg.ultFalta = ahora()
+			for t := range sg.faltan {
+				if len(faltan) >= 64 {
+					break
+				}
+				ya := false
+				for _, u := range faltan {
+					if u == t {
+						ya = true
+						break
+					}
+				}
+				if !ya {
+					faltan = append(faltan, t)
+				}
+			}
+		}
+	}
+
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
-	sg.frames = append(sg.frames, cp)
+	insertarTrama(sg, tx, tieneTx, cp)
 	sg.Bytes += len(cp) + 2
 	sg.DurMs = ahora() - sg.Inicio
 	sg.ultFrame = ahora()
@@ -205,7 +327,74 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 	if sg.DurMs >= segMaxDurMs {
 		cerrado = s.cerrarSeg(sg, false)
 	}
-	return nuevo, cerrado
+	return nuevo, cerrado, faltan
+}
+
+// reparar encaja una trama retransmitida en un segmento YA cerrado:
+//   - tx en su lista de huecos -> la inserta ordenada y reescribe el archivo
+//   - tx por delante de ultTx en un segmento cerrado SIN EOS (corte a media
+//     frase) -> es la cola perdida de esa misma frase: se anexa y los huecos
+//     intermedios quedan pedidos
+//   - un EOS tardío -> "sella" el segmento (eosVisto): los txs mayores ya
+//     pertenecen a frases nuevas, no a ésta
+//
+// Devuelve el segmento reparado (para que el llamador re-pida huecos) o nil.
+func (s *segStore) reparar(id string, payload []byte) *segmento {
+	if len(payload) < 3 {
+		return nil
+	}
+	rc := payload[0]
+	tx := txDeTrama(payload)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sg := range s.recientes {
+		if sg.De != id {
+			continue
+		}
+		if rc == 0 {
+			// EOS retransmitido: cierra la ventana de continuación del
+			// segmento inmediatamente anterior a este tx
+			if !sg.eosVisto && sg.tieneTx && ((int(tx)-int(sg.ultTx))&0xffff) < 30000 {
+				sg.eosVisto = true
+				return sg
+			}
+			continue
+		}
+		_, eraFalta := sg.faltan[tx]
+		continua := !sg.eosVisto && sg.tieneTx && ((int(tx)-int(sg.ultTx))&0xffff) < 1500
+		if !eraFalta && !continua {
+			continue
+		}
+		key := uint32(tx)<<1 | txFamilia(rc)
+		if _, dup := sg.vistos[key]; dup {
+			return sg
+		}
+		sg.vistos[key] = struct{}{}
+		delete(sg.faltan, tx)
+		marcarHuecos(sg, tx)
+		if ((int(tx) - int(sg.ultTx)) & 0xffff) < 30000 {
+			sg.ultTx = tx
+		}
+		cp := make([]byte, len(payload))
+		copy(cp, payload)
+		insertarTrama(sg, tx, true, cp)
+		sg.Bytes += len(cp) + 2
+		sg.ultFrame = ahora()
+		sg.reparaH = ahora() + 45_000 // cada relleno extiende la ventana
+		if sg.ruta != "" {
+			tmp := sg.ruta + ".tmp"
+			if escribirArchivoSeg(tmp, sg) == nil {
+				_ = os.Rename(tmp, sg.ruta)
+				if st, err := os.Stat(sg.ruta); err == nil {
+					sg.Bytes = int(st.Size())
+				}
+			} else {
+				os.Remove(tmp)
+			}
+		}
+		return sg
+	}
+	return nil
 }
 
 // cerrarSeg escribe el archivo definitivo, lo mueve al historial y libera RAM.
@@ -235,7 +424,20 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 	} else {
 		os.Remove(tmp)
 	}
-	sg.frames = nil
+	// Queda reparable ~45 s: las retransmisiones del emisor rellenan sus
+	// huecos (reparar) y reescriben el archivo. Si NO llegó EOS también se
+	// acepta la cola de la frase que se perdió con el corte.
+	if len(sg.faltan) > 0 || !sg.eosVisto {
+		sg.reparaH = ahora() + 45_000
+		s.recientes = append(s.recientes, sg)
+		for len(s.recientes) > 8 {
+			viejo := s.recientes[0]
+			s.recientes = s.recientes[1:]
+			viejo.frames, viejo.vistos, viejo.faltan = nil, nil, nil
+		}
+	} else {
+		sg.frames, sg.vistos, sg.faltan = nil, nil, nil
+	}
 	return sg
 }
 
@@ -273,6 +475,19 @@ func (s *segStore) tick() {
 		}
 		_ = id
 	}
+	// reparables vencidos o ya completos: liberan sus tramas de RAM
+	if len(s.recientes) > 0 {
+		vivos := s.recientes[:0]
+		for _, sg := range s.recientes {
+			vivo := sg.reparaH > ahoraMs && (len(sg.faltan) > 0 || !sg.eosVisto)
+			if vivo {
+				vivos = append(vivos, sg)
+			} else {
+				sg.frames, sg.vistos, sg.faltan = nil, nil, nil
+			}
+		}
+		s.recientes = vivos
+	}
 	// purga por antigüedad + tope de bytes por sala
 	limite := ahoraMs - segRetencionMs
 	total := int64(0)
@@ -299,6 +514,7 @@ func (s *segStore) tick() {
 
 	for _, sg := range cerrados {
 		s.mr.notificarSegFin(sg)
+		s.pedirFaltantes(sg) // frase cerrada por inactividad con huecos
 	}
 }
 
@@ -509,6 +725,32 @@ func (r *mediaRoom) notificarSegFin(sg *segmento) {
 		"durMs": sg.DurMs, "bytes": sg.Bytes, "interrumpida": sg.Cortado,
 	})
 	r.enviarCtrlGrupo(sg.Grupo, append([]byte{1}, msg...))
+}
+
+// pedirFaltantes avisa al EMISOR de los txs que faltan en un segmento:
+// anti-pérdida simétrica — igual que el oyente le re-pide al servidor, el
+// servidor le re-pide al que hablaba (que conserva su frase en memoria).
+func (s *segStore) pedirFaltantes(sg *segmento) {
+	s.mu.Lock()
+	if len(sg.faltan) == 0 || ahora()-sg.ultFalta < 3000 {
+		s.mu.Unlock()
+		return
+	}
+	txs := make([]uint16, 0, len(sg.faltan))
+	for t := range sg.faltan {
+		txs = append(txs, t)
+		if len(txs) >= 64 {
+			break
+		}
+	}
+	sg.ultFalta = ahora()
+	s.mu.Unlock()
+	c := s.mr.clienteDe(sg.De)
+	if c == nil {
+		return
+	}
+	msg, _ := json.Marshal(map[string]any{"t": "falta", "seq": sg.Seq, "txs": txs})
+	c.enviarCtrl(append([]byte{1}, msg...))
 }
 
 // enviarCtrlGrupo manda un mensaje de control a todos los clientes de un grupo.
