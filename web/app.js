@@ -2196,7 +2196,10 @@ function cablearRoom(room) {
     // asientos: si se llamara renderTodo() al hablar, innerHTML='' destruiría
     // el <div class="asiento"> bajo el dedo y se tragaría el clic/tap.
     $$('.asiento[data-id]').forEach(el => {
-      el.style.borderColor = el.dataset.id === S.activo ? 'var(--verde)' : '';
+      // Verde "hablando" solo en asientos ajenos: en el mío el borde es el
+      // estado del PTT (rojo = yo hablando) — un verde inline lo taparía
+      el.style.borderColor =
+        (el.dataset.id === S.activo && el.dataset.id !== S.identidad) ? 'var(--verde)' : '';
     });
     $$('#audiencia .mini-tile').forEach(el => {
       el.classList.toggle('hablando', el.dataset.id === S.activo);

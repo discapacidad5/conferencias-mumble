@@ -138,7 +138,7 @@ label.check input { width: auto; }
    Si el navegador no soporta @property quedan tramos fijos alternados,
    que igual informan "conectando" sin el parpadeo de color completo */
 @property --pttAng { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
-.asiento-mio.ptt-conectando { border: 3px solid transparent; }
+.asiento-mio.ptt-conectando { border: 3px solid transparent !important; }
 .asiento-mio.ptt-conectando::before {
   content: ''; position: absolute; inset: 0; border-radius: 11px; padding: 3px;
   background: repeating-conic-gradient(from var(--pttAng),
@@ -214,10 +214,12 @@ label.check input { width: auto; }
 /* MI asiento entero es el pulsador PTT: el nombre queda dentro del botón
    y las esquinas guardan las acciones (⋮ opciones · ✕ salir · 📌 pin) */
 .asiento-mio { cursor: pointer; }
-.asiento-mio.ptt-libre { border: 3px solid var(--ambar); }
-.asiento-mio.ptt-ocupado { border: 3px solid var(--verde); }
-.asiento-mio.ptt-hablando { border: 3px solid var(--peligro); animation: pulsa 1.2s infinite; }
-.asiento-mio.ptt-sinpermiso { border-style: solid; opacity: .8; }
+/* !important: el marcador verde "hablando" se pone como estilo inline en
+   todos los asientos; en el mío el estado del PTT debe ganar SIEMPRE */
+.asiento-mio.ptt-libre { border: 3px solid var(--ambar) !important; }
+.asiento-mio.ptt-ocupado { border: 3px solid var(--verde) !important; }
+.asiento-mio.ptt-hablando { border: 3px solid var(--peligro) !important; animation: pulsa 1.2s infinite; }
+.asiento-mio.ptt-sinpermiso { border-style: solid; border-color: var(--borde) !important; opacity: .8; }
 .asiento-esq {
   position: absolute; z-index: 5; min-width: 30px; min-height: 30px; padding: 0 .35rem;
   border-radius: 8px; background: rgba(0,0,0,.72); border: 1px solid var(--borde);
