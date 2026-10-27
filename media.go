@@ -116,6 +116,7 @@ type clienteWS struct {
 	canCam     bool
 	canPan     bool
 	opusRx     bool
+	pisoSuelto bool  // true tras piso_soltar: tramas rezagadas reparan la frase cerrada, no reabren el piso
 	ultimoHabl int64 // unix ms de su última trama de voz aceptada (watchdog de piso)
 	avisPiso   int64 // rate-limit del aviso piso_ocupado
 }
@@ -718,9 +719,11 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			tipo, _ := m["t"].(string)
 			switch tipo {
 			case "piso_tomar":
+				c.pisoSuelto = false
 				mr.tomarPisoWS(c)
 
 			case "piso_soltar":
+				c.pisoSuelto = true
 				liberarPisoDe(sala, c.identidad, false)
 
 			case "piso_hold":
@@ -833,8 +836,18 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				if len(payload) >= 3 {
 					if sgR := mr.seg.reparar(c.identidad, payload); sgR != nil {
 						mr.seg.pedirFaltantes(sgR)
+						if rc == 0 && sgR.DurMs >= 700 {
+							mr.notificarSegFin(sgR)
+						}
 						continue
 					}
+				}
+				// Si el cliente ya soltó el botón (piso_soltar llegó antes que
+				// las últimas tramas de audio encoladas), descartar cualquier
+				// trama sobrante para NO volver a tomar el piso ni abrir otra
+				// nota en vivo cuando el usuario ya levantó el dedo.
+				if c.pisoSuelto {
+					continue
 				}
 				// Piso exclusivo: solo pasa la voz del dueño del piso; hablar
 				// lo toma en automático y un tercero puede tumbártelo según los

@@ -193,6 +193,21 @@ func txFamilia(rc byte) uint32 {
 	return 1 // ADPCM / µ-law
 }
 
+// durDeTramas estima la duración real en ms a partir de los números tx
+// únicos archivados (cada tx = 40 ms de voz), para que una frase enviada
+// en ráfaga tras un micro-corte conserve su duración verdadera y no se
+// descarte por haber llegado en pocos milisegundos de reloj.
+func durDeTramas(sg *segmento) int64 {
+	if len(sg.vistos) > 0 {
+		txs := map[uint32]struct{}{}
+		for k := range sg.vistos {
+			txs[k>>1] = struct{}{}
+		}
+		return int64(len(txs)) * 40
+	}
+	return int64(len(sg.frames)) * 40
+}
+
 // insertarTrama añade una trama al segmento ordenada por tx: una
 // retransmisión que llega tarde rellena su hueco, no se pega al final.
 func insertarTrama(sg *segmento, tx uint16, tieneTx bool, cp []byte) {
@@ -321,6 +336,9 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 	insertarTrama(sg, tx, tieneTx, cp)
 	sg.Bytes += len(cp) + 2
 	sg.DurMs = ahora() - sg.Inicio
+	if d := durDeTramas(sg); d > sg.DurMs {
+		sg.DurMs = d
+	}
 	sg.ultFrame = ahora()
 
 	// Intervención muy larga (PTT olvidado): cortar a 90 s y seguir en una nueva
@@ -379,8 +397,15 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 		copy(cp, payload)
 		insertarTrama(sg, tx, true, cp)
 		sg.Bytes += len(cp) + 2
+		if d := durDeTramas(sg); d > sg.DurMs {
+			sg.DurMs = d
+		}
 		sg.ultFrame = ahora()
 		sg.reparaH = ahora() + 45_000 // cada relleno extiende la ventana
+		if sg.ruta == "" && sg.DurMs >= 700 {
+			sg.ruta = filepath.Join(s.dir, "seg-"+itoa8(sg.Seq)+".seg")
+			s.cerrados = append(s.cerrados, sg)
+		}
 		if sg.ruta != "" {
 			tmp := sg.ruta + ".tmp"
 			if escribirArchivoSeg(tmp, sg) == nil {
@@ -406,10 +431,19 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 	if sg.DurMs <= 0 {
 		sg.DurMs = ahora() - sg.Inicio
 	}
+	if d := durDeTramas(sg); d > sg.DurMs {
+		sg.DurMs = d
+	}
 	// tap accidental del PTT: notas de <0,7 s no se archivan ni entran al
-	// manifiesto (el cliente igual recibe seg_fin y borra la nota en vivo)
+	// manifiesto, pero si aún no llegó su EOS quedan en recientes por si las
+	// tramas de la frase vienen retrasadas detrás de piso_soltar
 	if sg.DurMs < 700 {
-		sg.frames = nil
+		if !sg.eosVisto {
+			sg.reparaH = ahora() + 45_000
+			s.recientes = append(s.recientes, sg)
+		} else {
+			sg.frames, sg.vistos, sg.faltan = nil, nil, nil
+		}
 		return sg
 	}
 	ruta := filepath.Join(s.dir, "seg-"+itoa8(sg.Seq)+".seg")

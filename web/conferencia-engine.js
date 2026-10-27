@@ -439,7 +439,7 @@ class VozRxProcessor extends AudioWorkletProcessor {
     this.fadeInPos = 0;
     this.fadeInLen = Math.ceil(rate * 0.005);
     this.readRate = 1.0;
-    this.velMax = 1.12;
+    this.velMax = 1.0;
     this.targetSamples = Math.ceil(rate * 0.06); // 60 ms: tiempo real instantáneo
     // SOLA: cola de las últimas muestras emitidas, para alinear por
     // correlación cada ventana al acelerar (drenar rápido sin subir el tono)
@@ -463,8 +463,9 @@ class VozRxProcessor extends AudioWorkletProcessor {
         return;
       }
       if (d.t === 'vel' && typeof d.v === 'number') {
-        // Drenaje acelerado cuando hay historial atrasado (hasta ~1.35x)
-        this.velMax = Math.max(1.05, Math.min(1.4, d.v));
+        // 1.0 = velocidad natural exacta (sin acelerar); solo >1 cuando hay
+        // más de 15 s de retraso acumulado
+        this.velMax = Math.max(1.0, Math.min(1.4, d.v));
         return;
       }
       if (d.t === 'target' && typeof d.ms === 'number') {
@@ -538,13 +539,12 @@ class VozRxProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Drenar micro-retrasos deprisa (+12% normal, hasta +35% con historial atrasado)
+    // Drenar retrasos solo cuando velMax > 1.0 (más de 15 s de atraso);
+    // con <= 15 s suena siempre a velocidad 1.0x natural
     const over = this.available - this.targetSamples;
     let desired = 1.0;
-    if (over > this.rate * 0.05) {
-      desired = Math.min(this.velMax, 1.0 + (over / this.rate) * 0.35);
-    } else if (!this.eosPending && this.available < this.targetSamples * 0.4) {
-      desired = 0.96;
+    if (this.velMax > 1.001 && over > this.rate * 0.05) {
+      desired = Math.min(this.velMax, 1.0 + (over / this.rate) * 0.15);
     }
     this.readRate += (desired - this.readRate) * 0.15;
 
@@ -2048,7 +2048,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         writePos: 0, readPosF: 0, available: 0, playing: false,
         eosPending: true, waitSamples: 0, underrunSamples: 0,
         lastOut: 0, fadeInPos: 0, fadeInLen: Math.ceil(ctxRate * 0.005),
-        readRate: 1.0, velMax: 1.12, eosSent: true,
+        readRate: 1.0, velMax: 1.0, eosSent: true,
         targetSamples: Math.ceil(ctxRate * 0.06),
       };
       this._vozPipe = pipe;
@@ -2091,14 +2091,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           }
           const over = pipe.available - pipe.targetSamples;
           let desired = 1.0;
-          // respaldo sin SOLA: limitar a +4% (imperceptible) para no subir el
-          // tono — salvo con retraso enorme (velMax≥2), donde importa llegar
-          // al presente aunque el tono suba
-          if (over > pipe.ctxRate * 0.05) {
-            const capVel = pipe.velMax >= 2 ? pipe.velMax : 1.04;
-            desired = Math.min(capVel, 1.0 + (over / pipe.ctxRate) * 0.35);
-          } else if (!pipe.eosPending && pipe.available < pipe.targetSamples * 0.4) {
-            desired = 0.96;
+          if (pipe.velMax > 1.001 && over > pipe.ctxRate * 0.05) {
+            const capVel = pipe.velMax >= 2 ? pipe.velMax : Math.min(pipe.velMax, 1.08);
+            desired = Math.min(capVel, 1.0 + (over / pipe.ctxRate) * 0.15);
           }
           pipe.readRate += (desired - pipe.readRate) * 0.15;
           for (let i = 0; i < n; i++) {
@@ -2291,18 +2286,16 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // re-escuchada NO es retraso: siempre a velocidad natural.
       const retraso = this._retrasoMs();
       // El buffer adaptativo (_jitMs) es retraso INTENCIONAL: no se drena
-      // acelerado — la aceleración solo actúa sobre el atraso por encima
-      // del colchón elegido por la estabilidad de la red
+      // acelerado — y hasta 15 s de atraso se oye a velocidad 1.0x natural
       const lag = Math.max(0, retraso - this._jitMs);
       const replayActivo = this._replayQ.length > 0 ||
         this._replayProg.length > 0 || this._replayPendMs > 30;
       const vel = replayActivo ? 1.0
-        : lag > 60000 ? 4.0   // >1 min: casi a saltos, llegar ya
-        : lag > 30000 ? 2.5
-        : lag > 10000 ? 1.6
-        : lag > 5000 ? 1.33
-        : lag > 3000 ? 1.08
-        : 1.0;
+        : lag > 60000 ? 1.40   // >60 s
+        : lag > 45000 ? 1.25   // >45 s
+        : lag > 30000 ? 1.15   // >30 s
+        : lag > 15000 ? 1.06   // 15–30 s: apenas +6%
+        : 1.0;                 // ≤15 s: velocidad 100% normal
       this._velAct = vel;
       if (vel !== pipe.velMax) {
         pipe.velMax = vel;
@@ -2434,13 +2427,21 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         if (parsed.sg.de && parsed.sg.abierto) this._segPorHablante.set(parsed.sg.de, sg.seq);
         const nuevos = await this._decodificarFramesSeg(parsed.frames, sg);
         for (const b of nuevos) this._insertarBloque(sg, b);
+        if (parsed.frames && parsed.frames.length) {
+          sg.raw = parsed.frames.map(f => f.slice());
+          sg.rawBytes = sg.raw.reduce((a, u) => a + u.length, 0);
+        }
         sg.bajando = false;
         sg.descargado = true;
+        sg.huecos = false;
         sg.ultRxT = performance.now(); // si sigue abierta, re-sondear en ~4 s
         if (!parsed.sg.abierto) { sg.completo = true; sg.finLocal = true; }
         if (parsed.sg.durMs) sg.durMs = parsed.sg.durMs;
         if (parsed.sg.cortado) sg.interrumpida = true;
         if (parsed.sg.inicio) sg.inicio = parsed.sg.inicio;
+        if (!parsed.sg.abierto && typeof window.idbGuardarArchivo === 'function') {
+          try { window.idbGuardarArchivo(parsed); } catch {}
+        }
       } catch {
         if (seg) seg.bajando = false;
       } finally {
@@ -2703,6 +2704,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     reproducirSeg(seq) {
       const seg = this._vozSegs.get(seq);
       if (!seg || !seg.bloques.length) return false;
+      // Si en vivo llegaron tramas con huecos y aún no se descargó el archivo
+      // completo del servidor, devolver false para que el llamador descargue
+      // el .seg íntegro del servidor en vez de reproducir la copia rota
+      if (seg.huecos && !seg.descargado) return false;
       return this._encolarReplay(seq, seg.bloques.slice());
     }
 
@@ -2718,7 +2723,16 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const parsed = parsearArchivoSeg(buf instanceof Uint8Array ? buf : new Uint8Array(buf));
       if (!parsed || !parsed.frames.length) return false;
       const bl = await this._decodificarFramesSeg(parsed.frames, null);
-      return this._encolarReplay(seq || parsed.sg.seq || ('r' + Date.now()), bl);
+      const sq = seq || parsed.sg.seq;
+      const seg = sq ? this._vozSegs.get(sq) : null;
+      if (seg && bl.length) {
+        seg.bloques = bl.slice();
+        seg.raw = parsed.frames.map(f => f.slice());
+        seg.rawBytes = seg.raw.reduce((a, u) => a + u.length, 0);
+        seg.descargado = true;
+        seg.huecos = false;
+      }
+      return this._encolarReplay(sq || ('r' + Date.now()), bl);
     }
 
     // Expone el parser CSEG: la app guarda en IndexedDB la nota descargada
@@ -2732,6 +2746,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return s ? {
         seq: s.seq, de: s.de, nombre: s.nombre, durMs: s.durMs,
         inicio: s.inicio, interrumpida: s.interrumpida, raw: s.raw,
+        huecos: !!s.huecos, descargado: !!s.descargado,
       } : null;
     }
 

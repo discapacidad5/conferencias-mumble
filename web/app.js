@@ -1659,12 +1659,12 @@ function wirePttButton(el, gate) {
     // Capturar el puntero + el arrastre se sigue en WINDOW: en móvil la
     // captura a veces falla o el navegador manda pointerleave/cancel al
     // cruzar el borde — con el seguimiento global el gesto no se pierde.
-    // Los asientos no usan gesto: llevan esquinas fijas 🔒 / A.
-    if (el._pttSinGesto) return;
+    // Los asientos llevan sinGesto (no arrastran 🔒/A, usan esquinas fijas)
+    // pero IGUAL necesitan seguimiento en window para soltar al levantar.
     try { el.setPointerCapture(e.pointerId); } catch {}
     wireGestoGlobal();
-    S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, lock: false, auto: false };
-    mostrarGestosPtt(el);
+    S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, sinGesto: !!el._pttSinGesto, lock: false, auto: false };
+    if (!el._pttSinGesto) mostrarGestosPtt(el);
   });
   el.addEventListener('click', (e) => {
     // click residual tras un gesto (bloquear/auto): no debe disparar nada
@@ -1699,7 +1699,7 @@ function wireGestoGlobal() {
   wireGestoGlobal._ok = true;
   window.addEventListener('pointermove', (e) => {
     const g = S.ptt._gesto;
-    if (!g || !S.ptt.quiero || S.ptt._bloqueado) return;
+    if (!g || g.sinGesto || !S.ptt.quiero || S.ptt._bloqueado) return;
     const dy = g.y0 - e.clientY, dx = g.x0 - e.clientX;
     g.lock = dy > 56;                           // arrastre hacia arriba
     g.auto = dx < -56 && !g.lock;               // arrastre hacia la derecha
@@ -1741,6 +1741,11 @@ function wireGestoGlobal() {
   };
   window.addEventListener('pointerup', fin);
   window.addEventListener('pointercancel', fin);
+  window.addEventListener('touchend', fin, { passive: true });
+  window.addEventListener('touchcancel', fin, { passive: true });
+  window.addEventListener('blur', () => {
+    if (S.ptt.quiero && S.ptt.modo === 'hold' && !S.ptt._bloqueado && !tengoPalabra()) pttOff();
+  });
 }
 
 // Esquina 🔒 de mi asiento / puesto de la palabra: arrancar hablando ya
@@ -5021,7 +5026,10 @@ async function idbMigrarLegado(db) {
 async function idbGuardarSeg(seq) {
   if (!S.room || typeof S.room.datosSeg !== 'function') return;
   const d = S.room.datosSeg(seq);
-  if (!d || !d.raw || !d.raw.length) return;
+  // Solo cachear en IndexedDB cuando el segmento esté COMPLETO (sin huecos
+  // o ya descargado del servidor); si en vivo faltaron tramas, no guardar
+  // la copia rota — al darle ▶ se bajará el archivo entero del servidor.
+  if (!d || (d.huecos && !d.descargado) || !d.raw || !d.raw.length) return;
   try {
     const raw = d.raw.map(u => u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength));
     const rec = {
