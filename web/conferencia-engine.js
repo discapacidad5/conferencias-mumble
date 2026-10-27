@@ -2441,10 +2441,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return true;
     }
 
-    // Quita la marca de pausa sin sonar: la próxima re-escucha empieza
-    // desde el inicio (opción "↺ desde el inicio" del menú ⋮)
-    reiniciarReplay(seq) {
+    // ⏹ de una nota: olvida su pausa y, si es la que está sonando, corta
+    // la salida al instante. El fin avisado deja el botón en ▶ y la
+    // próxima escucha empieza desde el principio
+    detenerReplay(seq) {
       this._replayPausas.delete(seq);
+      const rp = this._replayProg && this._replayProg[0];
+      if (rp && rp.seq === seq) {
+        this._replayQ.length = 0;
+        this._replayProg.length = 0;
+        this._replayPendMs = 0;
+        this._replayPlayedMs = 0;
+        this._vaciarPipeVoz();
+      }
+      this.emit('seg_replay_fin', seq);
     }
 
     // Reanuda la nota pausada desde donde quedó (salta los bloques ya
@@ -2452,6 +2462,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     reanudarReplay(seq) {
       const p = this._replayPausas.get(seq);
       if (!p) return false;
+      // Reanudar interrumpe igual que tocar otra nota: si algo suena,
+      // se descarta y la pausada entra ya (no se encola detrás)
+      if (this._replayProg.length || this._replayQ.length || this._vozBufMs > 60) {
+        while (this._replayProg.length) this.emit('seg_replay_fin', this._replayProg.shift().seq);
+        this._replayQ.length = 0;
+        this._replayPendMs = 0;
+        this._replayPlayedMs = 0;
+        this._vaciarPipeVoz();
+      }
       const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
       let ms = 0, i = 0;
       while (i < p.bloques.length &&

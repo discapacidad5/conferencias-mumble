@@ -4509,10 +4509,8 @@ function menuMensaje(el, x, y) {
       el.classList.add('sel');
     } },
   ];
-  if (seq && !grabando) {
-    items.push({ label: '↺ Escuchar desde el inicio', fn: () => reiniciarNota(seq) });
+  if (seq && !grabando)
     items.push({ label: '⬇️ Descargar audio', fn: () => exportarNotas([seq]) });
-  }
   items.push({ label: '🗑️ Eliminar', peligro: true, fn: () =>
     confirmar(seq
       ? '¿Eliminar esta nota de voz? No volverá a aparecer al sincronizar.'
@@ -4567,6 +4565,7 @@ function agregarNotaVozEnVivo(meta) {
   el.dataset.durMs = 0;
   el.innerHTML = `<div class="quien">🎙️ ${esc(meta.nombre || meta.de)} · <span class="muted">ahora</span></div>` +
     `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}" title="Ir al audio en tiempo real">⏭️</button>` +
+    `<button class="nv-stop btn mini oculto" data-seq="${meta.seq}" title="Detener">⏹️</button>` +
     `<div class="nv-pista"><div class="nv-relleno rec"></div></div>` +
     `<span class="nv-tiempo">● 0:00</span></div>`;
   // sin ⋮ mientras graba: no hay nada que seleccionar/descargar/borrar
@@ -4642,6 +4641,11 @@ function agregarNotaVoz(meta) {
       if (!b.classList.contains('sonando')) b.textContent = '▶';
       b.onclick = () => reproducirNota(meta.seq);
     }
+    const bs = viejo.querySelector('.nv-stop');
+    if (bs) {
+      bs.classList.remove('oculto');
+      bs.onclick = (ev) => { ev.stopPropagation(); detenerNota(meta.seq); };
+    }
     return;
   }
   const lista = $('#chat-lista');
@@ -4651,6 +4655,7 @@ function agregarNotaVoz(meta) {
   el.dataset.durMs = meta.durMs || 0;
   el.innerHTML = `<div class="quien">🎙️ ${esc(meta.nombre || meta.de)}${hora ? ` · <span class="muted">${hora}</span>` : ''}${meta.interrumpida ? ' <span class="muted">(interrumpida)</span>' : ''}</div>` +
     `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}">▶</button>` +
+    `<button class="nv-stop btn mini" data-seq="${meta.seq}" title="Detener">⏹️</button>` +
     `<div class="nv-pista"><div class="nv-relleno"></div></div>` +
     `<span class="nv-tiempo">${fmtDurSeg(meta.durMs)}</span></div>`;
   ponerOpcionesMsg(el);
@@ -4668,6 +4673,7 @@ function agregarNotaVoz(meta) {
   S._nvSeqs.push(meta.seq);
   S._nvSeqs.sort((a, b) => a - b);
   el.querySelector('.nv-play').onclick = () => reproducirNota(meta.seq);
+  el.querySelector('.nv-stop').onclick = (ev) => { ev.stopPropagation(); detenerNota(meta.seq); };
 }
 
 function marcarNotaVoz(seq, est, prog) {
@@ -4803,23 +4809,19 @@ function pcmAWav(pcm, rate) {
 async function reproducirNota(seq) {
   if (!S.room) return;
   if (!S._nvPausas) S._nvPausas = new Set();
-  if (S._nvForzarIni === seq) {
-    S._nvForzarIni = 0; // "↺ desde el inicio": ni pausa ni reanudar
-  } else {
-    // La nota que está sonando se PAUSA al pisarla de nuevo; si quedó en
-    // pausa, otro toque la reanuda desde donde iba — aunque hayas
-    // escuchado otras notas entremedio, la marca no se pierde
-    if (S._nvPausas.has(seq) && S.room.reanudarReplay && S.room.reanudarReplay(seq)) {
-      S._nvPausas.delete(seq);
-      S._nvRepro = seq;
-      marcarNotaVoz(seq, 'sonando');
-      return;
-    }
-    if (S.room.pausarReplay && S.room.pausarReplay(seq)) {
-      S._nvPausas.add(seq);
-      marcarNotaVoz(seq, 'pausa');
-      return;
-    }
+  // La nota que está sonando se PAUSA al pisarla de nuevo; si quedó en
+  // pausa, otro toque la reanuda desde donde iba — aunque hayas
+  // escuchado otras notas entremedio, la marca no se pierde
+  if (S._nvPausas.has(seq) && S.room.reanudarReplay && S.room.reanudarReplay(seq)) {
+    S._nvPausas.delete(seq);
+    S._nvRepro = seq;
+    marcarNotaVoz(seq, 'sonando');
+    return;
+  }
+  if (S.room.pausarReplay && S.room.pausarReplay(seq)) {
+    S._nvPausas.add(seq);
+    marcarNotaVoz(seq, 'pausa');
+    return;
   }
   S._nvRepro = seq;
   marcarNotaVoz(seq, 'cargando'); // feedback inmediato mientras decodifica/descarga
@@ -4843,14 +4845,14 @@ async function reproducirNota(seq) {
   toast('Esa nota de voz ya no está disponible (el servidor la guarda 1 hora)');
 }
 
-// "↺ desde el inicio" (menú ⋮): olvida la pausa guardada y la nota
-// empieza a sonar desde el principio, aunque esté sonando o pausada
-function reiniciarNota(seq) {
+// ⏹ junto al play: detiene la nota (si suena o está pausada) y olvida su
+// posición — el siguiente ▶ la empieza desde el inicio
+function detenerNota(seq) {
   if (!S.room) return;
   if (S._nvPausas) S._nvPausas.delete(seq);
-  if (S.room.reiniciarReplay) S.room.reiniciarReplay(seq);
-  S._nvForzarIni = seq;
-  reproducirNota(seq);
+  if (S._nvRepro === seq) S._nvRepro = 0; // no encadenar con la siguiente nota
+  if (S.room.detenerReplay) S.room.detenerReplay(seq);
+  else marcarNotaVoz(seq, 'oido');
 }
 
 // Al terminar de re-escuchar una nota, sigue con la siguiente del historial
