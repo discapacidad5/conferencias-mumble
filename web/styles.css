@@ -225,6 +225,16 @@ label.check input { width: auto; }
   background: var(--violeta2); color: #fff; font-size: .68rem; font-weight: 700;
   display: grid; place-items: center; box-shadow: 0 1px 3px rgba(0,0,0,.6);
 }
+/* La Palabra en espera (me interrumpieron): interior violeta = micro
+   pausado pero armado — vuelve solo cuando el otro suelte el piso */
+.asiento-mio.ptt-espera {
+  background: linear-gradient(rgba(139,92,246,.32), rgba(139,92,246,.32)), var(--bg2);
+  border: 3px solid var(--violeta2) !important;
+}
+.btn.ctl.ptt-espera, #chat-enviar.ptt-espera, .asiento-ptt.ptt-espera {
+  background: var(--violeta); border-color: var(--violeta2); color: #fff;
+  box-shadow: 0 0 0 3px var(--violeta2), 0 0 12px rgba(139,92,246,.5);
+}
 /* mi asiento en automático: interior teñido de violeta (igual que el cuerpo
    del pulsador) — mientras no transmita el color dice "estoy armado";
    hablando vuelve al fondo normal con el borde rojo */

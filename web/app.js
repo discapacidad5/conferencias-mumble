@@ -1784,13 +1784,17 @@ function ocultarGestosPtt() {
 // · aro girando amarillo/rojo = pisado pero aún conectando (micro + piso)
 function renderPttEstados() {
   const otro = !!(S.estado && S.estado.piso && S.estado.piso !== S.identidad);
+  // La Palabra no es un pulsador: con piso = hablando (rojo); sin piso por
+  // interrupción = espera (violeta, el micro vuelve solo al soltar el otro)
   const st = S.ptt.tengo ? 'hablando'
+    : tengoPalabra() ? 'espera'
     : S.ptt.quiero ? 'conectando'
     : !puedoHablar() ? 'sinpermiso'
     : otro ? 'ocupado' : 'libre';
   const auto = S.ptt.modo === 'auto';
   const tit = st === 'hablando'
     ? (auto ? 'Automático transmitiendo — toca para apagarlo' : 'Suelta para terminar')
+    : st === 'espera' ? 'Micro en espera: te interrumpieron — vuelve solo al soltar'
     : st === 'conectando' ? 'Conectando… verificando micro y piso'
     : st === 'sinpermiso' ? 'Pide la palabra para hablar'
     : st === 'ocupado' ? `Hablando: ${S.estado.pisoNombre || S.estado.piso}`
@@ -1798,7 +1802,7 @@ function renderPttEstados() {
     : auto ? 'Automático encendido: tu voz pisa el botón — toca para apagarlo'
     : 'Toca para hablar / toca para soltar';
   $$('.ptt-sup').forEach(el => {
-    el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso', 'ptt-conectando');
+    el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso', 'ptt-conectando', 'ptt-espera');
     el.classList.add('ptt-' + st);
     el.classList.toggle('ptt-bloqueado', !!S.ptt._bloqueado);
     el.classList.toggle('ptt-auto', auto);
@@ -1809,6 +1813,7 @@ function renderPttEstados() {
   $$('.asiento-esq.auto').forEach(b => b.classList.toggle('on', S.ptt.modo === 'auto'));
   const me = $('#mic-estado');
   if (me) me.textContent = st === 'hablando' ? (auto ? 'Auto: transmitiendo' : 'Estás hablando')
+    : st === 'espera' ? 'En espera — te interrumpieron'
     : st === 'conectando' ? 'Conectando…'
     : st === 'sinpermiso' ? 'Sin permiso'
     : st === 'ocupado' ? `Habla ${S.estado.pisoNombre || S.estado.piso}`
@@ -2998,27 +3003,25 @@ function renderAsientos() {
     }
     // verde solo si habla otro: si la palabra es mía manda el rojo del PTT
     if (S.activo === palabraId && !soyYo) pb.style.borderColor = 'var(--verde)';
-    // con La Palabra mi puesto entero ES el pulsador: el micro es obligatorio
-    // (pttOff lo ignora) y las esquinas conservan ⋮ opciones y ✕ dejarla
+    // La Palabra NO es un pulsador: el micro es obligatorio mientras la
+    // tengas — no hay candado, ni automático, ni gesto. Se ve siempre
+    // "pisada" (rojo hablando / violeta en espera tras interrupción) y
+    // tocarla solo ofrece dejarla — no se puede callar sin soltarla
     if (soyYo && S.room) {
       pb.classList.add('asiento-mio', 'ptt-sup');
-      wirePttButton(pb);
-      pb._pttSinGesto = true;
       pb.insertAdjacentHTML('beforeend',
         '<button class="asiento-esq menu" type="button" title="Opciones de la palabra">⋮</button>' +
-        '<button class="asiento-esq salir" type="button" title="Dejar la palabra">✕</button>' +
-        '<button class="asiento-esq lock" type="button" title="Micrófono bloqueado (sin mantener)">🔒</button>' +
-        '<button class="asiento-esq auto" type="button" title="Modo automático: la voz pisa el botón por ti">A</button>');
+        '<button class="asiento-esq salir" type="button" title="Dejar la palabra">✕</button>');
       pb.querySelectorAll('.asiento-esq').forEach(b =>
         b.addEventListener('pointerdown', ev => ev.stopPropagation()));
       pb.querySelector('.asiento-esq.menu').onclick =
         (ev) => { ev.stopPropagation(); if (pb._menuPalabra) pb._menuPalabra(ev); };
       pb.querySelector('.asiento-esq.salir').onclick =
         (ev) => { ev.stopPropagation(); confirmar('¿Dejar la palabra? Tu micrófono se silenciará.', dejarPalabra); };
-      pb.querySelector('.asiento-esq.lock').onclick =
-        (ev) => { ev.stopPropagation(); pttEsquinaLock(); };
-      pb.querySelector('.asiento-esq.auto').onclick =
-        (ev) => { ev.stopPropagation(); cambiarModoPtt(S.ptt.modo === 'auto' ? 'hold' : 'auto'); };
+      pb.onclick = (ev) => {
+        if (ev.target.closest('.asiento-esq') || ev.target.closest('.asiento-pin')) return;
+        confirmar('¿Dejar la palabra? Tu micrófono se silenciará.', dejarPalabra);
+      };
     }
     if (S.estado.palabraFin || S.estado.palabraPausada) {
       const msRest = S.estado.palabraPausada || Math.max(0, S.estado.palabraFin - Date.now());
@@ -3573,9 +3576,10 @@ function renderControles() {
   // igual con la cámara: sin permiso se desactiva y libera el hardware
   if (!puedoCam() && camPub)
     S.room.localParticipant.setCameraEnabled(false).catch(() => {});
-  // con la palabra el micro debe seguir activo: si quedó muteado, se
-  // reactiva — salvo en modo PTT, donde el propio usuario manda con el botón
-  if (!modoPtt() && tengoPalabra() && micPub && micPub.isMuted && !S.audio.retirando)
+  // con la palabra el micro es obligatorio en cualquier modo: si quedó
+  // muteado (interrupción, reingreso) se reactiva — ahí no hay botón que
+  // lo calle, para callarse hay que dejar la palabra
+  if (tengoPalabra() && micPub && micPub.isMuted && !S.audio.retirando)
     micPub.unmute().catch(() => {});
 
   // El botón del micro ES el pulsador PTT: ya no existe "encender/apagar".
