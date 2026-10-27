@@ -1053,7 +1053,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               hablandoActivo = false;
               silencioCola = 0;
               enviarMarcadorEOS();
-              this._room._marcarHablandoLocal(false);
+              if (this._room) {
+                this._room._marcarHablandoLocal(false);
+                if (window.S && S.ptt && S.ptt.modo === 'auto') this._room.soltarPiso();
+              }
             }
             return;
           }
@@ -1088,10 +1091,32 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               const umbralAbrir = Math.max(0.0032, noiseFloor * 2.0);
               const umbralMantener = Math.max(0.0014, noiseFloor * 1.15);
 
-              if (rms >= (hablandoActivo ? umbralMantener : umbralAbrir)) {
+              // En modo PTT el botón manda, no el VAD: mientras se tenga el
+              // piso se transmite TODO (una pulsación = una nota de voz
+              // completa, sin cortes por pausas) y el segmento solo se
+              // cierra al soltar el botón. Si aún no se concede el piso no
+              // se gasta subida (las tramas las descartaría el servidor).
+              const ptt = window.S && window.S.ptt && window.S.ptt.modo !== 'auto';
+              if (ptt) {
+                if (window.S.ptt.quiero && window.S.ptt.tengo) {
+                  if (!hablandoActivo) { hablandoActivo = true; opusPending.length = 0; }
+                  silencioCola = 0;
+                  this._room._marcarHablandoLocal(true);
+                  enviarTrama40ms(frameBuf);
+                } else if (hablandoActivo) {
+                  hablandoActivo = false;
+                  silencioCola = 0;
+                  enviarMarcadorEOS();
+                  this._room._marcarHablandoLocal(false);
+                }
+              } else if (rms >= (hablandoActivo ? umbralMantener : umbralAbrir)) {
                 if (!hablandoActivo) {
                   hablandoActivo = true;
                   opusPending.length = 0;
+                  // En modo "auto" la voz pisa el botón: al empezar a hablar
+                  // se reclama el piso (si está ocupado el servidor responde
+                  // piso_ocupado y el cliente escucha el sonido de rechazo)
+                  if (this._room) this._room.tomarPiso();
                   // Pre-roll de 40 ms con fade-in de 4 ms para conservar el ataque de la primera sílaba
                   if (tienePrevFrame) {
                     const pre = new Float32Array(prevFrame48k);
@@ -1099,7 +1124,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                     enviarTrama40ms(pre);
                   }
                 }
-                silencioCola = 11; // 440 ms de cola continua: cero cortes entre sílabas y ahorro de datos en pausas
+                // Cola de silencio configurable ("Soltar tras N s de silencio")
+                silencioCola = Math.max(8, Math.round(((window.S && S.ptt && S.ptt.silencio) || 2.2) / 0.04));
                 this._room._marcarHablandoLocal(true);
                 enviarTrama40ms(frameBuf);
               } else if (silencioCola > 0) {
@@ -1111,6 +1137,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   enviarMarcadorEOS();
                   hablandoActivo = false;
                   this._room._marcarHablandoLocal(false);
+                  // modo auto: soltar el piso cierra la frase y deja hablar a otro
+                  this._room.soltarPiso();
                   if (pendingBr !== null && pendingBr !== maxBr) {
                     configurarOpus(pendingBr);
                   }

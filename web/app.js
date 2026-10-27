@@ -35,7 +35,7 @@ const S = {
   // PTT / piso exclusivo: modo 'auto' (micro libre), 'hold' (mantener
   // pisado) o 'lock' (tocar para bloquear/soltar). quiero = dedo/intención
   // pisada; tengo = el servidor confirmó el piso
-  ptt: { modo: localStorage.getItem('lk_ptt_modo') || 'auto', quiero: false, tengo: false },
+  ptt: { modo: localStorage.getItem('lk_ptt_modo') || 'hold', quiero: false, tengo: false, silencio: +(localStorage.getItem('lk_ptt_silencio')) || 2.2 },
   pisoCfg: null, pisoFaltan: 0,
   // historial local de notas de voz (IndexedDB): tope en MB y auto-salto
   segCapMB: +(localStorage.getItem('lk_seg_mb') || 100),
@@ -958,7 +958,7 @@ async function entrar() {
     if (S.previewStream) { S.previewStream.getTracks().forEach(t => t.stop()); S.previewStream = null; }
     S.audio.liberar = $('#pj-mic-btn').classList.contains('off');
     if (!S.audio.liberar && (estoySentado() || tengoPalabra())) {
-      try { await activarMic(true); } catch {}
+      try { if (modoPtt()) await prepararMicPtt(); else await activarMic(true); } catch {}
     }
 
     entrarVistaSala();
@@ -1572,6 +1572,7 @@ async function pttOn() {
     S.audio.on = true;
   } catch (e) {
     S.ptt.quiero = false;
+    if (S.room && S.room.soltarPiso) S.room.soltarPiso();
     toast('No se pudo hablar: ' + e.message);
   }
   renderControles();
@@ -1584,6 +1585,29 @@ async function pttOff() {
   if (pub && !pub.isMuted) await pub.mute().catch(() => {});
   S.audio.on = false;
   renderControles();
+}
+
+// Chirp estilo Zello: blip agudo al conseguir el piso, doble grave si te
+// lo niegan (otra persona habla y aún no cumple su tiempo)
+let _pttCtx = null;
+function sonidoPiso(ok) {
+  try {
+    _pttCtx = _pttCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _pttCtx;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const t0 = ctx.currentTime;
+    const tonos = ok ? [[880, 0, 0.09]] : [[200, 0, 0.11], [150, 0.13, 0.16]];
+    for (const [f, dt, dur] of tonos) {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = ok ? 'sine' : 'square';
+      o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, t0 + dt);
+      g.gain.exponentialRampToValueAtTime(0.12, t0 + dt + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dt + dur);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t0 + dt); o.stop(t0 + dt + dur + 0.02);
+    }
+  } catch {}
 }
 
 /* ---------- salas de discusión ---------- */
@@ -1618,7 +1642,18 @@ async function chequearGrupo() {
     if (camOn) {
       try { await room.localParticipant.setCameraEnabled(true, { deviceId: S.dev.cam ? { exact: S.dev.cam } : undefined }); } catch {}
     }
-    if (micOn) await activarMic(true);
+    if (micOn) {
+      // en modo PTT el micro vuelve listo pero silenciado; si seguía pisado
+      // (p.ej. al cambiar de sala de discusión) se retoma el piso y se abre
+      if (modoPtt()) {
+        try {
+          await prepararMicPtt();
+          if (S.ptt.quiero && S.audio.pub) { S.room.tomarPiso(); await S.audio.pub.unmute(); }
+        } catch {}
+      } else {
+        await activarMic(true);
+      }
+    }
     const disuelta = !dest && salia && !(S.grupos || []).some(g => g.id === salia);
     toast(dest ? `Te movieron a: ${nombreGrupo(dest)}`
       : disuelta ? 'La sala se disolvió — regresaste a la principal'
@@ -1954,11 +1989,23 @@ function cablearRoom(room) {
   room.on('voz_retraso', (ms) => renderRetraso(ms));
   // --- piso exclusivo (PTT) ---
   room.on('piso', (m) => {
-    if (m && m.estado === 'mio') { S.ptt.tengo = true; renderControles(); }
+    if (m && m.estado === 'mio') {
+      S.ptt.tengo = true;
+      if (modoPtt() && S.ptt.quiero) sonidoPiso(true); // chirp de "ya puedes hablar"
+      renderControles();
+    }
   });
   room.on('piso_ocupado', (m) => {
     S.ptt.tengo = false;
+    if (modoPtt()) {
+      // cancelar el intento: el usuario reintenta cuando cumpla el tiempo
+      S.ptt.quiero = false;
+      S.audio.on = false;
+      const pub = S.audio.pub;
+      if (pub && !pub.isMuted) pub.mute().catch(() => {});
+    }
     S.pisoFaltan = (m && m.faltan) || 0;
+    sonidoPiso(false); // rechazo: otro tiene el piso
     if (m && m.error) toast(m.error);
     else toast(`🎙️ ${(m && m.nombre) || 'Otra persona'} tiene el piso — podrás interrumpir en ${S.pisoFaltan} s`, 4500);
     renderControles();
@@ -2080,7 +2127,18 @@ async function reconectar() {
       if (S.camQuerida) {
         try { await room.localParticipant.setCameraEnabled(true, { deviceId: S.dev.cam ? { exact: S.dev.cam } : undefined }); } catch {}
       }
-      if (S.audio.on) await activarMic(true);
+      if (S.audio.on) {
+        // en modo PTT: re-publicar silenciado y, si seguía pisado, retomar el piso
+        if (modoPtt()) {
+          try {
+            S.audio.pub = null;
+            await prepararMicPtt();
+            if (S.ptt.quiero && S.audio.pub) { S.room.tomarPiso(); await S.audio.pub.unmute(); }
+          } catch {}
+        } else {
+          await activarMic(true);
+        }
+      }
       toast('Reconectado a la sala');
       refrescarEstado();
       renderTodo();
@@ -3176,6 +3234,24 @@ function renderControles() {
     ? `Hablando: ${S.estado.pisoNombre || S.estado.piso} — tu voz le interrumpe pasado tu tiempo`
     : 'Micrófono';
 
+  // Botón PTT grande: solo visible en modos PTT dentro de la sala.
+  // amarillo = piso libre · verde = otra persona habla · rojo = yo hablo
+  const bp = $('#btn-ptt');
+  if (bp) {
+    const mostrar = !!S.room && modoPtt() && !S.audio.retirando;
+    bp.classList.toggle('oculto', !mostrar);
+    if (mostrar) {
+      const otroHabla = !!(S.estado && S.estado.piso && S.estado.piso !== S.identidad);
+      const yo = S.ptt.quiero && S.ptt.tengo;
+      bp.className = 'ptt-grande' +
+        (!puedoHablar() ? ' nopermiso' : yo ? ' hablando' : (otroHabla || S.ptt.quiero) ? ' ocupado' : ' libre');
+      bp.title = !puedoHablar() ? 'Pide la palabra para hablar'
+        : yo ? 'Suelta para terminar'
+        : S.ptt.modo === 'hold' ? 'Mantén pisado para hablar'
+        : 'Toca para hablar / toca para soltar';
+    }
+  }
+
   // chip del piso: quién está hablando ahora y cuánto falta para poder
   // interrumpirlo según el menor de mis tiempos por rol
   const chipPiso = $('#st-piso');
@@ -3290,19 +3366,49 @@ function cablearControles() {
         if (S.ptt.modo === 'hold' && S.ptt.quiero) pttOff();
       }));
   }
+  // botón PTT grande (estilo Zello): amarillo = libre, verde = otro habla,
+  // rojo = yo tengo el piso. En "hold" se mantiene pisado; en "lock" toca/suelta.
+  const bp = $('#btn-ptt');
+  if (bp && !bp._wired) {
+    bp._wired = true;
+    bp.addEventListener('pointerdown', (e) => {
+      if (S.ptt.modo !== 'hold' || S.audio.retirando) return;
+      e.preventDefault();
+      pttOn();
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
+      bp.addEventListener(ev, () => {
+        if (S.ptt.modo === 'hold' && S.ptt.quiero) pttOff();
+      }));
+    bp.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (S.ptt.modo !== 'lock' || S.audio.retirando) return;
+      if (S.ptt.quiero) pttOff(); else pttOn();
+    });
+  }
   // cambio de modo de habla desde el menú del micro
   const selModo = $('#mic-modo');
   if (selModo) {
     selModo.value = S.ptt.modo;
+    const silWrap = $('#mic-silencio-wrap'), silIn = $('#mic-silencio');
+    if (silWrap && silIn) {
+      silWrap.classList.toggle('oculto', S.ptt.modo !== 'auto');
+      silIn.value = S.ptt.silencio;
+      silIn.onchange = () => {
+        S.ptt.silencio = Math.max(0.5, Math.min(10, +silIn.value || 2.2));
+        localStorage.setItem('lk_ptt_silencio', String(S.ptt.silencio));
+      };
+    }
     selModo.onchange = () => {
       S.ptt.modo = selModo.value;
       localStorage.setItem('lk_ptt_modo', S.ptt.modo);
+      if (silWrap) silWrap.classList.toggle('oculto', S.ptt.modo !== 'auto');
       $('#mic-pop').classList.add('oculto');
       if (S.ptt.modo === 'auto' && S.ptt.quiero) pttOff();
       else if (modoPtt() && puedoHablar()) prepararMicPtt();
-      toast(S.ptt.modo === 'auto' ? 'Micrófono libre' :
-        S.ptt.modo === 'hold' ? 'PTT: mantén pisado el micrófono para hablar' :
-        'PTT: toca el micrófono para hablar y tócalo otra vez para soltar');
+      toast(S.ptt.modo === 'auto' ? 'Voz automática: al hablar piso el botón por ti' :
+        S.ptt.modo === 'hold' ? 'PTT: mantén pisado el botón para hablar' :
+        'PTT: toca el botón para hablar y tócalo otra vez para soltar');
       renderControles();
     };
   }
@@ -4015,9 +4121,12 @@ function loopNivel() {
   if (ajustes) $('#aj-nivel').style.width = Math.min(100, nivel * 320) + '%';
   const est = $('#mic-estado');
   const hablas = !enviando && nivel > 0.12 && puedoHablar();
-  const txt = enviando ? 'Enviando'
+  const txt = enviando && modoPtt() && !S.ptt.tengo ? 'Esperando piso…'
+    : enviando ? 'Enviando'
     : !puedoHablar() ? 'Sin permiso'
     : hablas ? 'Hablas con el micro silenciado'
+    : S.ptt.modo === 'hold' ? 'Mantén pisado para hablar'
+    : S.ptt.modo === 'lock' ? 'Toca para hablar'
     : 'Silenciado';
   if (est.textContent !== txt) est.textContent = txt;
   est.classList.toggle('avisa', hablas);

@@ -12,8 +12,8 @@
 <meta name="apple-mobile-web-app-title" content="Conferencia">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="icon" type="image/png" href="/icon-192.png">
-<link rel="stylesheet" href="/styles.css?v=117">
-<script src="/conferencia-engine.js?v=117"></script>
+<link rel="stylesheet" href="/styles.css?v=118">
+<script src="/conferencia-engine.js?v=118"></script>
 </head>
 <body>
 
@@ -321,10 +321,12 @@
           <select id="mic-sel"></select>
           <span class="muted">Modo para hablar</span>
           <select id="mic-modo">
-            <option value="auto">Siempre abierto (habla libre)</option>
             <option value="hold">Pulsar y mantener para hablar (PTT)</option>
             <option value="lock">Tocar para hablar / tocar para soltar</option>
+            <option value="auto">Automático: la voz pisa el botón por ti</option>
           </select>
+          <label id="mic-silencio-wrap" class="muted oculto">Soltar tras
+            <input id="mic-silencio" type="number" min="0.5" max="10" step="0.5" value="2.2" style="width:56px"> s de silencio</label>
           <button id="mic-mas" class="btn mini" type="button">Más ajustes…</button>
         </div>
       </span>
@@ -354,6 +356,9 @@
     </div>
     <span id="ctl-aviso" class="muted"></span>
     <button id="ctl-plegar" class="btn mini" title="Ocultar/mostrar controles">⌄</button>
+  </div>
+
+  <button id="btn-ptt" class="ptt-grande oculto" title="Pulsar para hablar">🎙️</button>
   </footer>
 </section>
 
@@ -505,6 +510,6 @@
   <button id="nav-tip-x" class="btn mini" aria-label="Cerrar">✕</button>
 </div>
 <div id="toast-wrap"></div>
-<script src="/app.js?v=117"></script>
+<script src="/app.js?v=118"></script>
 </body>
 </html>

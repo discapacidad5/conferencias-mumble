@@ -93,6 +93,28 @@ label.check input { width: auto; }
 }
 .chip-peligro { background: var(--peligro); color: #fff; }
 .chip-ico.rec { border-color: var(--peligro); animation: pulsa 1.4s infinite; }
+
+/* Botón PTT grande estilo Zello: amarillo = libre, verde = otro habla,
+   rojo = yo tengo el piso. Flota sobre la barra de controles. */
+.ptt-grande {
+  position: fixed; right: 18px; bottom: 96px; z-index: 70;
+  width: 78px; height: 78px; border-radius: 50%;
+  font-size: 2rem; border: 4px solid var(--borde);
+  background: var(--ambar); color: #14100a; cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0,0,0,.5);
+  touch-action: none; user-select: none; -webkit-user-select: none;
+  transition: transform .08s, background .15s;
+}
+.ptt-grande.ocupado { background: var(--verde); color: #fff; }
+.ptt-grande.hablando {
+  background: var(--peligro); color: #fff; border-color: #ff8f8f;
+  transform: scale(1.08); animation: pulsa 1.4s infinite;
+}
+.ptt-grande:active { transform: scale(.96); }
+.ptt-grande.nopermiso { background: var(--bg3); color: var(--muted); opacity: .6; }
+@media (max-width: 640px) {
+  .ptt-grande { width: 68px; height: 68px; bottom: 86px; right: 12px; font-size: 1.7rem; }
+}
 .badge {
   background: var(--peligro); color: #fff; border-radius: 999px;
   font-size: .7rem; padding: .1rem .45rem; margin-left: .3rem;
