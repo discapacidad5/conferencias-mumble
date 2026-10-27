@@ -11,6 +11,8 @@
   --peligro: #e05252;
   --verde: #37b26c;
   --ambar: #e0a83c;
+  --violeta: #5b3ea8;
+  --violeta2: #8b5cf6;
 }
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
@@ -161,6 +163,26 @@ label.check input { width: auto; }
   content: '🔒'; position: absolute; top: -8px; right: -8px; z-index: 6;
   font-size: .85rem; filter: drop-shadow(0 1px 2px rgba(0,0,0,.7));
 }
+/* automático armado: cuerpo violeta = el micro escucha en local y el VAD
+   pisa el botón por la voz; el aro conserva el estado (amarillo/verde/
+   rojo sigue mandando mientras transmite) · un toque apaga el auto */
+.btn.ctl.ptt-auto:not(.ptt-hablando),
+#chat-enviar.ptt-auto:not(.ptt-hablando),
+.asiento-ptt.ptt-auto:not(.ptt-hablando) {
+  background: var(--violeta); border-color: var(--violeta2); color: #fff;
+}
+.btn.ctl.ptt-auto { box-shadow: 0 0 0 3px var(--violeta2), 0 0 12px rgba(139,92,246,.5); }
+.btn.ctl.ptt-auto.ptt-hablando { box-shadow: 0 0 0 3px var(--peligro), 0 0 12px rgba(139,92,246,.5); }
+.btn.ctl.ptt-auto:not(.ptt-bloqueado)::after,
+#chat-enviar.ptt-auto:not(.ptt-bloqueado)::after {
+  content: 'A'; position: absolute; top: -8px; left: -8px; z-index: 6;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--violeta2); color: #fff; font-size: .68rem; font-weight: 700;
+  display: grid; place-items: center; box-shadow: 0 1px 3px rgba(0,0,0,.6);
+}
+/* mi asiento en automático: halo violeta interior (el A de la esquina
+   también se enciende); hablando conserva el borde rojo */
+.asiento-mio.ptt-auto { box-shadow: inset 0 0 0 3px rgba(139,92,246,.55); }
 
 /* Selección de mensajes del chat: marcar para borrar o exportar audios */
 #chat-sel.tab { flex: 0 0 auto; }

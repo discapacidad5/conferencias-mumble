@@ -1644,7 +1644,7 @@ function wirePttButton(el, gate) {
   el._pttWired = true;
   const libre = () => !gate || gate();
   el.addEventListener('pointerdown', (e) => {
-    if (S.audio.retirando || S.ptt.modo === 'lock' || !libre()) return;
+    if (S.audio.retirando || S.ptt.modo === 'lock' || S.ptt.modo === 'auto' || !libre()) return;
     e.preventDefault();
     e.stopPropagation();
     // si quedó bloqueado, un toque lo desbloquea y suelta
@@ -1728,6 +1728,9 @@ function wirePttButton(el, gate) {
     if (S.audio.retirando || !libre()) return;
     e.preventDefault();
     e.stopPropagation();
+    // en automático el pulsador es un interruptor, no un PTT: un toque
+    // apaga el automático (el VAD es quien pisa el botón por la voz)
+    if (S.ptt.modo === 'auto') { cambiarModoPtt('hold'); return; }
     if (S.ptt.quiero) pttOff(); else pttOn();
   });
 }
@@ -1777,28 +1780,31 @@ function renderPttEstados() {
     : S.ptt.quiero ? 'conectando'
     : !puedoHablar() ? 'sinpermiso'
     : otro ? 'ocupado' : 'libre';
-  const tit = st === 'hablando' ? 'Suelta para terminar'
+  const auto = S.ptt.modo === 'auto';
+  const tit = st === 'hablando'
+    ? (auto ? 'Automático transmitiendo — toca para apagarlo' : 'Suelta para terminar')
     : st === 'conectando' ? 'Conectando… verificando micro y piso'
     : st === 'sinpermiso' ? 'Pide la palabra para hablar'
     : st === 'ocupado' ? `Hablando: ${S.estado.pisoNombre || S.estado.piso}`
     : S.ptt.modo === 'hold' ? 'Mantén pisado para hablar'
-    : S.ptt.modo === 'auto' ? 'Voz automática activa (también puedes pulsar)'
+    : auto ? 'Automático encendido: tu voz pisa el botón — toca para apagarlo'
     : 'Toca para hablar / toca para soltar';
   $$('.ptt-sup').forEach(el => {
     el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso', 'ptt-conectando');
     el.classList.add('ptt-' + st);
     el.classList.toggle('ptt-bloqueado', !!S.ptt._bloqueado);
+    el.classList.toggle('ptt-auto', auto);
     el.title = S.ptt._bloqueado ? 'Bloqueado: toca para soltar' : tit;
   });
   // esquinas fijas del asiento/palabra: estado visual del candado y del auto
   $$('.asiento-esq.lock').forEach(b => b.classList.toggle('on', !!S.ptt._bloqueado));
   $$('.asiento-esq.auto').forEach(b => b.classList.toggle('on', S.ptt.modo === 'auto'));
   const me = $('#mic-estado');
-  if (me) me.textContent = st === 'hablando' ? 'Estás hablando'
+  if (me) me.textContent = st === 'hablando' ? (auto ? 'Auto: transmitiendo' : 'Estás hablando')
     : st === 'conectando' ? 'Conectando…'
     : st === 'sinpermiso' ? 'Sin permiso'
     : st === 'ocupado' ? `Habla ${S.estado.pisoNombre || S.estado.piso}`
-    : S.ptt.modo === 'auto' ? 'Auto: escuchando' : 'Piso libre';
+    : auto ? 'Auto: escuchando' : 'Piso libre';
 }
 
 // Chirp estilo Zello: blip agudo al conseguir el piso, doble grave si te
@@ -3611,6 +3617,7 @@ function renderControles() {
 function cambiarModoPtt(modo) {
   if (!['hold', 'lock', 'auto'].includes(modo)) return;
   S.ptt.modo = modo;
+  S.ptt._bloqueado = false;
   localStorage.setItem('lk_ptt_modo', modo);
   const sm = $('#mic-modo'), sp = $('#aj-ptt');
   if (sm) sm.value = modo;
@@ -3621,6 +3628,12 @@ function cambiarModoPtt(modo) {
   if (modo === 'auto') {
     if (puedoHablar()) prepararMicPtt(); // abre el micro solo para el VAD
   } else {
+    // al apagar el automático con el VAD transmitiendo (piso tomado sin
+    // dedo), soltarlo explícitamente antes de cerrar el micrófono
+    if (!S.ptt.quiero && S.ptt.tengo && S.room) {
+      S.room.soltarPiso();
+      S.ptt.tengo = false;
+    }
     if (S.ptt.quiero) pttOff();
     else if (S.audio.pub) retirarMic(); // manual: nada de micro abierto
   }
