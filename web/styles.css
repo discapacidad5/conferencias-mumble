@@ -196,7 +196,8 @@ label.check input { width: auto; }
   transition: transform .12s, opacity .12s, border-color .12s;
 }
 #ptt-gestos .pg-lock { left: -20px; top: -78px; }
-#ptt-gestos .pg-auto { left: -78px; top: -20px; font-weight: 700; }
+/* A a la DERECHA del pulsador: a la izquierda del micro no cabe en móvil */
+#ptt-gestos .pg-auto { left: 38px; top: -20px; font-weight: 700; }
 #ptt-gestos span.ready {
   opacity: 1; transform: scale(1.25);
   border-color: var(--ambar); box-shadow: 0 0 14px rgba(255,196,0,.55);
@@ -224,9 +225,12 @@ label.check input { width: auto; }
   background: var(--violeta2); color: #fff; font-size: .68rem; font-weight: 700;
   display: grid; place-items: center; box-shadow: 0 1px 3px rgba(0,0,0,.6);
 }
-/* mi asiento en automático: halo violeta interior (el A de la esquina
-   también se enciende); hablando conserva el borde rojo */
-.asiento-mio.ptt-auto { box-shadow: inset 0 0 0 3px rgba(139,92,246,.55); }
+/* mi asiento en automático: interior teñido de violeta (igual que el cuerpo
+   del pulsador) — mientras no transmita el color dice "estoy armado";
+   hablando vuelve al fondo normal con el borde rojo */
+.asiento-mio.ptt-auto:not(.ptt-hablando) {
+  background: linear-gradient(rgba(139,92,246,.32), rgba(139,92,246,.32)), var(--bg2);
+}
 
 /* Selección de mensajes del chat: marcar para borrar o exportar audios */
 #chat-sel.tab { flex: 0 0 auto; }

@@ -1656,66 +1656,16 @@ function wirePttButton(el, gate) {
     // si quedó bloqueado, un toque lo desbloquea y suelta
     if (S.ptt._bloqueado) { S.ptt._bloqueado = false; pttOff(); return; }
     pttOn();
-    // Capturar el puntero: como el botón de WhatsApp, TODOS los movimientos
-    // siguen llegando al botón aunque el dedo/ratón salga de él — así el
-    // arrastre hacia el candado (arriba) o el automático (izquierda) no se
-    // corta al cruzar el borde del botón. Los asientos no usan gesto:
-    // llevan esquinas fijas 🔒 / A (un asiento entero no se arrastra).
+    // Capturar el puntero + el arrastre se sigue en WINDOW: en móvil la
+    // captura a veces falla o el navegador manda pointerleave/cancel al
+    // cruzar el borde — con el seguimiento global el gesto no se pierde.
+    // Los asientos no usan gesto: llevan esquinas fijas 🔒 / A.
     if (el._pttSinGesto) return;
     try { el.setPointerCapture(e.pointerId); } catch {}
+    wireGestoGlobal();
     S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, lock: false, auto: false };
     mostrarGestosPtt(el);
   });
-  el.addEventListener('pointermove', (e) => {
-    const g = S.ptt._gesto;
-    if (!g || g.el !== el || !S.ptt.quiero || S.ptt._bloqueado) return;
-    const dy = g.y0 - e.clientY, dx = g.x0 - e.clientX;
-    g.lock = dy > 56;                          // arrastre hacia arriba
-    g.auto = dx > 56 && !g.lock;               // arrastre hacia la izquierda
-    // el botón se arrastra un poco con el dedo, como la nota de voz de
-    // WhatsApp: puro feedback visual, los gestos mandan por distancia
-    const vx = Math.min(0, Math.max(-30, -dx * 0.35));
-    const vy = Math.min(0, Math.max(-30, -dy * 0.35));
-    const base = el.classList.contains('asiento-ptt') ? 'translate(-50%,-50%) ' : '';
-    el.style.transform = `${base}translate(${vx}px, ${vy}px)`;
-    marcarGestosPtt(g);
-  });
-  ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
-    el.addEventListener(ev, (e) => {
-      const g = S.ptt._gesto;
-      ocultarGestosPtt();
-      if (el.style.transform) el.style.transform = ''; // soltar el arrastre
-      if (g && g.el === el && S.ptt.quiero) {
-        S.ptt._gesto = null;
-        if (g.lock) {
-          // candado: sigue hablando sin mantener el dedo; un toque suelta.
-          // El click que el navegador dispara tras este pointerup hay que
-          // tragárselo: si no, desbloquea al instante de bloquear.
-          S.ptt._bloqueado = true;
-          S.ptt._tragarClick = true;
-          e.stopPropagation();
-          toast('🔒 Bloqueado — toca el botón de nuevo para soltar');
-          renderControles();
-          return;
-        }
-        if (g.auto) {
-          // modo automático al vuelo: al entrar la frase actual la cierra
-          // el VAD cuando calles; al salir se suelta como una pulsación
-          S.ptt._gesto = null;
-          S.ptt._tragarClick = true;
-          e.stopPropagation();
-          const aAuto = S.ptt.modo !== 'auto';
-          if (aAuto) S.ptt.quiero = false;
-          cambiarModoPtt(aAuto ? 'auto' : 'hold');
-          return;
-        }
-        S.ptt._gesto = null;
-      }
-      if (S.ptt.modo !== 'lock' && S.ptt.quiero && !S.ptt._bloqueado) {
-        e.stopPropagation();
-        pttOff();
-      }
-    }));
   el.addEventListener('click', (e) => {
     // click residual tras un gesto (bloquear/auto): no debe disparar nada
     if (S.ptt._tragarClick) {
@@ -1739,6 +1689,58 @@ function wirePttButton(el, gate) {
     if (S.ptt.modo === 'auto') { cambiarModoPtt('hold'); return; }
     if (S.ptt.quiero) pttOff(); else pttOn();
   });
+}
+
+// Seguimiento global del gesto del pulsador: 🔒 arrastrando ARRIBA,
+// A (automático) arrastrando a la DERECHA (a la izquierda del botón del
+// micro no hay espacio en el celular). Se registra una sola vez.
+function wireGestoGlobal() {
+  if (wireGestoGlobal._ok) return;
+  wireGestoGlobal._ok = true;
+  window.addEventListener('pointermove', (e) => {
+    const g = S.ptt._gesto;
+    if (!g || !S.ptt.quiero || S.ptt._bloqueado) return;
+    const dy = g.y0 - e.clientY, dx = g.x0 - e.clientX;
+    g.lock = dy > 56;                           // arrastre hacia arriba
+    g.auto = dx < -56 && !g.lock;               // arrastre hacia la derecha
+    // el botón se arrastra un poco con el dedo, como la nota de voz de
+    // WhatsApp: puro feedback visual, los gestos mandan por distancia
+    const vx = Math.max(-30, Math.min(30, -dx * 0.35));
+    const vy = Math.min(0, Math.max(-30, -dy * 0.35));
+    const base = g.el.classList.contains('asiento-ptt') ? 'translate(-50%,-50%) ' : '';
+    g.el.style.transform = `${base}translate(${vx}px, ${vy}px)`;
+    marcarGestosPtt(g);
+  });
+  const fin = (e) => {
+    const g = S.ptt._gesto;
+    if (g) e.stopPropagation();
+    ocultarGestosPtt();
+    if (g && g.el.style.transform) g.el.style.transform = ''; // soltar el arrastre
+    S.ptt._gesto = null;
+    if (!g || !S.ptt.quiero) return;
+    if (g.lock) {
+      // candado: sigue hablando sin mantener el dedo; un toque suelta.
+      // El click que el navegador dispara tras este pointerup hay que
+      // tragárselo: si no, desbloquea al instante de bloquear.
+      S.ptt._bloqueado = true;
+      S.ptt._tragarClick = true;
+      toast('🔒 Bloqueado — toca el botón de nuevo para soltar');
+      renderControles();
+      return;
+    }
+    if (g.auto) {
+      // modo automático al vuelo: al entrar la frase actual la cierra
+      // el VAD cuando calles; al salir se suelta como una pulsación
+      S.ptt._tragarClick = true;
+      const aAuto = S.ptt.modo !== 'auto';
+      if (aAuto) S.ptt.quiero = false;
+      cambiarModoPtt(aAuto ? 'auto' : 'hold');
+      return;
+    }
+    if (S.ptt.modo !== 'lock' && !S.ptt._bloqueado) pttOff();
+  };
+  window.addEventListener('pointerup', fin);
+  window.addEventListener('pointercancel', fin);
 }
 
 // Esquina 🔒 de mi asiento / puesto de la palabra: arrancar hablando ya
