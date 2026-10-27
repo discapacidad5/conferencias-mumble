@@ -2082,6 +2082,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
              this._replayPlayedMs >= this._replayProg[0].finMs - 30) {
         this.emit('seg_replay_fin', this._replayProg.shift().seq);
       }
+      // la nota terminó sola (sin que otra la interrumpa): el contador de
+      // escuchados se reinicia aquí, si no la próxima ▶ heredaría el total
+      // de la anterior y se daría por terminada sin emitir progreso
+      if (!this._replayProg.length && !this._replayQ.length &&
+          this._replayPendMs <= 30) {
+        this._replayPendMs = 0;
+        this._replayPlayedMs = 0;
+      }
       if (this._replayProg.length && ahoraMs - (this._progUltimo || 0) > 200) {
         this._progUltimo = ahoraMs;
         const rp = this._replayProg[0];
@@ -2416,10 +2424,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (this._replayProg.length || this._replayQ.length || this._vozBufMs > 60) {
         while (this._replayProg.length) this.emit('seg_replay_fin', this._replayProg.shift().seq);
         this._replayQ.length = 0;
-        this._replayPendMs = 0;
-        this._replayPlayedMs = 0;
         this._vaciarPipeVoz();
       }
+      this._replayPendMs = 0; // contadores SIEMPRE a cero: la cola anterior
+      this._replayPlayedMs = 0; // pudo terminar sola dejando restos heredados
       this._replayPausas.delete(seq); // re-escucharla desde 0 olvida su pausa
       const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
       const msTotal = bloques.reduce((m, b) => m + (b.pcm.length / rate) * 1000, 0);
