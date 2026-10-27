@@ -958,7 +958,7 @@ async function entrar() {
     if (S.previewStream) { S.previewStream.getTracks().forEach(t => t.stop()); S.previewStream = null; }
     S.audio.liberar = $('#pj-mic-btn').classList.contains('off');
     if (!S.audio.liberar && (estoySentado() || tengoPalabra())) {
-      try { if (modoPtt()) await prepararMicPtt(); else await activarMic(true); } catch {}
+      try { await prepararMicPtt(); } catch {} // solo abre el micro en modo auto
     }
 
     entrarVistaSala();
@@ -1454,10 +1454,10 @@ function intentarAutoMic() {
   if (!S.micProhibido && !S.audio.retirando) {
     if (S.audio.autoPalabra && tengoPalabra()) {
       S.audio.autoPalabra = false;
-      if (modoPtt()) prepararMicPtt(); else activarMic(true);
+      prepararMicPtt(); // solo abre el micro en modo auto; en manual manda el botón
     } else if (S.audio.autoAsiento && estoySentado()) {
       S.audio.autoAsiento = false;
-      if (puedoHablar()) { if (modoPtt()) prepararMicPtt(); else activarMic(true); }
+      if (puedoHablar()) prepararMicPtt();
     }
   }
   if (S.camQuerida && puedoCam() && !S.room.localParticipant.isCameraEnabled) {
@@ -1534,19 +1534,23 @@ function miTiempoPiso() {
   return m;
 }
 
-// En modo PTT el micrófono queda publicado pero silenciado para que el
-// primer toque sea instantáneo (sin esperar a getUserMedia)
+// Modo automático: el micro queda capturando en LOCAL (publicado sin mutear
+// para que el VAD "pise el botón" al detectar voz) pero el motor solo envía
+// al servidor cuando el piso ya es mío. En los modos manuales el hardware
+// no se toca: se abre al pisar el botón y se libera al soltarlo, así el
+// teléfono puede usar el micrófono en otra app entre frase y frase.
 async function prepararMicPtt() {
   if (S.audio.pub || !puedoHablar() || S.audio.retirando || !S.room) return;
+  if (S.ptt.modo !== 'auto') return;
   try {
     const track = await construirMicTrack();
     S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
-    await S.audio.pub.mute();
+    S.audio.on = true; // intención: auto activo (reconexiones repúblican)
   } catch {}
 }
 
 async function pttOn() {
-  if (!S.room || S.ptt.quiero) return;
+  if (!S.room || S.ptt.quiero || S.audio.retirando) return;
   if (!puedoHablar()) {
     const razon = S.micProhibido
       ? 'Un moderador te prohibió activar el micrófono.'
@@ -1580,11 +1584,73 @@ async function pttOn() {
 
 async function pttOff() {
   S.ptt.quiero = false;
+  S.ptt.tengo = false;
   if (S.room) S.room.soltarPiso();
-  const pub = S.audio.pub;
-  if (pub && !pub.isMuted) await pub.mute().catch(() => {});
-  S.audio.on = false;
+  if (S.ptt.modo === 'auto') {
+    // el micro sigue abierto en local para que el VAD siga escuchando
+    S.audio.on = true;
+  } else {
+    // manual: liberar el hardware del micrófono entre pulsaciones
+    await retirarMic();
+    S.audio.liberar = true;
+  }
   renderControles();
+}
+
+// Cableado PTT compartido por los tres pulsadores (botón del micro, centro
+// de mi asiento y botón del chat): "hold" = mantener pisado, "lock" = un
+// toque toma el piso y otro lo suelta; en "auto" también sirve de pulsador
+// manual. gate() opcional decide si el gesto es PTT (p.ej. chat vacío).
+function wirePttButton(el, gate) {
+  if (!el || el._pttWired) return;
+  el._pttWired = true;
+  const libre = () => !gate || gate();
+  el.addEventListener('pointerdown', (e) => {
+    if (S.audio.retirando || S.ptt.modo === 'lock' || !libre()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    pttOn();
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
+    el.addEventListener(ev, (e) => {
+      if (S.ptt.modo !== 'lock' && S.ptt.quiero) {
+        e.stopPropagation();
+        pttOff();
+      }
+    }));
+  el.addEventListener('click', (e) => {
+    // el click que sigue a soltar en "hold" no debe activar menús ajenos
+    if (S.ptt.modo === 'hold') { e.preventDefault(); e.stopPropagation(); return; }
+    if (S.audio.retirando || !libre()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (S.ptt.quiero) pttOff(); else pttOn();
+  });
+}
+
+// Color compartido de todos los pulsadores PTT:
+// amarillo = piso libre · verde = otra persona habla · rojo = yo hablo
+function renderPttEstados() {
+  const otro = !!(S.estado && S.estado.piso && S.estado.piso !== S.identidad);
+  const st = S.ptt.quiero || S.ptt.tengo ? 'hablando'
+    : !puedoHablar() ? 'sinpermiso'
+    : otro ? 'ocupado' : 'libre';
+  const tit = st === 'hablando' ? 'Suelta para terminar'
+    : st === 'sinpermiso' ? 'Pide la palabra para hablar'
+    : st === 'ocupado' ? `Hablando: ${S.estado.pisoNombre || S.estado.piso}`
+    : S.ptt.modo === 'hold' ? 'Mantén pisado para hablar'
+    : S.ptt.modo === 'auto' ? 'Voz automática activa (también puedes pulsar)'
+    : 'Toca para hablar / toca para soltar';
+  $$('.ptt-sup').forEach(el => {
+    el.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso');
+    el.classList.add('ptt-' + st);
+    el.title = tit;
+  });
+  const me = $('#mic-estado');
+  if (me) me.textContent = st === 'hablando' ? 'Estás hablando'
+    : st === 'sinpermiso' ? 'Sin permiso'
+    : st === 'ocupado' ? `Habla ${S.estado.pisoNombre || S.estado.piso}`
+    : S.ptt.modo === 'auto' ? 'Auto: escuchando' : 'Piso libre';
 }
 
 // Chirp estilo Zello: blip agudo al conseguir el piso, doble grave si te
@@ -1642,17 +1708,20 @@ async function chequearGrupo() {
     if (camOn) {
       try { await room.localParticipant.setCameraEnabled(true, { deviceId: S.dev.cam ? { exact: S.dev.cam } : undefined }); } catch {}
     }
-    if (micOn) {
-      // en modo PTT el micro vuelve listo pero silenciado; si seguía pisado
-      // (p.ej. al cambiar de sala de discusión) se retoma el piso y se abre
-      if (modoPtt()) {
-        try {
-          await prepararMicPtt();
-          if (S.ptt.quiero && S.audio.pub) { S.room.tomarPiso(); await S.audio.pub.unmute(); }
-        } catch {}
-      } else {
-        await activarMic(true);
-      }
+    if (micOn || (modoPtt() && S.ptt.quiero)) {
+      // auto: el micro vuelve abierto para el VAD; manual: solo si seguía
+      // pisado al cambiar de sala, retomando el piso
+      try {
+        await prepararMicPtt();
+        if (modoPtt() && S.ptt.quiero) {
+          if (!S.audio.pub) {
+            const track = await construirMicTrack();
+            S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+          }
+          S.room.tomarPiso();
+          S.audio.on = true;
+        }
+      } catch {}
     }
     const disuelta = !dest && salia && !(S.grupos || []).some(g => g.id === salia);
     toast(dest ? `Te movieron a: ${nombreGrupo(dest)}`
@@ -1986,6 +2055,7 @@ function cablearRoom(room) {
   room.on('seg_reproduciendo', (m) => { if (m) marcarNotaVoz(m.seq, 'sonando'); });
   room.on('seg_reproducido', (m) => { if (m) marcarNotaVoz(m.seq, 'oido'); });
   room.on('seg_replay_fin', (seq) => reproducirSiguienteNota(seq));
+  room.on('seg_progreso', (p) => { if (p) marcarNotaVoz(p.seq, 'progreso', p); });
   room.on('voz_retraso', (ms) => renderRetraso(ms));
   // --- piso exclusivo (PTT) ---
   room.on('piso', (m) => {
@@ -1997,25 +2067,21 @@ function cablearRoom(room) {
   });
   room.on('piso_ocupado', (m) => {
     S.ptt.tengo = false;
-    if (modoPtt()) {
-      // cancelar el intento: el usuario reintenta cuando cumpla el tiempo
-      S.ptt.quiero = false;
-      S.audio.on = false;
-      const pub = S.audio.pub;
-      if (pub && !pub.isMuted) pub.mute().catch(() => {});
-    }
+    if (modoPtt()) pttOff(); // cancela el intento y libera el micrófono
     S.pisoFaltan = (m && m.faltan) || 0;
-    sonidoPiso(false); // rechazo: otro tiene el piso
-    if (m && m.error) toast(m.error);
-    else toast(`🎙️ ${(m && m.nombre) || 'Otra persona'} tiene el piso — podrás interrumpir en ${S.pisoFaltan} s`, 4500);
+    // rechazo audible con enfriamiento: en modo auto el VAD reintenta solo
+    // y el beep no debe sonar en cada intento
+    const ahoraR = Date.now();
+    if (!S._pisoRechazoTs || ahoraR - S._pisoRechazoTs > 3000) {
+      S._pisoRechazoTs = ahoraR;
+      sonidoPiso(false);
+      if (m && m.error) toast(m.error);
+      else toast(`🎙️ ${(m && m.nombre) || 'Otra persona'} tiene el piso — podrás interrumpir en ${S.pisoFaltan} s`, 4500);
+    }
     renderControles();
   });
   room.on('piso_perdido', (m) => {
-    S.ptt.tengo = false;
-    S.ptt.quiero = false;
-    S.audio.on = false;
-    const pub = S.audio.pub;
-    if (pub && !pub.isMuted) pub.mute().catch(() => {});
+    pttOff(); // suelta piso, intención y (en manual) el micrófono
     toast(`⚠️ ${(m && m.por) || 'Otra persona'} tomó el piso`, 4500);
     renderControles();
   });
@@ -2127,17 +2193,20 @@ async function reconectar() {
       if (S.camQuerida) {
         try { await room.localParticipant.setCameraEnabled(true, { deviceId: S.dev.cam ? { exact: S.dev.cam } : undefined }); } catch {}
       }
-      if (S.audio.on) {
-        // en modo PTT: re-publicar silenciado y, si seguía pisado, retomar el piso
-        if (modoPtt()) {
-          try {
-            S.audio.pub = null;
-            await prepararMicPtt();
-            if (S.ptt.quiero && S.audio.pub) { S.room.tomarPiso(); await S.audio.pub.unmute(); }
-          } catch {}
-        } else {
-          await activarMic(true);
-        }
+      if (S.audio.on || (modoPtt() && S.ptt.quiero)) {
+        // auto: re-publica el micro para el VAD; manual: solo si seguía pisado
+        try {
+          S.audio.pub = null;
+          await prepararMicPtt();
+          if (modoPtt() && S.ptt.quiero) {
+            if (!S.audio.pub) {
+              const track = await construirMicTrack();
+              S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+            }
+            S.room.tomarPiso();
+            S.audio.on = true;
+          }
+        } catch {}
       }
       toast('Reconectado a la sala');
       refrescarEstado();
@@ -2622,6 +2691,16 @@ function renderAsientos() {
         div.appendChild(pin);
       }
       if (S.activo === a.identidad) div.style.borderColor = 'var(--verde)';
+      // el centro de MI asiento es un pulsador PTT (esquinas = acciones del
+      // asiento); mismo comportamiento que el botón del micro
+      if (a.identidad === S.identidad && S.room) {
+        const bp = document.createElement('button');
+        bp.type = 'button';
+        bp.className = 'asiento-ptt ptt-sup';
+        bp.textContent = '🎙️';
+        wirePttButton(bp);
+        div.appendChild(bp);
+      }
       div.onclick = (ev) => menuPersona(ev, a.identidad, i + 1);
     } else {
       div.classList.add('libre');
@@ -2672,6 +2751,15 @@ function renderAsientos() {
       pb.insertAdjacentHTML('beforeend', `<span class="tag">${esc(palabraId)}</span>`);
     }
     if (S.activo === palabraId) pb.style.borderColor = 'var(--verde)';
+    // con la palabra, el centro del puesto también es pulsador PTT
+    if (soyYo && S.room) {
+      const bpt = document.createElement('button');
+      bpt.type = 'button';
+      bpt.className = 'asiento-ptt ptt-sup';
+      bpt.textContent = '🎙️';
+      wirePttButton(bpt);
+      pb.appendChild(bpt);
+    }
     if (S.estado.palabraFin) {
       pb.insertAdjacentHTML('beforeend', `<span class="crono" data-crono>${fmtMMSS(S.estado.palabraFin - Date.now())}</span>`);
     }
@@ -2796,6 +2884,8 @@ function renderAsientos() {
   $('#cola-wrap').classList.toggle('oculto', !S.estado.cola.length);
   $('#cola').innerHTML = S.estado.cola.map(c =>
     `<li>${esc(c.nombre)}${c.identidad === S.identidad ? ' (tú)' : ''}</li>`).join('');
+
+  renderPttEstados(); // los pulsadores de los asientos se recrean en cada render
 }
 
 function renderRejilla() {
@@ -3217,40 +3307,12 @@ function renderControles() {
   if (!modoPtt() && tengoPalabra() && micPub && micPub.isMuted && !S.audio.retirando)
     micPub.unmute().catch(() => {});
 
-  const bm = $('#ctl-mic');
-  const pisoOcupado = S.estado && S.estado.piso && S.estado.piso !== S.identidad;
-  bm.className = 'btn ctl ' + (micOn ? 'on' : 'off') + (modoPtt() && S.ptt.quiero ? ' ptt' : '');
-  const bloqueado = !puedoHablar() && !micOn;
-  bm.disabled = !!S.audio.retirando;
-  bm.title = bloqueado
-    ? 'Micrófono deshabilitado: pulsa para pedir la palabra'
-    : modoPtt()
-    ? (S.ptt.modo === 'hold'
-      ? 'Mantén pisado para hablar — si hay alguien hablando lo interrumpes cuando cumpla su tiempo'
-      : 'Toca para hablar / toca para soltar el piso')
-    : tengoPalabra()
-    ? 'Con la palabra el micro no se puede silenciar — déjala primero'
-    : pisoOcupado
-    ? `Hablando: ${S.estado.pisoNombre || S.estado.piso} — tu voz le interrumpe pasado tu tiempo`
-    : 'Micrófono';
-
-  // Botón PTT grande: solo visible en modos PTT dentro de la sala.
+  // El botón del micro ES el pulsador PTT: ya no existe "encender/apagar".
   // amarillo = piso libre · verde = otra persona habla · rojo = yo hablo
-  const bp = $('#btn-ptt');
-  if (bp) {
-    const mostrar = !!S.room && modoPtt() && !S.audio.retirando;
-    bp.classList.toggle('oculto', !mostrar);
-    if (mostrar) {
-      const otroHabla = !!(S.estado && S.estado.piso && S.estado.piso !== S.identidad);
-      const yo = S.ptt.quiero && S.ptt.tengo;
-      bp.className = 'ptt-grande' +
-        (!puedoHablar() ? ' nopermiso' : yo ? ' hablando' : (otroHabla || S.ptt.quiero) ? ' ocupado' : ' libre');
-      bp.title = !puedoHablar() ? 'Pide la palabra para hablar'
-        : yo ? 'Suelta para terminar'
-        : S.ptt.modo === 'hold' ? 'Mantén pisado para hablar'
-        : 'Toca para hablar / toca para soltar';
-    }
-  }
+  const bm = $('#ctl-mic');
+  bm.className = 'btn ctl ptt-sup' + (S.audio.retirando ? ' cargando' : '');
+  bm.disabled = !!S.audio.retirando;
+  renderPttEstados();
 
   // chip del piso: quién está hablando ahora y cuánto falta para poder
   // interrumpirlo según el menor de mis tiempos por rol
@@ -3285,8 +3347,10 @@ function renderControles() {
   // chat deshabilitado: bloqueo individual o "solo moderadores" de la sala
   const chatOff = S.chatProhibido || (S.estado?.chatOff && !esMod());
   const ci = $('#chat-input'), ce = $('#chat-enviar');
-  ci.disabled = chatOff; ce.disabled = chatOff;
+  ci.disabled = chatOff;
+  ce.disabled = false; // con el campo vacío el botón es PTT, no "enviar"
   ci.placeholder = chatOff ? 'Chat bloqueado por el moderador' : 'Escribe un mensaje…';
+  actualizarChatBtn();
 
   const enGrupo = S.miGrupo ? `[${nombreGrupo(S.miGrupo)}] ` : '';
   $('#ctl-aviso').textContent = enGrupo + (tengoPalabra()
@@ -3316,76 +3380,9 @@ function renderControles() {
 }
 
 function cablearControles() {
-  // Botón del micro según el modo de habla elegido:
-  //  - auto: comportamiento clásico (activar/silenciar, piso implícito)
-  //  - hold: PTT puro — mantener pisado para hablar, soltar para cerrar
-  //  - lock: un toque toma el piso, otro toque lo suelta
-  const bmPtt = $('#ctl-mic');
-  bmPtt.onclick = () => {
-    if (S.audio.retirando) return;
-    if (S.ptt.modo === 'hold') return; // usa pointerdown/up
-    if (S.ptt.modo === 'lock') {
-      if (S.ptt.quiero) pttOff(); else pttOn();
-      return;
-    }
-    const p = S.room.localParticipant.getTrackPublication(LC.Track.Source.Microphone);
-    const on = p && !p.isMuted;
-    if (!on && !puedoHablar()) {
-      const razon = S.micProhibido
-        ? 'Un moderador te prohibió activar el micrófono.'
-        : estoySentado()
-        ? 'Los micrófonos de los asientos están bloqueados.'
-        : 'La audiencia tiene el micrófono deshabilitado.';
-      genModal('Micrófono deshabilitado',
-        `<p>${razon}</p><p>Solo puedes hablar desde el puesto de la palabra. ¿Quieres levantar la mano para pedirla?</p>`,
-        () => accion('levantar_mano')
-          .then(() => toast('Mano levantada: espera la aprobación del moderador'))
-          .catch(e => toast(e.message)),
-        '✋ Levantar la mano');
-      return;
-    }
-    if (on && tengoPalabra()) {
-      genModal('El micro debe seguir activo',
-        '<p>Mientras tengas la palabra no puedes silenciar el micrófono. Para silenciarlo, primero deja la palabra.</p>',
-        dejarPalabra, '🗣️ Dejar la palabra');
-      return;
-    }
-    activarMic(!on);
-  };
-  // PTT "mantener pisado": eventos de puntero, no clic — funciona con dedo,
-  // ratón o lápiz sin arrastrar ni seleccionar
-  if (!bmPtt._pttWired) {
-    bmPtt._pttWired = true;
-    bmPtt.addEventListener('pointerdown', (e) => {
-      if (S.ptt.modo !== 'hold' || S.audio.retirando) return;
-      e.preventDefault();
-      pttOn();
-    });
-    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
-      bmPtt.addEventListener(ev, () => {
-        if (S.ptt.modo === 'hold' && S.ptt.quiero) pttOff();
-      }));
-  }
-  // botón PTT grande (estilo Zello): amarillo = libre, verde = otro habla,
-  // rojo = yo tengo el piso. En "hold" se mantiene pisado; en "lock" toca/suelta.
-  const bp = $('#btn-ptt');
-  if (bp && !bp._wired) {
-    bp._wired = true;
-    bp.addEventListener('pointerdown', (e) => {
-      if (S.ptt.modo !== 'hold' || S.audio.retirando) return;
-      e.preventDefault();
-      pttOn();
-    });
-    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
-      bp.addEventListener(ev, () => {
-        if (S.ptt.modo === 'hold' && S.ptt.quiero) pttOff();
-      }));
-    bp.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (S.ptt.modo !== 'lock' || S.audio.retirando) return;
-      if (S.ptt.quiero) pttOff(); else pttOn();
-    });
-  }
+  // El botón del micro ES el PTT — ya no hay "encender/apagar micrófono".
+  // hold = mantener pisado · lock = tocar/soltar · auto = la voz lo pisa
+  wirePttButton($('#ctl-mic'));
   // cambio de modo de habla desde el menú del micro
   const selModo = $('#mic-modo');
   if (selModo) {
@@ -3404,8 +3401,12 @@ function cablearControles() {
       localStorage.setItem('lk_ptt_modo', S.ptt.modo);
       if (silWrap) silWrap.classList.toggle('oculto', S.ptt.modo !== 'auto');
       $('#mic-pop').classList.add('oculto');
-      if (S.ptt.modo === 'auto' && S.ptt.quiero) pttOff();
-      else if (modoPtt() && puedoHablar()) prepararMicPtt();
+      if (S.ptt.modo === 'auto') {
+        if (puedoHablar()) prepararMicPtt(); // abre el micro solo para el VAD
+      } else {
+        if (S.ptt.quiero) pttOff();
+        else if (S.audio.pub) retirarMic(); // manual: nada de micro abierto
+      }
       toast(S.ptt.modo === 'auto' ? 'Voz automática: al hablar piso el botón por ti' :
         S.ptt.modo === 'hold' ? 'PTT: mantén pisado el botón para hablar' :
         'PTT: toca el botón para hablar y tócalo otra vez para soltar');
@@ -3706,17 +3707,22 @@ function cablearControles() {
   // index.html llama a mtab; esto solo reafirma el mismo handler)
   $$('.mod-tab').forEach(t => t.onclick = () => mtab(t));
 
-  // chat
+  // chat: el botón de enviar es PTT mientras el campo esté vacío y vuelve
+  // a ser "enviar" en cuanto hay texto escrito
+  const inp = $('#chat-input'), ce = $('#chat-enviar');
   const enviarChat = () => {
-    const inp = $('#chat-input');
     const texto = inp.value.trim();
     if (!texto) return;
     pubData({ t: 'chat', texto });
     agregarChat(S.nombre, texto, true);
     inp.value = '';
+    actualizarChatBtn();
   };
-  $('#chat-enviar').onclick = enviarChat;
-  $('#chat-input').onkeydown = (e) => { if (e.key === 'Enter') enviarChat(); };
+  wirePttButton(ce, () => !inp.value.trim());
+  ce.addEventListener('click', () => { if (inp.value.trim()) enviarChat(); });
+  inp.addEventListener('input', actualizarChatBtn);
+  inp.onkeydown = (e) => { if (e.key === 'Enter') enviarChat(); };
+  actualizarChatBtn();
 
   $('#ctl-ajustes').onclick = () => {
     poblarSelectsAjustes();
@@ -4178,8 +4184,11 @@ function agregarNotaVoz(meta) {
   const el = document.createElement('div');
   el.className = 'msg nota-voz';
   const hora = meta.inicio ? new Date(meta.inicio).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  el.dataset.durMs = meta.durMs || 0;
   el.innerHTML = `<div class="quien">🎙️ ${esc(meta.nombre || meta.de)}${hora ? ` · <span class="muted">${hora}</span>` : ''}${meta.interrumpida ? ' <span class="muted">(interrumpida)</span>' : ''}</div>` +
-    `<button class="nv-play btn mini" data-seq="${meta.seq}">▶ ${fmtDurSeg(meta.durMs)}</button>`;
+    `<div class="nv-player"><button class="nv-play btn mini" data-seq="${meta.seq}">▶</button>` +
+    `<div class="nv-pista"><div class="nv-relleno"></div></div>` +
+    `<span class="nv-tiempo">${fmtDurSeg(meta.durMs)}</span></div>`;
   lista.appendChild(el);
   while (lista.children.length > 200) {
     const viejo = lista.firstChild;
@@ -4196,14 +4205,37 @@ function agregarNotaVoz(meta) {
   el.querySelector('.nv-play').onclick = () => reproducirNota(meta.seq);
 }
 
-function marcarNotaVoz(seq, est) {
+function marcarNotaVoz(seq, est, prog) {
   const el = S._nvEls.get(seq);
   if (!el) return;
   const b = el.querySelector('.nv-play');
+  const t = el.querySelector('.nv-tiempo');
+  const r = el.querySelector('.nv-relleno');
   if (!b) return;
-  if (est === 'sonando') { b.classList.add('sonando'); b.classList.remove('oido'); }
-  if (est === 'oido') { b.classList.add('oido'); b.classList.remove('sonando'); }
-  if (est === 'perdida') { b.disabled = true; b.textContent = '⚠️ no recuperada'; }
+  if (est === 'cargando') {
+    b.classList.add('cargando'); b.classList.remove('sonando', 'oido');
+    b.textContent = '⏳';
+  }
+  if (est === 'sonando') {
+    b.classList.add('sonando'); b.classList.remove('oido', 'cargando');
+    b.textContent = '🔊';
+  }
+  if (est === 'oido') {
+    b.classList.add('oido'); b.classList.remove('sonando', 'cargando');
+    b.textContent = '▶';
+    if (r) r.style.width = '0%';
+    if (t) t.textContent = fmtDurSeg(+el.dataset.durMs || 0);
+  }
+  if (est === 'progreso' && prog) {
+    if (!b.classList.contains('sonando')) {
+      b.classList.add('sonando'); b.classList.remove('oido', 'cargando');
+      b.textContent = '🔊';
+    }
+    const tot = prog.durMs || 1;
+    if (r) r.style.width = Math.min(100, (prog.posMs / tot) * 100) + '%';
+    if (t) t.textContent = fmtDurSeg(prog.posMs) + ' / ' + fmtDurSeg(tot);
+  }
+  if (est === 'perdida') { b.disabled = true; b.textContent = '⚠️'; }
 }
 
 // Re-escuchar una nota: primero en la RAM del motor; si ya se limpió, en el
@@ -4211,7 +4243,7 @@ function marcarNotaVoz(seq, est) {
 async function reproducirNota(seq) {
   if (!S.room) return;
   S._nvRepro = seq;
-  marcarNotaVoz(seq, 'sonando');
+  marcarNotaVoz(seq, 'cargando'); // feedback inmediato mientras decodifica/descarga
   if (S.room.reproducirSeg && S.room.reproducirSeg(seq)) return;
   try {
     const rec = await idbCargarSeg(seq);
@@ -4234,12 +4266,28 @@ async function reproducirNota(seq) {
 
 // Al terminar de re-escuchar una nota, sigue con la siguiente del historial
 function reproducirSiguienteNota(seq) {
-  const el = S._nvEls.get(seq);
-  if (el) { const b = el.querySelector('.nv-play'); if (b) b.classList.remove('sonando'); }
+  marcarNotaVoz(seq, 'oido');
   if (S._nvRepro !== seq) return;
   const i = S._nvSeqs.indexOf(seq);
   if (i >= 0 && i + 1 < S._nvSeqs.length) reproducirNota(S._nvSeqs[i + 1]);
   else S._nvRepro = 0;
+}
+
+// El botón del chat es PTT cuando el campo está vacío (mismos permisos y
+// colores que los demás pulsadores) y "enviar" cuando hay texto
+function actualizarChatBtn() {
+  const ci = $('#chat-input'), ce = $('#chat-enviar');
+  if (!ci || !ce) return;
+  const vacio = !ci.value.trim();
+  ce.classList.toggle('ptt-sup', vacio);
+  ce.textContent = vacio ? '🎙️' : '➤';
+  if (vacio) {
+    ce.classList.remove('enviando');
+    renderPttEstados();
+  } else {
+    ce.classList.remove('ptt-libre', 'ptt-ocupado', 'ptt-hablando', 'ptt-sinpermiso');
+    ce.title = 'Enviar mensaje';
+  }
 }
 
 // Chip "vas con retraso": indica cuánto audio falta por escuchar respecto
