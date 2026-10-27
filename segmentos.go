@@ -302,8 +302,10 @@ func (s *segStore) tick() {
 	}
 }
 
-// manifiesto lista los segmentos cerrados (y el abierto) del grupo desde seq N.
-func (s *segStore) manifiesto(desde uint32, grupo int) map[string]any {
+// manifiesto lista los segmentos cerrados (y el abierto) del grupo desde
+// seq N. limite>0 recorta la lista a los últimos N — para la siembra del
+// chat al entrar no hace falta bajar el historial entero de la hora.
+func (s *segStore) manifiesto(desde uint32, grupo int, limite int) map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []any{}
@@ -311,6 +313,9 @@ func (s *segStore) manifiesto(desde uint32, grupo int) map[string]any {
 		if c.Seq >= desde && c.Grupo == grupo {
 			out = append(out, c)
 		}
+	}
+	if limite > 0 && len(out) > limite {
+		out = out[len(out)-limite:]
 	}
 	var abierto *segmento
 	for _, a := range s.abiertos {
@@ -518,6 +523,7 @@ func (r *mediaRoom) enviarCtrlGrupo(grupo int, raw []byte) {
 }
 
 // hAudioManifiesto atiende GET /api/salas/{sala}/audio?desde=N&g=G
+// &ultimos=N recorta a los últimos N segmentos (siembra del chat al entrar).
 func hAudioManifiesto(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	sala := r.PathValue("sala")
 	mr := media.room(sala)
@@ -533,7 +539,13 @@ func hAudioManifiesto(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			grupo = n
 		}
 	}
-	escribirJSON(w, 200, mr.seg.manifiesto(desde, grupo))
+	ultimos := 0
+	if v := r.URL.Query().Get("ultimos"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ultimos = n
+		}
+	}
+	escribirJSON(w, 200, mr.seg.manifiesto(desde, grupo, ultimos))
 }
 
 // hAudioSegmento atiende GET /api/salas/{sala}/audio/{seq}

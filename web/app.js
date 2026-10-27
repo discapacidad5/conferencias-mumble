@@ -4612,8 +4612,12 @@ async function sincronizarNotas() {
   if (!S.room || !S.sala) return;
   try {
     const ultimo = Math.max(S._ultimoSeg || 0, ...(S._nvSeqs.length ? [S._nvSeqs[S._nvSeqs.length - 1]] : [0]));
+    // solo metadatos (seq, nombre, duración, estado) — el audio NO baja aquí,
+    // se descarga recién al darle ▶ a una nota. Al entrar se piden las
+    // últimas 40; después solo el rango desde lo último conocido.
+    const q = ultimo > 0 ? `desde=${Math.max(0, ultimo - 40)}` : 'ultimos=40';
     const r = await fetch(
-      `/api/salas/${encodeURIComponent(S.sala)}/audio?desde=${Math.max(0, ultimo - 40)}&g=${S.miGrupo || 0}`,
+      `/api/salas/${encodeURIComponent(S.sala)}/audio?${q}&g=${S.miGrupo || 0}`,
       { headers: { Authorization: 'Bearer ' + S.token } });
     if (!r.ok) return;
     const man = await r.json();
