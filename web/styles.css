@@ -133,12 +133,24 @@ label.check input { width: auto; }
   animation: pttGira .9s linear infinite;
 }
 @keyframes pttGira { to { transform: rotate(360deg); } }
-/* el asiento (cuadrado) alterna el borde punteado amarillo/rojo */
-.asiento-mio.ptt-conectando {
-  border: 3px dashed var(--ambar);
-  animation: pttBorde .55s steps(2, jump-none) infinite;
+/* el asiento (cuadrado): franja bicolor que VIAJA por el borde — gradiente
+   cónico animado por ángulo, recortado a anillo de 3px por la máscara.
+   Si el navegador no soporta @property quedan tramos fijos alternados,
+   que igual informan "conectando" sin el parpadeo de color completo */
+@property --pttAng { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
+.asiento-mio.ptt-conectando { border: 3px solid transparent; }
+.asiento-mio.ptt-conectando::before {
+  content: ''; position: absolute; inset: 0; border-radius: 11px; padding: 3px;
+  background: repeating-conic-gradient(from var(--pttAng),
+    var(--ambar) 0 10deg, var(--peligro) 10deg 20deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: pttAng 1.1s linear infinite;
+  pointer-events: none; z-index: 4;
 }
-@keyframes pttBorde { 50% { border-color: var(--peligro); } }
+@keyframes pttAng { to { --pttAng: 360deg; } }
 
 /* Gestos del pulsador (estilo nota de voz): al mantener pisado aparecen
    🔒 arriba (arrastra hasta él para bloquear) y A a la izquierda
