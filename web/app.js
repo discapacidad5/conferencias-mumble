@@ -1653,7 +1653,9 @@ function wirePttButton(el, gate) {
     // Capturar el puntero: como el botón de WhatsApp, TODOS los movimientos
     // siguen llegando al botón aunque el dedo/ratón salga de él — así el
     // arrastre hacia el candado (arriba) o el automático (izquierda) no se
-    // corta al cruzar el borde del botón.
+    // corta al cruzar el borde del botón. Los asientos no usan gesto:
+    // llevan esquinas fijas 🔒 / A (un asiento entero no se arrastra).
+    if (el._pttSinGesto) return;
     try { el.setPointerCapture(e.pointerId); } catch {}
     S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, lock: false, auto: false };
     mostrarGestosPtt(el);
@@ -1680,8 +1682,11 @@ function wirePttButton(el, gate) {
       if (g && g.el === el && S.ptt.quiero) {
         S.ptt._gesto = null;
         if (g.lock) {
-          // candado: sigue hablando sin mantener el dedo; un toque suelta
+          // candado: sigue hablando sin mantener el dedo; un toque suelta.
+          // El click que el navegador dispara tras este pointerup hay que
+          // tragárselo: si no, desbloquea al instante de bloquear.
           S.ptt._bloqueado = true;
+          S.ptt._tragarClick = true;
           e.stopPropagation();
           toast('🔒 Bloqueado — toca el botón de nuevo para soltar');
           renderControles();
@@ -1691,6 +1696,7 @@ function wirePttButton(el, gate) {
           // modo automático al vuelo: al entrar la frase actual la cierra
           // el VAD cuando calles; al salir se suelta como una pulsación
           S.ptt._gesto = null;
+          S.ptt._tragarClick = true;
           e.stopPropagation();
           const aAuto = S.ptt.modo !== 'auto';
           if (aAuto) S.ptt.quiero = false;
@@ -1705,6 +1711,12 @@ function wirePttButton(el, gate) {
       }
     }));
   el.addEventListener('click', (e) => {
+    // click residual tras un gesto (bloquear/auto): no debe disparar nada
+    if (S.ptt._tragarClick) {
+      S.ptt._tragarClick = false;
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
     if (S.ptt._bloqueado) {
       S.ptt._bloqueado = false;
       e.preventDefault(); e.stopPropagation();
@@ -1718,6 +1730,20 @@ function wirePttButton(el, gate) {
     e.stopPropagation();
     if (S.ptt.quiero) pttOff(); else pttOn();
   });
+}
+
+// Esquina 🔒 de mi asiento / puesto de la palabra: arrancar hablando ya
+// bloqueado (o bloquear la frase en curso); con candado puesto, soltar
+function pttEsquinaLock() {
+  if (S.audio.retirando) return;
+  if (S.ptt._bloqueado) {
+    S.ptt._bloqueado = false;
+    pttOff();
+  } else {
+    S.ptt._bloqueado = true;
+    if (!S.ptt.quiero) pttOn();
+    else renderControles();
+  }
 }
 
 // Indicadores flotantes del gesto: 🔒 arriba del botón, A a la izquierda
@@ -1764,6 +1790,9 @@ function renderPttEstados() {
     el.classList.toggle('ptt-bloqueado', !!S.ptt._bloqueado);
     el.title = S.ptt._bloqueado ? 'Bloqueado: toca para soltar' : tit;
   });
+  // esquinas fijas del asiento/palabra: estado visual del candado y del auto
+  $$('.asiento-esq.lock').forEach(b => b.classList.toggle('on', !!S.ptt._bloqueado));
+  $$('.asiento-esq.auto').forEach(b => b.classList.toggle('on', S.ptt.modo === 'auto'));
   const me = $('#mic-estado');
   if (me) me.textContent = st === 'hablando' ? 'Estás hablando'
     : st === 'conectando' ? 'Conectando…'
@@ -2853,13 +2882,20 @@ function renderAsientos() {
       if (a.identidad === S.identidad && S.room) {
         div.classList.add('asiento-mio', 'ptt-sup');
         wirePttButton(div);
+        div._pttSinGesto = true; // un asiento entero no se arrastra: esquinas fijas
         div.insertAdjacentHTML('beforeend',
           '<button class="asiento-esq menu" type="button" title="Opciones del asiento">⋮</button>' +
-          '<button class="asiento-esq salir" type="button" title="Levantarme del asiento">✕</button>');
+          '<button class="asiento-esq salir" type="button" title="Levantarme del asiento">✕</button>' +
+          '<button class="asiento-esq lock" type="button" title="Hablar con el micrófono bloqueado (sin mantener)">🔒</button>' +
+          '<button class="asiento-esq auto" type="button" title="Modo automático: la voz pisa el botón por ti">A</button>');
         div.querySelector('.asiento-esq.menu').onclick =
           (ev) => { ev.stopPropagation(); menuPersona(ev, a.identidad, i + 1); };
         div.querySelector('.asiento-esq.salir').onclick =
           (ev) => { ev.stopPropagation(); accion('levantarse').catch(e => toast(e.message)); };
+        div.querySelector('.asiento-esq.lock').onclick =
+          (ev) => { ev.stopPropagation(); pttEsquinaLock(); };
+        div.querySelector('.asiento-esq.auto').onclick =
+          (ev) => { ev.stopPropagation(); cambiarModoPtt(S.ptt.modo === 'auto' ? 'hold' : 'auto'); };
         // las esquinas no deben disparar el PTT del asiento completo
         div.querySelectorAll('.asiento-esq').forEach(b =>
           b.addEventListener('pointerdown', ev => ev.stopPropagation()));
@@ -2921,15 +2957,22 @@ function renderAsientos() {
     if (soyYo && S.room) {
       pb.classList.add('asiento-mio', 'ptt-sup');
       wirePttButton(pb);
+      pb._pttSinGesto = true;
       pb.insertAdjacentHTML('beforeend',
         '<button class="asiento-esq menu" type="button" title="Opciones de la palabra">⋮</button>' +
-        '<button class="asiento-esq salir" type="button" title="Dejar la palabra">✕</button>');
+        '<button class="asiento-esq salir" type="button" title="Dejar la palabra">✕</button>' +
+        '<button class="asiento-esq lock" type="button" title="Micrófono bloqueado (sin mantener)">🔒</button>' +
+        '<button class="asiento-esq auto" type="button" title="Modo automático: la voz pisa el botón por ti">A</button>');
       pb.querySelectorAll('.asiento-esq').forEach(b =>
         b.addEventListener('pointerdown', ev => ev.stopPropagation()));
       pb.querySelector('.asiento-esq.menu').onclick =
         (ev) => { ev.stopPropagation(); if (pb._menuPalabra) pb._menuPalabra(ev); };
       pb.querySelector('.asiento-esq.salir').onclick =
         (ev) => { ev.stopPropagation(); confirmar('¿Dejar la palabra? Tu micrófono se silenciará.', dejarPalabra); };
+      pb.querySelector('.asiento-esq.lock').onclick =
+        (ev) => { ev.stopPropagation(); pttEsquinaLock(); };
+      pb.querySelector('.asiento-esq.auto').onclick =
+        (ev) => { ev.stopPropagation(); cambiarModoPtt(S.ptt.modo === 'auto' ? 'hold' : 'auto'); };
     }
     if (S.estado.palabraFin || S.estado.palabraPausada) {
       const msRest = S.estado.palabraPausada || Math.max(0, S.estado.palabraFin - Date.now());

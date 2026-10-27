@@ -191,6 +191,9 @@ label.check input { width: auto; }
 }
 .asiento-esq.salir { top: .3rem; right: .3rem; }
 .asiento-esq.menu { bottom: .3rem; right: .3rem; }
+.asiento-esq.lock { bottom: .3rem; left: .3rem; }
+.asiento-esq.auto { bottom: 2.7rem; left: .3rem; font-weight: 700; }
+.asiento-esq.on { background: var(--verde); border-color: var(--verde); color: #fff; }
 .badge {
   background: var(--peligro); color: #fff; border-radius: 999px;
   font-size: .7rem; padding: .1rem .45rem; margin-left: .3rem;
