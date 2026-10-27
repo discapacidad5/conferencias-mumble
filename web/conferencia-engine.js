@@ -2413,13 +2413,23 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seq}`,
           { headers: { Authorization: 'Bearer ' + (window.S.token || '') } });
         if (!r.ok) {
-          if (seg) { seg.bajando = false; seg.perdido = true; }
+          if (seg) {
+            seg.bajando = false;
+            seg.completo = true;
+            seg.finLocal = true;
+            if (!seg.bloques.length) { seg.perdido = true; seg.saltado = true; }
+          }
           return;
         }
         const buf = new Uint8Array(await r.arrayBuffer());
         const parsed = parsearArchivoSeg(buf);
         if (!parsed) {
-          if (seg) seg.bajando = false;
+          if (seg) {
+            seg.bajando = false;
+            seg.completo = true;
+            seg.finLocal = true;
+            if (!seg.bloques.length) seg.saltado = true;
+          }
           return;
         }
         const sg = seg || this._vozSegNuevo(
@@ -2464,17 +2474,27 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         if (!r.ok) return;
         const man = await r.json();
         const vivos = new Set(); // seq que el servidor conoce (cerradas o abiertas)
+        const base = this._baseSeg || 0;
+        const miId = this.localParticipant.identity;
         for (const meta of man.segmentos || []) {
           vivos.add(meta.seq);
+          if (meta.de === miId) continue; // mi propia voz no entra a la cola en vivo
           const seg = this._vozSegs.get(meta.seq);
-          if (seg && (seg.descargado || seg.reproducido)) continue;
-          this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
-          // mis propias frases no se descargan: no se escuchan a uno mismo
-          if (meta.de !== this.localParticipant.identity) this._bajarSeg(meta.seq);
+          if (seg) {
+            // Ya existía en mi sesión: actualizar su cierre y rellenar si tuvo huecos
+            this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
+            if (!seg.descargado && !seg.reproducido && (seg.huecos || !seg.bloques.length)) {
+              this._bajarSeg(meta.seq);
+            }
+          } else if (meta.seq > base) {
+            // Frase nueva ocurrida después de que entré y perdida durante el corte
+            this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
+            this._bajarSeg(meta.seq);
+          }
         }
-        if (man.abierto) {
+        if (man.abierto && man.abierto.de !== miId) {
           vivos.add(man.abierto.seq);
-          if (!this._vozSegs.get(man.abierto.seq)) {
+          if (!this._vozSegs.get(man.abierto.seq) && man.abierto.seq > base) {
             this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
             this._bajarSeg(man.abierto.seq);
           }
@@ -3146,6 +3166,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               // cerrado — el oyente entra "al presente" (el pasado está en el
               // historial, no se descarga solo)
               this._vozBase = true;
+              this._baseSeg = m.ultimoSeg;
               this._ultimoSeg = Math.max(this._ultimoSeg, m.ultimoSeg);
             } else if (m.ultimoSeg > this._ultimoSeg) {
               // Reconexión tras micro-corte: descargar las frases perdidas
@@ -3167,6 +3188,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             break;
           }
           const cur = this._segPorHablante.get(de);
+          // Como el piso es exclusivo (1 hablante a la vez), al iniciar una
+          // frase nueva cualquier frase anterior que haya quedado abierta en
+          // local se da por terminada para no tapar la voz nueva
+          for (const ant of this._vozOrden) {
+            if (!ant.completo && !ant.finLocal && ant.seq !== cur) {
+              ant.finLocal = true;
+              if (!ant.bloques.length && !ant.bajando) ant.saltado = true;
+            }
+          }
           let seg;
           if (cur != null && cur < 0) {
             // Ya llegaban tramas en vivo con seq pseudo: re-etiquetar al real
@@ -3197,6 +3227,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
         case 'seg_fin': {
           // La frase terminó (EOS): el segmento es una nota de voz cerrada
+          if (m.de === this.localParticipant.identity) {
+            this._ultimoSeg = Math.max(this._ultimoSeg, m.seq || 0);
+            this.emit('seg_fin', {
+              seq: m.seq, de: m.de, nombre: m.nombre || m.de,
+              durMs: m.durMs || 0, inicio: Date.now() - (m.durMs || 0),
+              interrumpida: !!m.interrumpida, abierto: false,
+            });
+            break;
+          }
           let seg = this._vozSegs.get(m.seq);
           if (seg) {
             seg.completo = true;

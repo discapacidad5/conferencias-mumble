@@ -348,20 +348,18 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 	return nuevo, cerrado, faltan
 }
 
-// reparar encaja una trama retransmitida en un segmento YA cerrado:
-//   - tx en su lista de huecos -> la inserta ordenada y reescribe el archivo
-//   - tx por delante de ultTx en un segmento cerrado SIN EOS (corte a media
-//     frase) -> es la cola perdida de esa misma frase: se anexa y los huecos
-//     intermedios quedan pedidos
-//   - un EOS tardío -> "sella" el segmento (eosVisto): los txs mayores ya
-//     pertenecen a frases nuevas, no a ésta
-//
-// Devuelve el segmento reparado (para que el llamador re-pida huecos) o nil.
+// reparar encaja una trama retransmitida en un hueco específico (sg.faltan[tx])
+// de un segmento YA cerrado y reescribe su archivo. Nunca captura tramas
+// nuevas por delante de ultTx: las tramas nuevas deben pasar siempre a la
+// transmisión en vivo y abrir o continuar la frase actual.
 func (s *segStore) reparar(id string, payload []byte) *segmento {
 	if len(payload) < 3 {
 		return nil
 	}
 	rc := payload[0]
+	if rc == 0 {
+		return nil
+	}
 	tx := txDeTrama(payload)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -369,18 +367,7 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 		if sg.De != id {
 			continue
 		}
-		if rc == 0 {
-			// EOS retransmitido: cierra la ventana de continuación del
-			// segmento inmediatamente anterior a este tx
-			if !sg.eosVisto && sg.tieneTx && ((int(tx)-int(sg.ultTx))&0xffff) < 30000 {
-				sg.eosVisto = true
-				return sg
-			}
-			continue
-		}
-		_, eraFalta := sg.faltan[tx]
-		continua := !sg.eosVisto && sg.tieneTx && ((int(tx)-int(sg.ultTx))&0xffff) < 1500
-		if !eraFalta && !continua {
+		if _, eraFalta := sg.faltan[tx]; !eraFalta {
 			continue
 		}
 		key := uint32(tx)<<1 | txFamilia(rc)
@@ -389,10 +376,6 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 		}
 		sg.vistos[key] = struct{}{}
 		delete(sg.faltan, tx)
-		marcarHuecos(sg, tx)
-		if ((int(tx) - int(sg.ultTx)) & 0xffff) < 30000 {
-			sg.ultTx = tx
-		}
 		cp := make([]byte, len(payload))
 		copy(cp, payload)
 		insertarTrama(sg, tx, true, cp)
@@ -401,11 +384,7 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 			sg.DurMs = d
 		}
 		sg.ultFrame = ahora()
-		sg.reparaH = ahora() + 45_000 // cada relleno extiende la ventana
-		if sg.ruta == "" && sg.DurMs >= 700 {
-			sg.ruta = filepath.Join(s.dir, "seg-"+itoa8(sg.Seq)+".seg")
-			s.cerrados = append(s.cerrados, sg)
-		}
+		sg.reparaH = ahora() + 45_000
 		if sg.ruta != "" {
 			tmp := sg.ruta + ".tmp"
 			if escribirArchivoSeg(tmp, sg) == nil {
@@ -435,15 +414,9 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 		sg.DurMs = d
 	}
 	// tap accidental del PTT: notas de <0,7 s no se archivan ni entran al
-	// manifiesto, pero si aún no llegó su EOS quedan en recientes por si las
-	// tramas de la frase vienen retrasadas detrás de piso_soltar
+	// manifiesto (el cliente igual recibe seg_fin y borra la nota en vivo)
 	if sg.DurMs < 700 {
-		if !sg.eosVisto {
-			sg.reparaH = ahora() + 45_000
-			s.recientes = append(s.recientes, sg)
-		} else {
-			sg.frames, sg.vistos, sg.faltan = nil, nil, nil
-		}
+		sg.frames, sg.vistos, sg.faltan = nil, nil, nil
 		return sg
 	}
 	ruta := filepath.Join(s.dir, "seg-"+itoa8(sg.Seq)+".seg")
@@ -458,10 +431,8 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 	} else {
 		os.Remove(tmp)
 	}
-	// Queda reparable ~45 s: las retransmisiones del emisor rellenan sus
-	// huecos (reparar) y reescriben el archivo. Si NO llegó EOS también se
-	// acepta la cola de la frase que se perdió con el corte.
-	if len(sg.faltan) > 0 || !sg.eosVisto {
+	// Si quedaron huecos detectados, queda reparable ~45 s para rellenarlos
+	if len(sg.faltan) > 0 {
 		sg.reparaH = ahora() + 45_000
 		s.recientes = append(s.recientes, sg)
 		for len(s.recientes) > 8 {
@@ -513,8 +484,7 @@ func (s *segStore) tick() {
 	if len(s.recientes) > 0 {
 		vivos := s.recientes[:0]
 		for _, sg := range s.recientes {
-			vivo := sg.reparaH > ahoraMs && (len(sg.faltan) > 0 || !sg.eosVisto)
-			if vivo {
+			if sg.reparaH > ahoraMs && len(sg.faltan) > 0 {
 				vivos = append(vivos, sg)
 			} else {
 				sg.frames, sg.vistos, sg.faltan = nil, nil, nil

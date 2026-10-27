@@ -719,11 +719,9 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			tipo, _ := m["t"].(string)
 			switch tipo {
 			case "piso_tomar":
-				c.pisoSuelto = false
 				mr.tomarPisoWS(c)
 
 			case "piso_soltar":
-				c.pisoSuelto = true
 				liberarPisoDe(sala, c.identidad, false)
 
 			case "piso_hold":
@@ -829,25 +827,13 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					continue
 				}
 				rc := payload[0]
-				// Reparación anti-pérdida: si esta tx pertenece a un segmento
-				// ya cerrado que la espera, se archiva SIN fanout en vivo (los
-				// oyentes ya cerraron esa frase — repetirla sería un eco; su
-				// propio relleno baja el archivo ya completo)
-				if len(payload) >= 3 {
+				// Reparación anti-pérdida: si esta tx rellena un hueco explícito
+				// de un segmento ya cerrado, se archiva en ese archivo
+				if len(payload) >= 3 && rc != 0 {
 					if sgR := mr.seg.reparar(c.identidad, payload); sgR != nil {
 						mr.seg.pedirFaltantes(sgR)
-						if rc == 0 && sgR.DurMs >= 700 {
-							mr.notificarSegFin(sgR)
-						}
 						continue
 					}
-				}
-				// Si el cliente ya soltó el botón (piso_soltar llegó antes que
-				// las últimas tramas de audio encoladas), descartar cualquier
-				// trama sobrante para NO volver a tomar el piso ni abrir otra
-				// nota en vivo cuando el usuario ya levantó el dedo.
-				if c.pisoSuelto {
-					continue
 				}
 				// Piso exclusivo: solo pasa la voz del dueño del piso; hablar
 				// lo toma en automático y un tercero puede tumbártelo según los

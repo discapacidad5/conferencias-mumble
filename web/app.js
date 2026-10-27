@@ -4599,6 +4599,20 @@ const fmtDurSeg = (ms) => {
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 };
 
+// Inserta una nota de voz en #chat-lista respetando el orden numérico de seq
+// (para que una nota recuperada tras un corte no quede abajo de notas más nuevas)
+function insertarNotaOrdenada(lista, el, seq) {
+  el.dataset.seq = seq;
+  for (const ch of lista.children) {
+    const cSeq = +(ch.dataset?.seq || ch.querySelector('.nv-play')?.dataset.seq || 0);
+    if (cSeq > seq) {
+      lista.insertBefore(el, ch);
+      return;
+    }
+  }
+  lista.appendChild(el);
+}
+
 // Cada frase cerrada queda como nota de voz en el historial del chat:
 // reproducible, con indicador de sonando/escuchada
 // La frase que se está grabando AHORA aparece al instante en el chat con
@@ -4618,7 +4632,7 @@ function agregarNotaVozEnVivo(meta) {
     `<div class="nv-pista"><div class="nv-relleno rec"></div></div>` +
     `<span class="nv-tiempo">● 0:00</span></div>`;
   // sin ⋮ mientras graba: no hay nada que seleccionar/descargar/borrar
-  lista.appendChild(el);
+  insertarNotaOrdenada(lista, el, meta.seq);
   lista.scrollTop = lista.scrollHeight;
   S._nvEls.set(meta.seq, el);
   S._nvSeqs.push(meta.seq);
@@ -4733,7 +4747,7 @@ function agregarNotaVoz(meta) {
     `<div class="nv-pista"><div class="nv-relleno"></div></div>` +
     `<span class="nv-tiempo">${fmtDurSeg(meta.durMs)}</span></div>`;
   ponerOpcionesMsg(el);
-  lista.appendChild(el);
+  insertarNotaOrdenada(lista, el, meta.seq);
   while (lista.children.length > 200) {
     const viejo = lista.firstChild;
     if (viejo && viejo.classList.contains('nota-voz')) {
@@ -4933,14 +4947,20 @@ function detenerNota(seq) {
   else marcarNotaVoz(seq, 'oido');
 }
 
-// Al terminar de re-escuchar una nota, sigue con la siguiente del historial
+// Al terminar de re-escuchar una nota, sigue con la siguiente cerrada del historial
 function reproducirSiguienteNota(seq) {
   marcarNotaVoz(seq, 'oido');
   if (S._nvPausas) S._nvPausas.delete(seq);
   if (S._nvRepro !== seq) return;
-  const i = S._nvSeqs.indexOf(seq);
-  if (i >= 0 && i + 1 < S._nvSeqs.length) reproducirNota(S._nvSeqs[i + 1]);
-  else S._nvRepro = 0;
+  for (const s of S._nvSeqs) {
+    if (s <= seq) continue;
+    const el = S._nvEls.get(s);
+    if (el && !el.classList.contains('grabando')) {
+      reproducirNota(s);
+      return;
+    }
+  }
+  S._nvRepro = 0;
 }
 
 // El botón del chat es PTT cuando el campo está vacío (mismos permisos y
