@@ -1164,18 +1164,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               }
               const rms = Math.sqrt(sum / 960);
 
-              if (!hablandoActivo && rms < noiseFloor * 1.5) {
-                noiseFloor = Math.max(0.0008, Math.min(0.0032, noiseFloor * 0.95 + rms * 0.05));
-              }
               const sens = (window.S && S.ptt && S.ptt.sens) || 2.0;
               const umbralAbrir = Math.max(0.0032, noiseFloor * sens);
-              const umbralMantener = Math.max(0.0014, noiseFloor * 1.15);
               // ataque: N tramas seguidas de voz antes de activar (evita que
               // un golpe o ruido ambiente aislado "pise el botón" en auto)
               const ataqueN = Math.max(1, Math.round(((window.S && S.ptt && S.ptt.ataque) || 0.12) / 0.04));
               if (rms >= umbralAbrir) vozSeg++; else vozSeg = 0;
-              const vozOk = rms >= (hablandoActivo ? umbralMantener : umbralAbrir)
-                && (hablandoActivo || vozSeg >= ataqueN);
+              const vozOk = rms >= umbralAbrir && (hablandoActivo || vozSeg >= ataqueN);
+              // El piso de ruido se re-ajusta también con la frase abierta
+              // (en tramas sin voz clara): si el ambiente sube mientras se
+              // habla, el umbral lo sigue y el automático no queda pegado
+              // eternamente por ruido de fondo
+              if (rms < noiseFloor * 1.5 || (hablandoActivo && rms < umbralAbrir)) {
+                noiseFloor = Math.max(0.0008, Math.min(0.01, noiseFloor * 0.96 + rms * 0.04));
+              }
 
               // En modo PTT el botón manda, no el VAD: mientras se tenga el
               // piso se transmite TODO (una pulsación = una nota de voz
@@ -1203,44 +1205,51 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   enviarMarcadorEOS();
                   this._room._marcarHablandoLocal(false);
                 }
-              } else if (vozOk || (window.S && S.ptt && S.ptt.quiero)) {
+              } else {
                 // Modo automático: la voz pisa el botón. El micro escucha en
                 // local SIEMPRE, pero al servidor solo se transmite cuando el
                 // piso ya es mío (S.ptt.tengo): sin piso no se gasta subida.
-                const tengo = window.S && S.ptt && S.ptt.tengo;
-                if (!hablandoActivo) {
-                  hablandoActivo = true;
-                  opusPending.length = 0;
-                  ultimoPedirPiso = performance.now();
-                  autoPreTs = ultimoPedirPiso;
-                  if (this._room) this._room.tomarPiso();
-                  // pre-roll de 40 ms guardado: se suelta apenas concedan el
-                  // piso para conservar el ataque de la primera sílaba
-                  autoPre = tienePrevFrame ? new Float32Array(prevFrame48k) : null;
-                }
-                // Cola de silencio configurable ("Soltar tras N s", tope 5 s)
+                const quieroPtt = window.S && S.ptt && S.ptt.quiero;
+                // Cola de silencio ("Soltar tras N s", tope 5 s): SOLO la
+                // voz clara (≥ umbral de apertura) la recarga. El ruido de
+                // fondo o la voz demasiado baja cuentan como silencio — así
+                // el cierre tarda lo configurado y no lo que dure el ruido
                 const silSeg = Math.min(5, (window.S && S.ptt && S.ptt.silencio) || 2.2);
-                silencioCola = Math.max(8, Math.round(silSeg / 0.04));
-                this._room._marcarHablandoLocal(true);
-                if (tengo) {
-                  if (autoPre) {
-                    // el pre-roll solo sirve si el piso llegó al instante;
-                    // tras una espera larga es un blip desconectado
-                    if (performance.now() - autoPreTs < 1500) {
-                      for (let k = 0; k < 192; k++) autoPre[k] *= (k / 192);
-                      enviarTrama40ms(autoPre);
-                    }
-                    autoPre = null;
+                const colaMax = Math.max(8, Math.round(silSeg / 0.04));
+                if (rms >= umbralAbrir) silencioCola = colaMax;
+                else if (silencioCola > 0) silencioCola--;
+                if ((vozOk || hablandoActivo || quieroPtt) &&
+                    (rms >= umbralAbrir || silencioCola > 0 || quieroPtt)) {
+                  if (!hablandoActivo) {
+                    hablandoActivo = true;
+                    opusPending.length = 0;
+                    ultimoPedirPiso = performance.now();
+                    autoPreTs = ultimoPedirPiso;
+                    if (this._room) this._room.tomarPiso();
+                    // pre-roll de 40 ms guardado: se suelta apenas concedan
+                    // el piso para conservar el ataque de la primera sílaba
+                    autoPre = tienePrevFrame ? new Float32Array(prevFrame48k) : null;
                   }
-                  enviarTrama40ms(frameBuf);
-                } else if (this._room && performance.now() - ultimoPedirPiso > 900) {
-                  // piso ajeno: reintenta por si el otro ya soltó
-                  ultimoPedirPiso = performance.now();
-                  this._room.tomarPiso();
-                }
-              } else if (silencioCola > 0) {
-                silencioCola--;
-                if (silencioCola === 0) {
+                  this._room._marcarHablandoLocal(true);
+                  const tengo = window.S && S.ptt && S.ptt.tengo;
+                  if (tengo) {
+                    if (autoPre) {
+                      // el pre-roll solo sirve si el piso llegó al instante;
+                      // tras una espera larga es un blip desconectado
+                      if (performance.now() - autoPreTs < 1500) {
+                        for (let k = 0; k < 192; k++) autoPre[k] *= (k / 192);
+                        enviarTrama40ms(autoPre);
+                      }
+                      autoPre = null;
+                    }
+                    enviarTrama40ms(frameBuf);
+                  } else if (this._room && performance.now() - ultimoPedirPiso > 900) {
+                    // piso ajeno: reintenta por si el otro ya soltó
+                    ultimoPedirPiso = performance.now();
+                    this._room.tomarPiso();
+                  }
+                } else if (hablandoActivo) {
+                  // silencio agotó la cola: fundido de salida + cierre
                   const tail = new Float32Array(frameBuf);
                   for (let k = 0; k < 1920; k++) tail[k] *= (1 - k / 1920);
                   enviarTrama40ms(tail);
@@ -1253,13 +1262,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                     configurarOpus(pendingBr);
                   }
                 } else {
-                  enviarTrama40ms(frameBuf);
-                }
-              } else {
-                hablandoActivo = false;
-                this._room._marcarHablandoLocal(false);
-                if (pendingBr !== null && pendingBr !== maxBr) {
-                  configurarOpus(pendingBr);
+                  if (pendingBr !== null && pendingBr !== maxBr) {
+                    configurarOpus(pendingBr);
+                  }
                 }
               }
 
