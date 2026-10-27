@@ -1650,22 +1650,33 @@ function wirePttButton(el, gate) {
     // si quedó bloqueado, un toque lo desbloquea y suelta
     if (S.ptt._bloqueado) { S.ptt._bloqueado = false; pttOff(); return; }
     pttOn();
-    // gesto estilo nota de voz: arrastrar ARRIBA = candado (queda hablando),
-    // arrastrar a la IZQUIERDA = activar/desactivar el modo automático
+    // Capturar el puntero: como el botón de WhatsApp, TODOS los movimientos
+    // siguen llegando al botón aunque el dedo/ratón salga de él — así el
+    // arrastre hacia el candado (arriba) o el automático (izquierda) no se
+    // corta al cruzar el borde del botón.
+    try { el.setPointerCapture(e.pointerId); } catch {}
     S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, lock: false, auto: false };
     mostrarGestosPtt(el);
   });
   el.addEventListener('pointermove', (e) => {
     const g = S.ptt._gesto;
     if (!g || g.el !== el || !S.ptt.quiero || S.ptt._bloqueado) return;
-    g.lock = (g.y0 - e.clientY) > 56;          // arrastre hacia arriba
-    g.auto = (g.x0 - e.clientX) > 56 && !g.lock; // arrastre hacia la izquierda
+    const dy = g.y0 - e.clientY, dx = g.x0 - e.clientX;
+    g.lock = dy > 56;                          // arrastre hacia arriba
+    g.auto = dx > 56 && !g.lock;               // arrastre hacia la izquierda
+    // el botón se arrastra un poco con el dedo, como la nota de voz de
+    // WhatsApp: puro feedback visual, los gestos mandan por distancia
+    const vx = Math.min(0, Math.max(-30, -dx * 0.35));
+    const vy = Math.min(0, Math.max(-30, -dy * 0.35));
+    const base = el.classList.contains('asiento-ptt') ? 'translate(-50%,-50%) ' : '';
+    el.style.transform = `${base}translate(${vx}px, ${vy}px)`;
     marcarGestosPtt(g);
   });
   ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev =>
     el.addEventListener(ev, (e) => {
       const g = S.ptt._gesto;
       ocultarGestosPtt();
+      if (el.style.transform) el.style.transform = ''; // soltar el arrastre
       if (g && g.el === el && S.ptt.quiero) {
         S.ptt._gesto = null;
         if (g.lock) {
@@ -2833,7 +2844,10 @@ function renderAsientos() {
         pin.addEventListener('pointerdown', ev => ev.stopPropagation());
         div.appendChild(pin);
       }
-      if (S.activo === a.identidad) div.style.borderColor = 'var(--verde)';
+      // Verde "hablando" solo en asientos ajenos: en el mío manda el color
+      // del pulsador PTT (rojo = yo hablando); sin esto tapaba el rojo
+      if (S.activo === a.identidad && a.identidad !== S.identidad)
+        div.style.borderColor = 'var(--verde)';
       // MI asiento entero ES el pulsador PTT: mi nombre queda dentro del
       // botón y las esquinas guardan las acciones (⋮ opciones · ✕ salir)
       if (a.identidad === S.identidad && S.room) {
@@ -2900,7 +2914,8 @@ function renderAsientos() {
     } else {
       pb.insertAdjacentHTML('beforeend', `<span class="tag">${esc(palabraId)}</span>`);
     }
-    if (S.activo === palabraId) pb.style.borderColor = 'var(--verde)';
+    // verde solo si habla otro: si la palabra es mía manda el rojo del PTT
+    if (S.activo === palabraId && !soyYo) pb.style.borderColor = 'var(--verde)';
     // con La Palabra mi puesto entero ES el pulsador: el micro es obligatorio
     // (pttOff lo ignora) y las esquinas conservan ⋮ opciones y ✕ dejarla
     if (soyYo && S.room) {

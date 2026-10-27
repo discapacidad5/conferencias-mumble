@@ -2351,16 +2351,41 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return out;
     }
 
+    // Vacía la salida sin cortar el nodo: lo ya encolado deja de sonar al
+    // instante (interrumpir una nota o el audio en vivo con otra nota)
+    _vaciarPipeVoz() {
+      const pipe = this._vozPipe;
+      this._vozBufMs = 0;
+      if (!pipe) return;
+      if (pipe.worklet) {
+        try { pipe.worklet.port.postMessage({ t: 'limpiar' }); } catch {}
+      } else {
+        pipe.available = 0;
+        pipe.readPosF = pipe.writePos;
+        pipe.playing = false;
+        pipe.eosPending = false;
+        pipe.waitSamples = 0;
+        pipe.readRate = 1.0;
+      }
+    }
+
     // ---------- re-escucha de notas de voz ----------
     _encolarReplay(seq, bloques) {
       if (!bloques.length) return false;
+      // La nueva nota interrumpe de inmediato: se descarta lo que sonaba
+      // (otra re-escucha o el audio vivo encolado). Al terminar, el vivo
+      // continúa por donde va su retraso — lo perdido queda en el historial.
+      if (this._replayProg.length || this._replayQ.length || this._vozBufMs > 60) {
+        while (this._replayProg.length) this.emit('seg_replay_fin', this._replayProg.shift().seq);
+        this._replayQ.length = 0;
+        this._replayPendMs = 0;
+        this._replayPlayedMs = 0;
+        this._vaciarPipeVoz();
+      }
       const rate = (this._vozPipe && this._vozPipe.ctxRate) || this._vozRate;
       const msTotal = bloques.reduce((m, b) => m + (b.pcm.length / rate) * 1000, 0);
       this._replayQ.push({ seq, bloques, alimentado: 0, msTotal });
-      const base = this._replayProg.length
-        ? this._replayProg[this._replayProg.length - 1].finMs
-        : this._replayPlayedMs;
-      this._replayProg.push({ seq, msTotal, finMs: Math.max(base, this._replayPlayedMs) + msTotal });
+      this._replayProg.push({ seq, msTotal, finMs: msTotal });
       this._programarFeedOn();
       return true;
     }
