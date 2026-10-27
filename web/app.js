@@ -1811,12 +1811,13 @@ function renderPttEstados() {
     : st === 'sinpermiso' ? 'Sin permiso'
     : st === 'ocupado' ? `Habla ${S.estado.pisoNombre || S.estado.piso}`
     : auto ? 'Auto: escuchando' : 'Piso libre';
-  // Círculo flotante central: de pie el dedo tapa el pulsador, así que el
-  // estado del piso se ve en grande en el centro de la pantalla. Sentado
-  // (o con La Palabra) el propio asiento ya lo marca, no hace falta.
+  // Círculo flotante central: SOLO mientras el dedo está físicamente
+  // pisado — es un indicador del estado del piso, no un botón. Con candado
+  // o en automático no se muestra: ahí el propio pulsador ya se ve activo.
   const pf = $('#ptt-float');
   if (pf) {
     const mostrar = (st === 'conectando' || st === 'hablando') &&
+      S.ptt.quiero && !S.ptt._bloqueado &&
       !estoySentado() && !tengoPalabra();
     pf.classList.toggle('oculto', !mostrar);
     pf.classList.toggle('conectando', st === 'conectando');
