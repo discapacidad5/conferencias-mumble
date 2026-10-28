@@ -426,7 +426,7 @@ class VozRxProcessor extends AudioWorkletProcessor {
     super();
     const rate = sampleRate || 48000;
     this.rate = rate;
-    this.cap = Math.ceil(rate * 1.5);
+    this.cap = Math.ceil(rate * 30);
     this.ring = new Float32Array(this.cap);
     this.writePos = 0;
     this.readPosF = 0;
@@ -440,10 +440,9 @@ class VozRxProcessor extends AudioWorkletProcessor {
     this.fadeInLen = Math.ceil(rate * 0.005);
     this.readRate = 1.0;
     this.velMax = 1.0;
-    this.targetSamples = Math.ceil(rate * 0.06); // 60 ms: tiempo real instantáneo
-    // SOLA: cola de las últimas muestras emitidas, para alinear por
-    // correlación cada ventana al acelerar (drenar rápido sin subir el tono)
-    this.solaOv = Math.ceil(rate * 0.01); // solape de 10 ms
+    this.targetSamples = Math.ceil(rate * 1.0);
+    this.capMs = 28;
+    this.solaOv = Math.ceil(rate * 0.01);
     this.solaTail = new Float32Array(this.solaOv);
     this.port.onmessage = (ev) => {
       const d = ev.data;
@@ -462,22 +461,20 @@ class VozRxProcessor extends AudioWorkletProcessor {
         this.readRate = 1.0;
         return;
       }
-      if (d.t === 'vel' && typeof d.v === 'number') {
-        // 1.0 = velocidad natural exacta (sin acelerar); solo >1 cuando hay
-        // más de 15 s de retraso acumulado
-        this.velMax = Math.max(1.0, Math.min(1.4, d.v));
+      if (d.t === 'vel') {
+        // Reproducción siempre 1.0x natural: la aceleración está desactivada
+        this.velMax = 1.0;
+        this.readRate = 1.0;
         return;
       }
       if (d.t === 'target' && typeof d.ms === 'number') {
-        // Colchón de arranque adaptativo: con cortes crece hasta 5 s para
-        // que la frase viva suene entera; estable, ~0,4 s
-        this.targetSamples = Math.ceil(this.rate * (Math.max(55, Math.min(5000, d.ms)) / 1000));
+        // Colchón autorregulado (hasta 10 s): acumula el trozo completo
+        // antes de reproducir para absorber los siguientes baches a 1.0x
+        this.targetSamples = Math.ceil(this.rate * (Math.max(100, Math.min(10000, d.ms)) / 1000));
         return;
       }
       if (d.t === 'cap' && typeof d.ms === 'number') {
-        // Tope de cola configurable: música en vivo 260 ms; la tubería de
-        // notas de voz llega a ~6,5 s cuando el buffer adaptativo crece
-        this.capMs = Math.max(0.1, Math.min(6.5, d.ms / 1000));
+        this.capMs = Math.max(0.26, Math.min(29, d.ms / 1000));
         return;
       }
       if (d.t === 'push' && d.pcm) {
@@ -485,16 +482,6 @@ class VozRxProcessor extends AudioWorkletProcessor {
         const n = src.length;
         if (n === 0) return;
         this.eosPending = false;
-        // Tope de la cola (capMs): por defecto 260 ms en vivo; la tubería de
-        // segmentos lo sube para guardar historial en espera de sonar
-        const hardCap = this.rate * (this.capMs || 0.26);
-        if (this.available + n > hardCap) {
-          const keep = Math.ceil(this.rate * 0.08);
-          const drop = Math.max(0, (this.available + n) - keep);
-          this.readPosF = (this.readPosF + drop) % this.cap;
-          this.available = Math.max(0, this.available - drop);
-          this.fadeInPos = 0;
-        }
         const ring = this.ring;
         const cap = this.cap;
         let wp = this.writePos;
@@ -516,10 +503,9 @@ class VozRxProcessor extends AudioWorkletProcessor {
     if (!this.playing) {
       if (this.available > 0) {
         this.waitSamples += n;
-        // La espera máxima escala con el colchón: con buffer adaptativo
-        // grande se acumula de verdad antes de soltar la frase completa
-        const esperaMax = Math.max(this.rate * 0.08,
-          Math.min(this.rate * 1.5, this.targetSamples * 0.7));
+        // Espera a reunir el colchón completo (targetSamples) o a que la
+        // frase haya terminado (eosPending) antes de arrancar a 1.0x
+        const esperaMax = Math.max(this.rate * 0.5, this.targetSamples);
         if (
           this.available >= this.targetSamples ||
           this.eosPending ||
@@ -539,36 +525,16 @@ class VozRxProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Drenar retrasos solo cuando velMax > 1.0 (más de 15 s de atraso);
-    // con <= 15 s suena siempre a velocidad 1.0x natural
-    const over = this.available - this.targetSamples;
-    let desired = 1.0;
-    if (this.velMax > 1.001 && over > this.rate * 0.05) {
-      desired = Math.min(this.velMax, 1.0 + (over / this.rate) * 0.15);
-    }
-    this.readRate += (desired - this.readRate) * 0.15;
-
-    // Aceleración con SOLA (overlap-add alineado por correlación): consume
-    // más entrada de la que emite sin cambiar el tono de la voz. Se usa en
-    // el rango 1.02–1.9×; por encima el retraso es tan grande que la voz ya
-    // no se entiende ni con SOLA, y conviene el salto directo (resampleo
-    // barato) para llegar al presente cuanto antes.
-    if (this.readRate > 1.02 && this.readRate < 1.9 &&
-        this.available > n * this.readRate + this.rate * 0.05) {
-      this._sola(out, n);
-      return true;
-    }
-
+    // Reproducción 1:1 a velocidad natural 1.0x (jamás acelera: el colchón
+    // acumulado tras el primer bache absorbe los baches siguientes)
     const ring = this.ring;
     const cap = this.cap;
     for (let i = 0; i < n; i++) {
-      if (this.available > 1.05) {
+      if (this.available >= 1) {
         const idx0 = this.readPosF | 0;
-        const frac = this.readPosF - idx0;
-        const idx1 = (idx0 + 1) % cap;
-        let s = ring[idx0] + frac * (ring[idx1] - ring[idx0]);
-        this.readPosF = (this.readPosF + this.readRate) % cap;
-        this.available -= this.readRate;
+        let s = ring[idx0];
+        this.readPosF = (idx0 + 1) % cap;
+        this.available -= 1;
         if (this.fadeInPos < this.fadeInLen) {
           s *= this.fadeInPos / this.fadeInLen;
           this.fadeInPos++;
@@ -581,7 +547,7 @@ class VozRxProcessor extends AudioWorkletProcessor {
         if (Math.abs(this.lastOut) < 0.0001) this.lastOut = 0;
         out[i] = this.lastOut;
         this.underrunSamples++;
-        if (this.eosPending || this.underrunSamples > this.rate * 0.045) {
+        if (this.eosPending || this.underrunSamples > this.rate * 0.08) {
           this.playing = false;
           this.eosPending = false;
           this.waitSamples = 0;
@@ -592,8 +558,6 @@ class VozRxProcessor extends AudioWorkletProcessor {
         }
       }
     }
-    // Guardar la cola de salida para alinear la próxima ventana SOLA
-    if (n >= this.solaOv) this.solaTail.set(out.subarray(n - this.solaOv));
     return true;
   }
 
@@ -1654,10 +1618,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._vozBase = false;            // la 1ª bienvenida fija la base
       this._vozPipe = null;             // reproductor único ordenado
       this._vozBufMs = 0;               // ms de PCM ya empujados al reproductor
-      // Buffer adaptativo del vivo: crece con cada sequía (+700 ms, tope
-      // 5 s) y vuelve a bajar cuando la red se estabiliza — con datos
-      // móviles vale más 1-3 s de retraso que una frase entrecortada
-      this._jitMs = 400;
+      // Colchón autorregulado a 1.0x: empieza en 1,2 s; si ocurre un bache
+      // de N segundos, el colchón sube a N segundos (hasta 10 s) y como la
+      // voz suena siempre a 1.0x sin acelerar, ese colchón absorbe todos los
+      // baches siguientes durante el resto de la conversación.
+      this._jitMs = 1200;
       this._jitBumpT = 0;
       this._jitUltimoCorte = 0;
       this._starveDesde = 0;
@@ -1863,9 +1828,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         const c = this._ctrlCola.shift();
         try { this._ws.send(c); } catch { this._ctrlCola.unshift(c); break; }
       }
-      // Drenar por debajo de 12 KB en bufferedAmount para no disparar el
-      // watchdog de socket congelado (que reemplaza el socket a los 14 KB)
-      while (this._txCola.length && this._ws.bufferedAmount < 12 * 1024) {
+      // Drenar hasta 64 KB por tanda para que las ráfagas salgan fluidas
+      while (this._txCola.length && this._ws.bufferedAmount < 64 * 1024) {
         const p = this._txCola.shift();
         this._txBytes -= p.length;
         try { this._ws.send(p); } catch {
@@ -1973,8 +1937,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return seg;
     }
 
-    // Inserta un bloque decodificado en el segmento, ordenado por txSeq
-    // (los huecos reparados se insertan en su posición correcta)
+    // Inserta un bloque decodificado en el segmento, ordenado por txSeq.
+    // Si cae antes de seg.alimentado (ya sonó ese punto), queda en seg.bloques
+    // para que la grabación quede íntegra y desplazamos seg.alimentado +1 para
+    // NO volver a reproducir bloques que ya sonaron ni revivir notas viejas.
     _insertarBloque(seg, bl) {
       seg.ultRxT = performance.now(); // watchdog de frase abierta
       if (typeof bl.tx !== 'number' || bl.tx < 0) {
@@ -1984,8 +1950,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let i = seg.bloques.length;
       while (i > 0 && ((seg.bloques[i - 1].tx - bl.tx) & 0xffff) < 30000) i--;
       seg.bloques.splice(i, 0, bl);
-      if (i < seg.alimentado) seg.alimentado = i; // reposición de un hueco
-      if (seg.reproducido && i < seg.bloques.length) seg.reproducido = false;
+      if (i < seg.alimentado) seg.alimentado++;
     }
 
     _programarReparacion(seg) {
@@ -1993,7 +1958,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       seg._repT = setTimeout(() => {
         seg._repT = null;
         if (seg.seq > 0) this._bajarSeg(seg.seq);
-      }, 500);
+      }, 250);
     }
 
     // Trama de voz en vivo ya decodificada y remuestreada: entra a la cola
@@ -2038,7 +2003,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const ctx = this._asegurarRxAudioCtx();
       const ctxRate = ctx.sampleRate || 48000;
       this._vozRate = ctxRate;
-      const cap = Math.ceil(ctxRate * 8);
+      const cap = Math.ceil(ctxRate * 30);
       const gainNode = ctx.createGain();
       gainNode.gain.value = 1.0;
       gainNode.connect(ctx.destination);
@@ -2049,7 +2014,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         eosPending: true, waitSamples: 0, underrunSamples: 0,
         lastOut: 0, fadeInPos: 0, fadeInLen: Math.ceil(ctxRate * 0.005),
         readRate: 1.0, velMax: 1.0, eosSent: true,
-        targetSamples: Math.ceil(ctxRate * 0.06),
+        targetSamples: Math.ceil(ctxRate * 1.0),
       };
       this._vozPipe = pipe;
 
@@ -2061,9 +2026,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           });
           wn.connect(gainNode);
           pipe.worklet = wn;
-          // esta tubería lleva notas de voz e historial: cola amplia (1,4 s)
-          // para que el drenaje acelerado no recorte frases
-          try { wn.port.postMessage({ t: 'cap', ms: 1400 }); } catch {}
+          try {
+            wn.port.postMessage({ t: 'cap', ms: 28000 });
+            wn.port.postMessage({ t: 'target', ms: this._jitMs || 1200 });
+          } catch {}
           if (pipe.proc) { try { pipe.proc.disconnect(); } catch {} pipe.proc = null; }
           return true;
         } catch { return false; }
@@ -2077,8 +2043,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           if (!pipe.playing) {
             if (pipe.available > 0) {
               pipe.waitSamples += n;
-              const esperaMax = Math.max(pipe.ctxRate * 0.08,
-                Math.min(pipe.ctxRate * 1.5, pipe.targetSamples * 0.7));
+              const esperaMax = Math.max(pipe.ctxRate * 0.5, pipe.targetSamples);
               if (pipe.available >= pipe.targetSamples || pipe.eosPending ||
                   pipe.waitSamples >= esperaMax) {
                 pipe.playing = true; pipe.waitSamples = 0;
@@ -2089,21 +2054,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             }
             if (!pipe.playing) { for (let i = 0; i < n; i++) out[i] = 0; return; }
           }
-          const over = pipe.available - pipe.targetSamples;
-          let desired = 1.0;
-          if (pipe.velMax > 1.001 && over > pipe.ctxRate * 0.05) {
-            const capVel = pipe.velMax >= 2 ? pipe.velMax : Math.min(pipe.velMax, 1.08);
-            desired = Math.min(capVel, 1.0 + (over / pipe.ctxRate) * 0.15);
-          }
-          pipe.readRate += (desired - pipe.readRate) * 0.15;
           for (let i = 0; i < n; i++) {
-            if (pipe.available > 1.05) {
+            if (pipe.available >= 1) {
               const idx0 = pipe.readPosF | 0;
-              const frac = pipe.readPosF - idx0;
-              const idx1 = (idx0 + 1) % pipe.cap;
-              let s = pipe.ring[idx0] + frac * (pipe.ring[idx1] - pipe.ring[idx0]);
-              pipe.readPosF = (pipe.readPosF + pipe.readRate) % pipe.cap;
-              pipe.available -= pipe.readRate;
+              let s = pipe.ring[idx0];
+              pipe.readPosF = (idx0 + 1) % pipe.cap;
+              pipe.available -= 1;
               if (pipe.fadeInPos < pipe.fadeInLen) { s *= pipe.fadeInPos / pipe.fadeInLen; pipe.fadeInPos++; }
               out[i] = s; pipe.lastOut = s; pipe.underrunSamples = 0;
             } else {
@@ -2111,7 +2067,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               if (Math.abs(pipe.lastOut) < 0.0001) pipe.lastOut = 0;
               out[i] = pipe.lastOut;
               pipe.underrunSamples++;
-              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.045) {
+              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.08) {
                 pipe.playing = false; pipe.eosPending = false;
                 pipe.waitSamples = 0; pipe.available = 0;
                 pipe.readPosF = pipe.writePos;
@@ -2142,17 +2098,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           return;
         } catch {}
       }
-      // fallback: ring buffer del ScriptProcessor — la tubería conserva
-      // buffer adaptativo + ~1 s de cola antes de recortar
-      const colaMax = Math.ceil(pipe.ctxRate * Math.max(1.4, this._jitMs / 1000 + 1));
-      if (pipe.available + pcm.length > pipe.cap) {
-        const drop = (pipe.available + pcm.length) - colaMax;
-        if (drop > 0) {
-          pipe.readPosF = (pipe.readPosF + drop) % pipe.cap;
-          pipe.available = Math.max(0, pipe.available - drop);
-          pipe.fadeInPos = 0;
-        }
-      }
+      // fallback: ring buffer de 30 s del ScriptProcessor (sin descartar voz)
       const ring = pipe.ring, cap = pipe.cap;
       for (let i = 0; i < pcm.length && pipe.available < cap; i++) {
         ring[pipe.writePos] = pcm[i];
@@ -2162,19 +2108,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     }
 
     // Corazón de la reproducción ordenada: corre cada 60 ms. Alimenta el
-    // reproductor único primero con notas re-escuchadas, luego con el
-    // segmento más antiguo pendiente (las descargas bloquean en orden).
+    // reproductor único siempre a velocidad natural 1.0x (cero aceleración),
+    // uniendo los trozos por número tx antes de sonar y autorregulando el
+    // colchón según el bache real de la red móvil.
     _feedVoz() {
       const ahoraMs = performance.now();
       const dt = Math.min(250, ahoraMs - (this._feedUltimo || ahoraMs));
       this._feedUltimo = ahoraMs;
       const pipe = this._asegurarVozPipe();
-      this._vozBufMs = Math.max(0, this._vozBufMs - dt * (this._velAct || 1.05));
+      this._vozBufMs = Math.max(0, this._vozBufMs - dt);
 
-      // 1. Notas re-escuchadas tienen prioridad y suenan a velocidad natural
-      while (this._replayQ.length && this._vozBufMs < 550) {
+      // 1. Notas re-escuchadas tienen prioridad y suenan a velocidad 1.0x
+      while (this._replayQ.length && this._vozBufMs < 1200) {
         const rp = this._replayQ[0];
-        while (rp.alimentado < rp.bloques.length && this._vozBufMs < 550) {
+        while (rp.alimentado < rp.bloques.length && this._vozBufMs < 1200) {
           const bl = rp.bloques[rp.alimentado++];
           this._vozEmpujar(bl.pcm);
           this._replayPendMs += (bl.pcm.length / pipe.ctxRate) * 1000;
@@ -2182,9 +2129,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         if (rp.alimentado >= rp.bloques.length) this._replayQ.shift();
         else break;
       }
-      // progreso real: la nota termina cuando sonó, no cuando se encoló
       if (this._replayPendMs > 0) {
-        const paso = Math.min(this._replayPendMs, dt * 1.05);
+        const paso = Math.min(this._replayPendMs, dt);
         this._replayPendMs -= paso;
         this._replayPlayedMs += paso;
       }
@@ -2192,9 +2138,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
              this._replayPlayedMs >= this._replayProg[0].finMs - 30) {
         this.emit('seg_replay_fin', this._replayProg.shift().seq);
       }
-      // la nota terminó sola (sin que otra la interrumpa): el contador de
-      // escuchados se reinicia aquí, si no la próxima ▶ heredaría el total
-      // de la anterior y se daría por terminada sin emitir progreso
       if (!this._replayProg.length && !this._replayQ.length &&
           this._replayPendMs <= 30) {
         this._replayPendMs = 0;
@@ -2216,6 +2159,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         seg = s;
         break;
       }
+      let bloqueadoPorHueco = false;
       if (seg) {
         if (seg.bajando) {
           // esperar la descarga; si se atascó >8 s se declara perdida
@@ -2234,11 +2178,33 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             try { pipe.gainNode.gain.value = Math.max(0, Math.min(3, vf)); } catch {}
             this.emit('seg_reproduciendo', this._segMeta(seg));
           }
-          // El buffer vivo guarda jit + margen: con red inestable el
-          // retraso crece pero la frase suena completa, no entrecortada
-          const bufLim = Math.max(550, this._jitMs + 500);
-          while (seg.alimentado < seg.bloques.length && this._vozBufMs < bufLim) {
-            this._vozEmpujar(seg.bloques[seg.alimentado++].pcm);
+          // Si aún no empezó a sonar esta frase y sigue abierta, reunir
+          // primero el colchón (_jitMs) de trozos antes de empezar a sonar
+          const cerradoSeg = !!(seg.completo || seg.finLocal);
+          const msDisp = (seg.bloques.length - seg.alimentado) * 40;
+          const listoParaArrancar = seg.alimentado > 0 || cerradoSeg || msDisp >= this._jitMs;
+          const bufLim = Math.max(2000, this._jitMs + 1500);
+          while (listoParaArrancar && seg.alimentado < seg.bloques.length && this._vozBufMs < bufLim) {
+            const bl = seg.bloques[seg.alimentado];
+            // Unir trozos sin huecos: si falta un tx intermedio, pedir
+            // reparación y esperar hasta 1,5 s a que llegue antes de sonar
+            if (typeof seg.ultTxEmp === 'number' && typeof bl.tx === 'number' && bl.tx >= 0) {
+              const diff = (bl.tx - seg.ultTxEmp) & 0xffff;
+              if (diff > 1 && diff < 30000 && !seg.descargado) {
+                if (!seg._huecoDesde) {
+                  seg._huecoDesde = ahoraMs;
+                  this._programarReparacion(seg);
+                }
+                if (ahoraMs - seg._huecoDesde < 1500) {
+                  bloqueadoPorHueco = true;
+                  break;
+                }
+              }
+            }
+            seg._huecoDesde = 0;
+            if (typeof bl.tx === 'number' && bl.tx >= 0) seg.ultTxEmp = bl.tx;
+            seg.alimentado++;
+            this._vozEmpujar(bl.pcm);
           }
           if (seg.alimentado >= seg.bloques.length &&
               (seg.completo || seg.finLocal) && !seg.finAvisado) {
@@ -2249,61 +2215,47 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
       }
 
-      // Sequía de la frase viva (esperando tramas o descarga): el buffer
-      // crece para que el siguiente tramo suene entero. Si la red se
-      // estabiliza 8 s, vuelve a bajar poco a poco
-      const esperando = seg && (seg.bajando ||
-        (seg.alimentado >= seg.bloques.length && !(seg.completo || seg.finLocal)));
-      if (esperando) {
+      // Autorregulación natural: si ocurre un bache (nos quedamos sin audio
+      // mientras la frase sigue abierta o esperando un trozo faltante),
+      // medimos la duración real del bache y subimos el colchón (_jitMs) a
+      // ese tamaño (hasta 10 s). Como jamás aceleramos (1.0x fijo), una vez
+      // pasa el primer bache ese colchón se mantiene solo y absorbe los
+      // baches siguientes sin volver a cortarse.
+      const enBache = seg && (seg.bajando || bloqueadoPorHueco ||
+        (seg.alimentado > 0 && this._vozBufMs < 80 &&
+         seg.alimentado >= seg.bloques.length && !(seg.completo || seg.finLocal)));
+      if (enBache) {
         if (!this._starveDesde) this._starveDesde = ahoraMs;
         this._jitUltimoCorte = ahoraMs;
-        if (ahoraMs - this._starveDesde > 400 && ahoraMs - this._jitBumpT > 1000) {
+        const durBache = ahoraMs - this._starveDesde;
+        const nuevoJit = Math.min(10000, Math.max(this._jitMs + 300, durBache + 800));
+        if (nuevoJit > this._jitMs && ahoraMs - this._jitBumpT > 400) {
           this._jitBumpT = ahoraMs;
-          this._jitMs = Math.min(5000, this._jitMs + 700);
+          this._jitMs = nuevoJit;
         }
       } else {
         this._starveDesde = 0;
-        if (ahoraMs - this._jitUltimoCorte > 8000 && this._jitMs > 400) {
-          this._jitMs = Math.max(400, this._jitMs - 30);
+        // Solo reduce muy despacio si lleva >45 s sin ningún bache
+        if (ahoraMs - this._jitUltimoCorte > 45000 && this._jitMs > 1200) {
+          this._jitMs = Math.max(1200, this._jitMs - 20);
         }
       }
-      // El reproductor espera jit ms de cola antes de sonar tras un corte,
-      // y la cola física admite buffer + margen
       const tgt = Math.ceil(pipe.ctxRate * this._jitMs / 1000);
       if (pipe.targetSamples !== tgt) {
         pipe.targetSamples = tgt;
         if (pipe.worklet) {
           try {
             pipe.worklet.port.postMessage({ t: 'target', ms: this._jitMs });
-            pipe.worklet.port.postMessage({ t: 'cap', ms: this._jitMs + 1500 });
           } catch {}
         }
       }
 
-      // 3. Velocidad de drenaje escalonada según el retraso respecto al
-      // presente: a más atraso más aceleración (el audio queda grabado en
-      // las notas, así que conviene llegar al vivo cuanto antes). Una nota
-      // re-escuchada NO es retraso: siempre a velocidad natural.
+      // 3. Sin aceleración: velocidad siempre 1.0x natural. Solo medimos el
+      // retraso real para mostrárselo al usuario en el botón "Ir al presente"
+      // por si quiere adelantar manualmente cuando supera 15 s.
       const retraso = this._retrasoMs();
-      // El buffer adaptativo (_jitMs) es retraso INTENCIONAL: no se drena
-      // acelerado — y hasta 15 s de atraso se oye a velocidad 1.0x natural
-      const lag = Math.max(0, retraso - this._jitMs);
-      const replayActivo = this._replayQ.length > 0 ||
-        this._replayProg.length > 0 || this._replayPendMs > 30;
-      const vel = replayActivo ? 1.0
-        : lag > 60000 ? 1.40   // >60 s
-        : lag > 45000 ? 1.25   // >45 s
-        : lag > 30000 ? 1.15   // >30 s
-        : lag > 15000 ? 1.06   // 15–30 s: apenas +6%
-        : 1.0;                 // ≤15 s: velocidad 100% normal
-      this._velAct = vel;
-      if (vel !== pipe.velMax) {
-        pipe.velMax = vel;
-        if (pipe.worklet) {
-          try { pipe.worklet.port.postMessage({ t: 'vel', v: vel }); } catch {}
-        }
-      }
-      this._drenando = vel > 1.2;
+      this._velAct = 1.0;
+      this._drenando = false;
       if (retraso !== this._retrasoAviso) {
         this._retrasoAviso = retraso;
         this.emit('voz_retraso', Math.round(retraso));
@@ -2876,17 +2828,18 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const enviarPing = () => {
         if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
         const now = performance.now();
-        // Watchdog Make-Before-Break: si el WiFi del vecino congeló el socket TCP
-        // más de 4.5s sin recibir respuesta o atascó la cola de subida (>14 KB),
-        // abrir un socket nuevo en paralelo de inmediato sin esperar 10-15s al OS.
-        if ((now - (this._lastRxAt || now)) > 4500 || this._ws.bufferedAmount > 14 * 1024) {
+        // En datos móviles las ráfagas pueden tardar varios segundos: NO
+        // matar el socket por bufferedAmount ni a los 4,5 s (eso tiraba las
+        // tramas en vuelo y causaba reconexiones en bucle). Solo reemplazar
+        // si el socket lleva >20 s completamente muerto sin recibir nada.
+        if ((now - (this._lastRxAt || now)) > 20000) {
           this._lastRxAt = now;
           if (typeof this._reemplazarSocketCongelado === 'function') {
             this._reemplazarSocketCongelado();
             return;
           }
         }
-        if (this._ws.bufferedAmount > 6144) {
+        if (this._ws.bufferedAmount > 32768) {
           this._evaluarCalidadRed(420);
         }
         try {
@@ -2900,9 +2853,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (navConn && typeof navConn.addEventListener === 'function') {
         this._onNetChange = () => {
           this._evaluarCalidadRed();
-          if (typeof this._reemplazarSocketCongelado === 'function') {
-            this._reemplazarSocketCongelado();
-          }
         };
         navConn.addEventListener('change', this._onNetChange);
       }

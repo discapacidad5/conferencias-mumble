@@ -573,9 +573,9 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		esAdmin:   cl.RoomAdmin,
 		connSid:   r.URL.Query().Get("sid"),
 		conn:      conn,
-		ctrlCh:    make(chan []byte, 64),
-		audioCh:   make(chan []byte, 10), // máx 400 ms en cola: tiempo real sin acumular 3-5s de retraso
-		videoCh:   make(chan []byte, 2),  // máximo 2 frames en cola: cero latencia acumulada
+		ctrlCh:    make(chan []byte, 128),
+		audioCh:   make(chan []byte, 512), // ~20 s de ráfaga celular: jamás descartar tramas cuando llegan juntas tras un bache
+		videoCh:   make(chan []byte, 2),   // máximo 2 frames en cola: cero latencia acumulada
 		cerrado:   make(chan struct{}),
 		canMic:    canMic,
 		canCam:    canCam,
