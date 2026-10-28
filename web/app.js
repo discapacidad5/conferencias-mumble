@@ -2266,6 +2266,9 @@ function cablearRoom(room) {
     S._ultimoSeg = Math.max(S._ultimoSeg || 0, m.seq || 0);
     agregarNotaVoz(m);
     idbGuardarSeg(m.seq);
+    // todo audio cerrado queda persistido en el teléfono (incluido el mío,
+    // que nunca pasa por mi cola en vivo): el servidor lo purga en ~1 h
+    if ((m.durMs || 0) >= 800) bgEncolarSeg(m.seq, 4000);
   });
   room.on('seg_perdido', (seq) => marcarNotaVoz(seq, 'perdida'));
   room.on('seg_reproduciendo', (m) => { if (m) marcarNotaVoz(m.seq, 'sonando'); });
@@ -4714,6 +4717,16 @@ async function sincronizarNotas() {
           (!viejo || viejo.classList.contains('grabando')))
         agregarNotaVoz({ seq: meta.seq, de: meta.de, nombre: meta.nombre, durMs: meta.durMs, inicio: meta.inicio, interrumpida: meta.interrumpida });
     }
+    // comparar el manifiesto del servidor contra IndexedDB: se encolan para
+    // descarga de fondo SOLO los audios cerrados que aún no están en local
+    try {
+      const guardados = new Set((await idbListarSala()).map(r => r.seq));
+      for (const meta of (man.segmentos || [])) {
+        if (meta.seq && (meta.durMs || 0) >= 800 &&
+            !guardados.has(meta.seq) && !nvBorrados().has(meta.seq))
+          bgEncolarSeg(meta.seq, 2500);
+      }
+    } catch {}
     if (man.abierto && man.abierto.seq && !S._nvEls.has(man.abierto.seq) && !nvBorrados().has(man.abierto.seq))
       agregarNotaVozEnVivo({ seq: man.abierto.seq, de: man.abierto.de, nombre: man.abierto.nombre, inicio: man.abierto.inicio });
     // Fantasmas: notas "grabando" que el servidor ya no tiene ni abiertas
@@ -5177,6 +5190,80 @@ async function idbVaciar() {
 async function precargarNotasVoz() {
   const recs = await idbListarSala();
   for (const r of recs.slice(-80)) agregarNotaVoz(r);
+}
+
+// ---------- descarga de fondo: todo audio cerrado queda en el teléfono ----------
+// El servidor retiene cada .seg solo ~1 h. Esta cola baja al IndexedDB local
+// los audios que falten, de a UNO por vez y espaciados, con prioridad menor
+// que el audio en vivo: si ya está guardado en local o completo en RAM, no
+// gasta datos. Así al darle ▶ siempre suena, aunque el servidor lo haya
+// purgado.
+const _bgSeg = { cola: [], enCola: new Set(), muertos: new Set(), timer: 0, activo: false };
+
+function bgEncolarSeg(seq, demoraMs) {
+  seq = +seq || 0;
+  if (seq <= 0 || _bgSeg.muertos.has(seq) || nvBorrados().has(seq)) return;
+  if (!_bgSeg.enCola.has(seq)) {
+    _bgSeg.enCola.add(seq);
+    _bgSeg.cola.push(seq);
+  }
+  _bgProgramar(demoraMs || 0);
+}
+
+function _bgProgramar(demoraMs) {
+  if (_bgSeg.timer || !_bgSeg.cola.length) return;
+  _bgSeg.timer = setTimeout(() => {
+    _bgSeg.timer = 0;
+    _bgProcesarSeg();
+  }, Math.max(400, demoraMs || 400));
+}
+
+async function _bgProcesarSeg() {
+  if (_bgSeg.activo || !S.sala || !S.token || !S.room) return;
+  _bgSeg.cola.sort((a, b) => a - b);
+  const seq = _bgSeg.cola.shift();
+  if (!seq) return;
+  _bgSeg.enCola.delete(seq);
+  _bgSeg.activo = true;
+  try {
+    // 1) ya está guardada en el teléfono → nada que bajar
+    let rec = null;
+    try { rec = await idbCargarSeg(seq); } catch {}
+    if (rec && rec.raw && rec.raw.length) return;
+    // 2) está completa en RAM (llegó en vivo sin huecos o ya reparada):
+    //    se persiste sin gastar datos
+    try {
+      const d = S.room.datosSeg && S.room.datosSeg(seq);
+      if (d && d.raw && d.raw.length && (!d.huecos || d.descargado)) {
+        await idbGuardarSeg(seq);
+        return;
+      }
+    } catch {}
+    // 3) descargar el .seg completo del servidor (incluye mi propia voz,
+    //    que nunca pasa por mi cola en vivo)
+    const r = await fetch(
+      `/api/salas/${encodeURIComponent(S.sala)}/audio/${seq}`,
+      { headers: { Authorization: 'Bearer ' + S.token } });
+    if (!r.ok) {
+      if (r.status === 404 || r.status === 410) {
+        _bgSeg.muertos.add(seq); // el servidor ya la purgó
+        marcarNotaVoz(seq, 'perdida');
+      } else bgEncolarSeg(seq, 8000); // error transitorio: reintentar
+      return;
+    }
+    const buf = await r.arrayBuffer();
+    const p = S.room.analizarArchivoSeg && S.room.analizarArchivoSeg(buf);
+    if (p && p.sg && !p.sg.abierto && p.frames && p.frames.length) {
+      await idbGuardarArchivo(p);
+    } else if (p && p.sg && p.sg.abierto) {
+      bgEncolarSeg(seq, 10000); // aún abierta en el servidor: reintentar luego
+    }
+  } catch {
+    bgEncolarSeg(seq, 8000); // sin señal/datos: reintenta en unos segundos
+  } finally {
+    _bgSeg.activo = false;
+    _bgProgramar(1200);
+  }
 }
 
 // chat: "leído" = panel abierto en la pestaña Chat. Si está cerrado, los
