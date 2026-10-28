@@ -887,7 +887,22 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let opusListo = false;
       let opusTimestampUs = 0;
       let opusPending = [];
-      let txSeq = (this._room && typeof this._room._txSeqGlobal === 'number') ? this._room._txSeqGlobal : 0;
+      let opusTags = [];
+      // Cada audio nuevo cambia su identificador aid (1..15) y vuelve a
+      // empezar su índice de trama en 0 (0, 1, 2...): así al soltar el PTT
+      // y volver a pisar, el servidor termina de recibir las tramas que
+      // faltaban del audio anterior (aid=1) mientras recibe el nuevo (aid=2, idx=0).
+      let aid = 0;
+      let txIdx = -1;
+      let txSeq = 0;
+      let enFrase = false;
+      const abrirNuevoAudio = () => {
+        if (!this._room) return;
+        this._room._vozAid = (((this._room._vozAid || 0) % 15) + 1);
+        aid = this._room._vozAid;
+        txIdx = -1;
+        enFrase = true;
+      };
       let hablandoActivo = false;
 
       // Estado ADPCM y filtro anti-aliasing para respaldo universal
@@ -916,8 +931,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 if (opusPending.length >= 2) {
                   const b1 = opusPending.shift();
                   const b2 = opusPending.shift();
+                  const tagOpus = opusTags.length ? opusTags.shift() : txSeq;
                   const rateCode = maxBr <= 11000 ? 10 : (maxBr <= 20000 ? 11 : 12);
-                  const s = txSeq & 0xffff;
+                  const s = tagOpus & 0xffff;
                   const pkt = new Uint8Array(9 + b1.length + b2.length);
                   pkt[0] = FRAME_AUDIO;
                   pkt[1] = rateCode;
@@ -981,23 +997,27 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
       };
 
-      // Enviar marcador explícito de fin de frase (EOS) con el mismo txSeq
-      // de la última trama de voz enviada (SIN incrementar txSeq, para que
-      // jamás cree huecos falsos en la numeración de tramas de audio).
+      // Enviar marcador explícito de fin de frase (EOS) con el mismo (aid, idx)
+      // de la última trama enviada de este audio, y cerrar enFrase para que
+      // la próxima vez que hable cambie a un nuevo aid con trama 0.
       const enviarMarcadorEOS = () => {
-        if (!this._room) return;
+        if (!this._room || !enFrase) return;
+        enFrase = false;
         const s = txSeq & 0xffff;
         const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
         this._room._enviarFrame(eos);
       };
 
-      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz). Si el socket está
-      // caído o saturado se encola en vez de descartarse: la frase llega
-      // completa al servidor aunque el oyente la oiga con retraso.
+      // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz). Si empieza un
+      // audio nuevo, asigna nuevo aid (001 -> 002) y empieza en trama 0.
       const enviarTrama40ms = (frame48k) => {
         if (!this._room) return;
-        txSeq = (txSeq + 1) & 0xffff;
-        this._room._txSeqGlobal = txSeq;
+        if (!enFrase || txIdx >= 4090) abrirNuevoAudio();
+        txIdx = (txIdx + 1) & 0x0fff;
+        txSeq = ((aid & 0x0f) << 12) | txIdx;
+        if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
+          opusTags.push(txSeq);
+        }
 
         let enviadoOpus = false;
         if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
@@ -1289,6 +1309,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._micCleanup = () => {
           micCerrado = true;
           this._actualizarBitrateMic = null;
+          // Al soltar el PTT manual, enviar el EOS con (aid, ultimoIdx)
+          // antes de cerrar el codificador para que el servidor sepa cuál
+          // fue la última trama de este audio y reclame cualquier hueco.
+          try { if (opusEncoder && opusEncoder.state === 'configured') opusEncoder.flush(); } catch {}
+          if (enFrase) enviarMarcadorEOS();
           try { if (opusEncoder && opusEncoder.state !== 'closed') opusEncoder.close(); } catch {}
           opusEncoder = null;
           try { if (txWorklet) txWorklet.disconnect(); } catch {}
@@ -1928,18 +1953,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       return seg;
     }
 
-    // Inserta un bloque decodificado en el segmento, ordenado por txSeq.
-    // Si cae antes de seg.alimentado (ya sonó ese punto), queda en seg.bloques
-    // para que la grabación quede íntegra y desplazamos seg.alimentado +1 para
-    // NO volver a reproducir bloques que ya sonaron ni revivir notas viejas.
+    // Inserta un bloque decodificado en el segmento, ordenado por su índice
+    // de trama dentro del audio (0, 1, 2... = bl.tx & 0x0fff).
     _insertarBloque(seg, bl) {
       seg.ultRxT = performance.now(); // watchdog de frase abierta
       if (typeof bl.tx !== 'number' || bl.tx < 0) {
         seg.bloques.push(bl);
         return;
       }
+      const idx = bl.tx & 0x0fff;
       let i = seg.bloques.length;
-      while (i > 0 && ((seg.bloques[i - 1].tx - bl.tx) & 0xffff) < 30000) i--;
+      while (i > 0 && (((seg.bloques[i - 1].tx & 0x0fff) - idx) & 0x0fff) < 2048) i--;
       seg.bloques.splice(i, 0, bl);
       if (i < seg.alimentado) seg.alimentado++;
     }
@@ -1953,25 +1977,50 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     }
 
     // Trama de voz en vivo ya decodificada y remuestreada: entra a la cola
-    // ordenada del segmento del hablante (no directo al altavoz)
+    // ordenada del segmento del hablante (identificado por su aid).
     _alimentarSegVoz(fromId, pcm, txSeq, crudo) {
       if (!pcm || !pcm.length) return;
+      const aid = (typeof txSeq === 'number' && txSeq >= 0) ? ((txSeq >> 12) & 0x0f) : 0;
+      const idx = (typeof txSeq === 'number' && txSeq >= 0) ? (txSeq & 0x0fff) : -1;
       let seg = null;
       const seq = this._segPorHablante.get(fromId);
       if (seq != null) seg = this._vozSegs.get(seq) || null;
+      // Si la trama trae un aid distinto al del segmento abierto (o pertenece
+      // a un segmento anterior que aún estaba completándose), buscar ese
+      // segmento por aid o abrir uno nuevo para no mezclar dos audios.
+      if (seg && aid > 0 && seg.aid && seg.aid !== aid) {
+        let encontrado = null;
+        for (let k = this._vozOrden.length - 1; k >= 0; k--) {
+          const cand = this._vozOrden[k];
+          if (cand.de === fromId && cand.aid === aid) { encontrado = cand; break; }
+        }
+        if (encontrado) {
+          seg = encontrado;
+        } else {
+          seg.finLocal = true;
+          this._segPorHablante.delete(fromId);
+          seg = null;
+        }
+      }
       if (!seg) seg = this._segImplicito(fromId);
+      if (aid > 0 && !seg.aid) seg.aid = aid;
 
       if (typeof txSeq === 'number' && txSeq >= 0) {
         if (seg.vistos.has(txSeq)) return;
         seg.vistos.add(txSeq);
         if (seg.ultTx >= 0) {
-          const diff = (txSeq - seg.ultTx) & 0xffff;
-          if (diff > 1 && diff < 30000) {
+          const ultIdx = seg.ultTx & 0x0fff;
+          const diff = (idx - ultIdx) & 0x0fff;
+          if (diff > 1 && diff < 2048) {
             seg.huecos = true;
             this._programarReparacion(seg);
           }
+        } else if (idx > 0) {
+          // Faltaron las tramas iniciales (0 .. idx-1) de este audio
+          seg.huecos = true;
+          this._programarReparacion(seg);
         }
-        if (seg.ultTx < 0 || ((txSeq - seg.ultTx) & 0xffff) < 30000) seg.ultTx = txSeq;
+        if (seg.ultTx < 0 || ((idx - (seg.ultTx & 0x0fff)) & 0x0fff) < 2048) seg.ultTx = txSeq;
       }
       this._insertarBloque(seg, { tx: txSeq, pcm });
       if (crudo && seg.rawBytes < 4194304) {
@@ -2176,14 +2225,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // de la ráfaga (sean 30 s o 5 min) espera íntegro en seg.bloques
           while (seg.alimentado < seg.bloques.length && this._vozBufMs < 2000) {
             const bl = seg.bloques[seg.alimentado];
-            // Ensamblado en secuencia estricta (estilo P2P): si falta un tx
-            // intermedio, NO reproducir el bloque siguiente ni dejar hueco;
-            // pedir la pieza faltante al servidor (reintentando cada 800 ms)
-            // y esperar a que encaje. Ese silencio mientras llega la pieza
-            // acumula detrás el resto del audio y crea solo el colchón natural.
-            if (typeof seg.ultTxEmp === 'number' && typeof bl.tx === 'number' && bl.tx >= 0) {
-              const diff = (bl.tx - seg.ultTxEmp) & 0xffff;
-              if (diff > 1 && diff < 30000 && !seg.descargado) {
+            // Ensamblado en secuencia estricta desde idx=0: si falta la trama 0
+            // o un idx intermedio de este audio, pedir la pieza faltante al
+            // servidor (reintentando cada 800 ms) y esperar a que encaje.
+            if (typeof bl.tx === 'number' && bl.tx >= 0) {
+              const idx = bl.tx & 0x0fff;
+              const espIdx = typeof seg.ultTxEmp === 'number' ? ((seg.ultTxEmp + 1) & 0x0fff) : 0;
+              const diff = (idx - espIdx) & 0x0fff;
+              if (diff > 0 && diff < 2048 && !seg.descargado) {
                 if (!seg._huecoDesde) seg._huecoDesde = ahoraMs;
                 if (!seg._ultRepIntento || ahoraMs - seg._ultRepIntento > 800) {
                   seg._ultRepIntento = ahoraMs;
@@ -2195,7 +2244,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               }
             }
             seg._huecoDesde = 0;
-            if (typeof bl.tx === 'number' && bl.tx >= 0) seg.ultTxEmp = bl.tx;
+            if (typeof bl.tx === 'number' && bl.tx >= 0) seg.ultTxEmp = bl.tx & 0x0fff;
             seg.alimentado++;
             this._vozEmpujar(bl.pcm);
           }

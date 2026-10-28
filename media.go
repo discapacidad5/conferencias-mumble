@@ -877,13 +877,17 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 						}
 					}
 				}
-				// Reparación anti-pérdida: si esta tx rellena un hueco explícito
-				// de un segmento ya cerrado, se archiva y destraba las tramas
-				// consecutivas que estaban esperando esa pieza
-				if len(payload) >= 3 && rc != 0 {
+				// Reparación anti-pérdida: si esta trama pertenece por su aid
+				// a un segmento ya cerrado (rellena un hueco o completa su cola
+				// mientras el emisor ya empezó un aid nuevo), se archiva en su
+				// propio segmento y destraba las tramas consecutivas.
+				if len(payload) >= 3 {
 					if sgR, listosR := mr.seg.reparar(c.identidad, payload); sgR != nil {
 						difundirTramas(listosR)
 						mr.seg.pedirFaltantes(sgR)
+						if (rc == 0 || len(sgR.faltan) == 0) && sgR.DurMs >= 700 {
+							mr.notificarSegFin(sgR)
+						}
 						continue
 					}
 				}
