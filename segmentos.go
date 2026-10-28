@@ -57,15 +57,17 @@ type segmento struct {
 	ruta     string
 	frames   [][]byte // solo mientras Abierto o reparable
 	ultFrame int64    // unix ms de la última trama recibida
-	// Anti-pérdida emisor->servidor: dedup y detección de huecos por número
-	// de trama tx (16 bits, lo pone el emisor en payload[1:3] little-endian)
-	vistos   map[uint32]struct{} // (tx<<1 | familia) ya archivados
-	faltan   map[uint16]struct{} // txs detectados como perdidos
-	ultTx    uint16              // tx más alto visto
-	tieneTx  bool                // ya llegó al menos una trama numerada
-	ultFalta int64               // último aviso "falta" enviado al emisor
-	reparaH  int64               // >0: cerrado pero reparable hasta este instante
-	eosVisto bool                // cerrado por EOS del emisor (no por corte)
+	// Anti-pérdida emisor->servidor: dedup, ensamblado en orden estricto y
+	// detección de huecos por número de trama tx (payload[1:3] little-endian)
+	vistos    map[uint32]struct{} // (tx<<1 | familia) ya archivados
+	porTx     map[uint32][]byte   // (tx<<1 | familia) -> payload retenido hasta estar en secuencia
+	faltan    map[uint16]struct{} // txs detectados como perdidos
+	ultTx     uint16              // tx más alto visto
+	proxEnvTx uint16              // siguiente tx que toca liberar en secuencia hacia los oyentes
+	tieneTx   bool                // ya llegó al menos una trama numerada
+	ultFalta  int64               // último aviso "falta" enviado al emisor
+	reparaH   int64               // >0: cerrado pero reparable hasta este instante
+	eosVisto  bool                // cerrado por EOS del emisor (no por corte)
 }
 
 type segStore struct {
@@ -243,10 +245,52 @@ func marcarHuecos(sg *segmento, tx uint16) []uint16 {
 	return nuevos
 }
 
-// appendFrame acumula una trama de voz en el segmento abierto del hablante.
-// Devuelve (segmentoNuevo, segmentoCerrado, txsFaltantes) — el tercero se
-// envía al emisor como {t:'falta'} para que retransmita lo que se perdió.
-func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, forceEOS bool) (nuevo *segmento, cerrado *segmento, faltan []uint16) {
+// drenarContiguos extrae en orden estricto todas las tramas consecutivas
+// desde sg.proxEnvTx que ya estén completas (sin huecos en sg.faltan).
+// Si falta sg.proxEnvTx, se detiene y retiene las posteriores hasta que
+// llegue la pieza faltante.
+func drenarContiguos(sg *segmento) [][]byte {
+	if !sg.tieneTx {
+		return nil
+	}
+	var listos [][]byte
+	for {
+		tx := sg.proxEnvTx
+		if _, falta := sg.faltan[tx]; falta {
+			break // pieza faltante: prohibido avanzar hasta que llegue
+		}
+		b0, ok0 := sg.porTx[uint32(tx)<<1|0]
+		b1, ok1 := sg.porTx[uint32(tx)<<1|1]
+		if !ok0 && !ok1 {
+			// Si ya vimos txs posteriores pero este tx no está en porTx ni en
+			// faltan, ya se drenó antes; si estamos más allá de ultTx, parar.
+			if ((int(sg.ultTx)-int(tx))&0xffff) >= 30000 || tx == sg.ultTx {
+				break
+			}
+		}
+		if ok0 {
+			listos = append(listos, b0)
+			delete(sg.porTx, uint32(tx)<<1|0)
+		}
+		if ok1 {
+			listos = append(listos, b1)
+			delete(sg.porTx, uint32(tx)<<1|1)
+		}
+		if tx == sg.ultTx && !ok0 && !ok1 {
+			break
+		}
+		sg.proxEnvTx = uint16((int(tx) + 1) & 0xffff)
+		if ((int(sg.ultTx) - int(tx)) & 0xffff) == 0 {
+			break
+		}
+	}
+	return listos
+}
+
+// appendFrame acumula una trama de voz en el segmento abierto del hablante y
+// devuelve solo las tramas que ya están en secuencia completa sin huecos
+// (listos) para reenviar a los oyentes, además de los txs faltantes.
+func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, forceEOS bool) (nuevo *segmento, cerrado *segmento, faltan []uint16, listos [][]byte) {
 	rc := payload[0]
 	tieneTx := len(payload) >= 3
 	var tx uint16
@@ -259,12 +303,12 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 	sg := s.abiertos[id]
 	if rc == 0 || forceEOS {
 		// EOS: el hablante soltó la frase. Si el EOS saltó sobre tramas que
-		// nunca llegaron, se marcan: el segmento queda reparable unos
-		// segundos y se le piden al emisor.
+		// nunca llegaron, se marcan: el segmento queda reparable y se piden.
 		if sg != nil {
 			if tieneTx {
 				faltan = marcarHuecos(sg, tx)
 			}
+			listos = drenarContiguos(sg)
 			if len(sg.faltan) > 0 && len(faltan) == 0 {
 				for t := range sg.faltan {
 					faltan = append(faltan, t)
@@ -274,44 +318,58 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 				}
 			}
 			sg.eosVisto = true
+			cp := make([]byte, len(payload))
+			copy(cp, payload)
+			listos = append(listos, cp)
 			cerrado = s.cerrarSeg(sg, false)
 		}
-		return nil, cerrado, faltan
+		return nil, cerrado, faltan, listos
 	}
 
 	if sg == nil {
 		sg = &segmento{
-			Seq:      s.proxSeq,
-			Grupo:    grupo,
-			De:       id,
-			Nombre:   nombre,
-			Inicio:   ahora(),
-			Abierto:  true,
-			ultFrame: ahora(),
-			vistos:   map[uint32]struct{}{},
-			faltan:   map[uint16]struct{}{},
-			ultTx:    tx,
-			tieneTx:  tieneTx,
+			Seq:       s.proxSeq,
+			Grupo:     grupo,
+			De:        id,
+			Nombre:    nombre,
+			Inicio:    ahora(),
+			Abierto:   true,
+			ultFrame:  ahora(),
+			vistos:    map[uint32]struct{}{},
+			porTx:     map[uint32][]byte{},
+			faltan:    map[uint16]struct{}{},
+			ultTx:     tx,
+			proxEnvTx: tx,
+			tieneTx:   tieneTx,
 		}
 		s.proxSeq++
 		s.abiertos[id] = sg
 		nuevo = sg
 	}
 
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+
 	if tieneTx {
 		key := uint32(tx)<<1 | txFamilia(rc)
 		if _, dup := sg.vistos[key]; dup {
-			return nuevo, cerrado, nil // retransmisión de algo ya archivado
+			return nuevo, cerrado, nil, nil // retransmisión de algo ya archivado
 		}
 		sg.vistos[key] = struct{}{}
+		sg.porTx[key] = cp
+		// Si esta trama es anterior a proxEnvTx (y no habíamos empezado o
+		// llegó reordenada al arranque), ajustar proxEnvTx
+		if ((int(sg.proxEnvTx) - int(tx)) & 0xffff) < 30000 {
+			sg.proxEnvTx = tx
+		}
 		faltan = marcarHuecos(sg, tx)
 		if ((int(tx) - int(sg.ultTx)) & 0xffff) < 30000 {
 			sg.ultTx = tx
 		}
 		delete(sg.faltan, tx)
-		// Si lleva huecos sin rellenar >4 s, se los volvemos a pedir al
-		// emisor (el primer aviso pudo perderse con el mismo micro-corte)
-		if len(sg.faltan) > 0 && ahora()-sg.ultFalta > 4000 {
+		// Si sigue habiendo huecos sin rellenar >600 ms, volver a pedirlos
+		// de inmediato al emisor hasta que no falte ni una pieza
+		if len(sg.faltan) > 0 && ahora()-sg.ultFalta > 600 {
 			sg.ultFalta = ahora()
 			for t := range sg.faltan {
 				if len(faltan) >= 64 {
@@ -329,10 +387,11 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 				}
 			}
 		}
+		listos = drenarContiguos(sg)
+	} else {
+		listos = [][]byte{cp}
 	}
 
-	cp := make([]byte, len(payload))
-	copy(cp, payload)
 	insertarTrama(sg, tx, tieneTx, cp)
 	sg.Bytes += len(cp) + 2
 	sg.DurMs = ahora() - sg.Inicio
@@ -341,24 +400,23 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 	}
 	sg.ultFrame = ahora()
 
-	// Intervención muy larga (PTT olvidado): cortar a 90 s y seguir en una nueva
+	// Intervención muy larga: cortar a 3 min y seguir en una nueva
 	if sg.DurMs >= segMaxDurMs {
 		cerrado = s.cerrarSeg(sg, false)
 	}
-	return nuevo, cerrado, faltan
+	return nuevo, cerrado, faltan, listos
 }
 
 // reparar encaja una trama retransmitida en un hueco específico (sg.faltan[tx])
-// de un segmento YA cerrado y reescribe su archivo. Nunca captura tramas
-// nuevas por delante de ultTx: las tramas nuevas deben pasar siempre a la
-// transmisión en vivo y abrir o continuar la frase actual.
-func (s *segStore) reparar(id string, payload []byte) *segmento {
+// de un segmento YA cerrado, reescribe su archivo y devuelve también las
+// tramas contiguas destrabadas para los oyentes.
+func (s *segStore) reparar(id string, payload []byte) (*segmento, [][]byte) {
 	if len(payload) < 3 {
-		return nil
+		return nil, nil
 	}
 	rc := payload[0]
 	if rc == 0 {
-		return nil
+		return nil, nil
 	}
 	tx := txDeTrama(payload)
 	s.mu.Lock()
@@ -372,12 +430,15 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 		}
 		key := uint32(tx)<<1 | txFamilia(rc)
 		if _, dup := sg.vistos[key]; dup {
-			return sg
+			return sg, nil
 		}
-		sg.vistos[key] = struct{}{}
-		delete(sg.faltan, tx)
 		cp := make([]byte, len(payload))
 		copy(cp, payload)
+		sg.vistos[key] = struct{}{}
+		if sg.porTx != nil {
+			sg.porTx[key] = cp
+		}
+		delete(sg.faltan, tx)
 		insertarTrama(sg, tx, true, cp)
 		sg.Bytes += len(cp) + 2
 		if d := durDeTramas(sg); d > sg.DurMs {
@@ -385,6 +446,7 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 		}
 		sg.ultFrame = ahora()
 		sg.reparaH = ahora() + 45_000
+		listos := drenarContiguos(sg)
 		if sg.ruta != "" {
 			tmp := sg.ruta + ".tmp"
 			if escribirArchivoSeg(tmp, sg) == nil {
@@ -396,9 +458,9 @@ func (s *segStore) reparar(id string, payload []byte) *segmento {
 				os.Remove(tmp)
 			}
 		}
-		return sg
+		return sg, listos
 	}
-	return nil
+	return nil, nil
 }
 
 // cerrarSeg escribe el archivo definitivo, lo mueve al historial y libera RAM.
@@ -438,10 +500,10 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 		for len(s.recientes) > 8 {
 			viejo := s.recientes[0]
 			s.recientes = s.recientes[1:]
-			viejo.frames, viejo.vistos, viejo.faltan = nil, nil, nil
+			viejo.frames, viejo.vistos, viejo.porTx, viejo.faltan = nil, nil, nil, nil
 		}
 	} else {
-		sg.frames, sg.vistos, sg.faltan = nil, nil, nil
+		sg.frames, sg.vistos, sg.porTx, sg.faltan = nil, nil, nil, nil
 	}
 	return sg
 }
@@ -472,11 +534,14 @@ func (s *segStore) ultimoCerrado() uint32 {
 // historial de más de 1 hora (y el exceso de bytes por sala).
 func (s *segStore) tick() {
 	var cerrados []*segmento
+	var incompletos []*segmento
 	s.mu.Lock()
 	ahoraMs := ahora()
 	for id, sg := range s.abiertos {
 		if ahoraMs-sg.ultFrame > segIdleCierreMs {
 			cerrados = append(cerrados, s.cerrarSeg(sg, false))
+		} else if len(sg.faltan) > 0 {
+			incompletos = append(incompletos, sg)
 		}
 		_ = id
 	}
@@ -486,8 +551,9 @@ func (s *segStore) tick() {
 		for _, sg := range s.recientes {
 			if sg.reparaH > ahoraMs && len(sg.faltan) > 0 {
 				vivos = append(vivos, sg)
+				incompletos = append(incompletos, sg)
 			} else {
-				sg.frames, sg.vistos, sg.faltan = nil, nil, nil
+				sg.frames, sg.vistos, sg.porTx, sg.faltan = nil, nil, nil, nil
 			}
 		}
 		s.recientes = vivos
@@ -519,6 +585,9 @@ func (s *segStore) tick() {
 	for _, sg := range cerrados {
 		s.mr.notificarSegFin(sg)
 		s.pedirFaltantes(sg) // frase cerrada por inactividad con huecos
+	}
+	for _, sg := range incompletos {
+		s.pedirFaltantes(sg) // reintento periódico hasta que llegue el 100%
 	}
 }
 
@@ -736,7 +805,7 @@ func (r *mediaRoom) notificarSegFin(sg *segmento) {
 // servidor le re-pide al que hablaba (que conserva su frase en memoria).
 func (s *segStore) pedirFaltantes(sg *segmento) {
 	s.mu.Lock()
-	if len(sg.faltan) == 0 || ahora()-sg.ultFalta < 3000 {
+	if len(sg.faltan) == 0 || ahora()-sg.ultFalta < 700 {
 		s.mu.Unlock()
 		return
 	}

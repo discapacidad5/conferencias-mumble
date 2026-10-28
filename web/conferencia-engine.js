@@ -887,10 +887,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let opusListo = false;
       let opusTimestampUs = 0;
       let opusPending = [];
-      let txSeq = 0;
-      // Nueva sesión de micro: el contador tx vuelve a 0 — las tramas
-      // pendientes de la sesión anterior ya no son atribuibles, se sueltan
-      if (this._room) this._room._resetVozTxPend();
+      let txSeq = (this._room && typeof this._room._txSeqGlobal === 'number') ? this._room._txSeqGlobal : 0;
       let hablandoActivo = false;
 
       // Estado ADPCM y filtro anti-aliasing para respaldo universal
@@ -984,18 +981,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
       };
 
-      // Enviar 3 marcadores cortos EOS espaciados 25ms fuerza 3 DupACKs (TCP Fast Retransmit)
-      // en caso de que el último paquete de voz se haya perdido en un WiFi débil.
+      // Enviar marcador explícito de fin de frase (EOS) con el mismo txSeq
+      // de la última trama de voz enviada (SIN incrementar txSeq, para que
+      // jamás cree huecos falsos en la numeración de tramas de audio).
       const enviarMarcadorEOS = () => {
-        const sendOne = () => {
-          if (!this._room) return;
-          const s = (txSeq = (txSeq + 1) & 0xffff);
-          const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
-          this._room._enviarFrame(eos);
-        };
-        sendOne();
-        setTimeout(sendOne, 25);
-        setTimeout(sendOne, 50);
+        if (!this._room) return;
+        const s = txSeq & 0xffff;
+        const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
+        this._room._enviarFrame(eos);
       };
 
       // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz). Si el socket está
@@ -1004,6 +997,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const enviarTrama40ms = (frame48k) => {
         if (!this._room) return;
         txSeq = (txSeq + 1) & 0xffff;
+        this._room._txSeqGlobal = txSeq;
 
         let enviadoOpus = false;
         if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
@@ -2182,16 +2176,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // de la ráfaga (sean 30 s o 5 min) espera íntegro en seg.bloques
           while (seg.alimentado < seg.bloques.length && this._vozBufMs < 2000) {
             const bl = seg.bloques[seg.alimentado];
-            // Si falta un tx intermedio, pedir reparación y esperar hasta
-            // 1,2 s a que llegue antes de sonar para unir los trozos
+            // Ensamblado en secuencia estricta (estilo P2P): si falta un tx
+            // intermedio, NO reproducir el bloque siguiente ni dejar hueco;
+            // pedir la pieza faltante al servidor (reintentando cada 800 ms)
+            // y esperar a que encaje. Ese silencio mientras llega la pieza
+            // acumula detrás el resto del audio y crea solo el colchón natural.
             if (typeof seg.ultTxEmp === 'number' && typeof bl.tx === 'number' && bl.tx >= 0) {
               const diff = (bl.tx - seg.ultTxEmp) & 0xffff;
               if (diff > 1 && diff < 30000 && !seg.descargado) {
-                if (!seg._huecoDesde) {
-                  seg._huecoDesde = ahoraMs;
+                if (!seg._huecoDesde) seg._huecoDesde = ahoraMs;
+                if (!seg._ultRepIntento || ahoraMs - seg._ultRepIntento > 800) {
+                  seg._ultRepIntento = ahoraMs;
                   this._programarReparacion(seg);
                 }
-                if (ahoraMs - seg._huecoDesde < 1200) {
+                if (ahoraMs - seg._huecoDesde < 8000) {
                   break;
                 }
               }
@@ -2354,8 +2352,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           sg.rawBytes = sg.raw.reduce((a, u) => a + u.length, 0);
         }
         sg.bajando = false;
-        sg.descargado = true;
-        sg.huecos = false;
+        sg.descargado = !parsed.sg.abierto;
+        if (!parsed.sg.abierto) sg.huecos = false;
         sg.ultRxT = performance.now(); // si sigue abierta, re-sondear en ~4 s
         if (!parsed.sg.abierto) { sg.completo = true; sg.finLocal = true; }
         if (parsed.sg.durMs) sg.durMs = parsed.sg.durMs;

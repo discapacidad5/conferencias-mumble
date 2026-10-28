@@ -845,10 +845,44 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					continue
 				}
 				rc := payload[0]
+				// Función auxiliar que empaqueta y entrega en secuencia
+				// estricta un slice de tramas contiguas a todos los oyentes
+				difundirTramas := func(tramas [][]byte) {
+					if len(tramas) == 0 {
+						return
+					}
+					mr.mu.RLock()
+					defer mr.mu.RUnlock()
+					for _, pl := range tramas {
+						if len(pl) == 0 {
+							continue
+						}
+						rCode := pl[0]
+						pkt := make([]byte, 2+len(idBytes)+len(pl))
+						pkt[0] = frameTipoAudio
+						pkt[1] = byte(len(idBytes))
+						copy(pkt[2:], idBytes)
+						copy(pkt[2+len(idBytes):], pl)
+						for _, otro := range mr.clientes {
+							if otro == c || otro.grupo != c.grupo {
+								continue
+							}
+							if rCode >= 10 && rCode <= 19 && !otro.opusRx {
+								continue
+							}
+							if rCode >= 30 && rCode <= 39 && otro.opusRx {
+								continue
+							}
+							otro.enviarBinarioAudio(pkt)
+						}
+					}
+				}
 				// Reparación anti-pérdida: si esta tx rellena un hueco explícito
-				// de un segmento ya cerrado, se archiva en ese archivo
+				// de un segmento ya cerrado, se archiva y destraba las tramas
+				// consecutivas que estaban esperando esa pieza
 				if len(payload) >= 3 && rc != 0 {
-					if sgR := mr.seg.reparar(c.identidad, payload); sgR != nil {
+					if sgR, listosR := mr.seg.reparar(c.identidad, payload); sgR != nil {
+						difundirTramas(listosR)
 						mr.seg.pedirFaltantes(sgR)
 						continue
 					}
@@ -865,33 +899,17 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					mr.mu.Unlock()
 					mr.difundirEstadoPeers(c.grupo)
 				}
-				// rc == 0: marcador explícito de fin de frase (EOS), llega a todos los oyentes
-				// rc 10..19 = Opus (solo para clientes con opusRx=true)
-				// rc 30..39 = ADPCM respaldo simultáneo (solo para clientes con opusRx=false)
-				// rc 20..29 o 1..2 = ADPCM/u-law primario (para todos cuando el emisor no tiene Opus)
-				mr.mu.RLock()
-				for _, otro := range mr.clientes {
-					if otro == c || otro.grupo != c.grupo {
-						continue
-					}
-					if rc >= 10 && rc <= 19 && !otro.opusRx {
-						continue
-					}
-					if rc >= 30 && rc <= 39 && otro.opusRx {
-						continue
-					}
-					otro.enviarBinarioAudio(out)
-				}
-				mr.mu.RUnlock()
 
-				// Historial confiable: la frase se archiva como segmento
-				// descargable para reparar micro-cortes y notas de voz. El
-				// servidor deduplica por tx, las inserta en orden y le pide
-				// al emisor ({t:'falta'}) las tramas que detecta perdidas.
-				nuevo, cerrado, faltan := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
+				// Ensamblado en orden estricto (estilo P2P): el servidor
+				// verifica la secuencia tx de cada trama; si falta una pieza
+				// anterior, retiene las posteriores y se la pide de inmediato
+				// al emisor ({t:'falta'}). Solo cuando la secuencia está
+				// completa sin huecos la envía a los oyentes (listos).
+				nuevo, cerrado, faltan, listos := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
 				if nuevo != nil {
 					mr.seg.notificarSegIni(nuevo)
 				}
+				difundirTramas(listos)
 				if cerrado != nil {
 					mr.notificarSegFin(cerrado)
 				}
