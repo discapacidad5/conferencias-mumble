@@ -1714,11 +1714,11 @@ function wirePttButton(el, gate) {
 function wireGestoGlobal() {
   if (wireGestoGlobal._ok) return;
   wireGestoGlobal._ok = true;
-  window.addEventListener('pointermove', (e) => {
+  const seguir = (cx, cy) => {
     const g = S.ptt._gesto;
     if (!g || g.sinGesto || !S.ptt.quiero || S.ptt._bloqueado) return;
-    const dy = g.y0 - e.clientY, dx = g.x0 - e.clientX;
-    g.lock = dy > 56;                           // arrastre hacia arriba
+    const dy = g.y0 - cy, dx = g.x0 - cx;
+    g.lock = dy > 44;                           // arrastre hacia arriba
     g.auto = dx < -56 && !g.lock;               // arrastre hacia la derecha
     // el botón se arrastra un poco con el dedo, como la nota de voz de
     // WhatsApp: puro feedback visual, los gestos mandan por distancia
@@ -1727,7 +1727,16 @@ function wireGestoGlobal() {
     const base = g.el.classList.contains('asiento-ptt') ? 'translate(-50%,-50%) ' : '';
     g.el.style.transform = `${base}translate(${vx}px, ${vy}px)`;
     marcarGestosPtt(g);
-  });
+  };
+  window.addEventListener('pointermove', (e) => seguir(e.clientX, e.clientY));
+  // pointerrawupdate: en Android Chrome sigue llegando aunque el gesto
+  // nativo del sistema "congele" los pointermove al arrastrar desde abajo.
+  window.addEventListener('pointerrawupdate', (e) => seguir(e.clientX, e.clientY));
+  // Respaldo táctil: algunos WebViews solo entregan touchmove durante el arrastre.
+  window.addEventListener('touchmove', (e) => {
+    const t = e.touches && e.touches[0];
+    if (t) seguir(t.clientX, t.clientY);
+  }, { passive: true });
   const fin = (e) => {
     const g = S.ptt._gesto;
     if (g) e.stopPropagation();

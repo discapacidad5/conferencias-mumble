@@ -898,6 +898,13 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // VOZ_REDUNDANCIA=2 = doble envío; si aún se pierden, subir a 3.
       const VOZ_REDUNDANCIA = 2;
       const prevOpusPkts = [], prevAdpcmPkts = [];
+      // Redundancia solo con holgura: si la cola TCP ya va llena (>32 KB)
+      // duplicar paquetes ahoga la subida y la voz llega tarde — el hueco
+      // lo repara el servidor pidiendo 'falta' desde la semilla _vozTxPend.
+      const txHolgado = () => {
+        const w = this._room && this._room._ws;
+        return !w || w.bufferedAmount < 32 * 1024;
+      };
       const emitirOpusPkt = (tag, partes) => {
         if (!this._room || !partes || !partes.length) return;
         const s = tag & 0xffff;
@@ -920,7 +927,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           pkt.set(b2, o + 2);
         }
         this._room._enviarFrame(pkt);
-        for (const p of prevOpusPkts) this._room._enviarFrame(p); // copias redundantes
+        if (txHolgado()) for (const p of prevOpusPkts) this._room._enviarFrame(p); // copias redundantes
         prevOpusPkts.push(pkt);
         if (prevOpusPkts.length > VOZ_REDUNDANCIA - 1) prevOpusPkts.shift();
       };
@@ -1057,9 +1064,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._room._enviarFrame(eos);
         // La cola del audio viaja duplicada de inmediato: la última trama
         // queda cubierta sin esperar a la siguiente frase, y la propia
-        // marca EOS también se envía dos veces (cerrar es idempotente)
-        for (const p of prevOpusPkts) this._room._enviarFrame(p);
-        for (const p of prevAdpcmPkts) this._room._enviarFrame(p);
+        // marca EOS también se envía dos veces (cerrar es idempotente).
+        // Las copias se saltan si la subida ya va llena (holgura baja).
+        if (txHolgado()) {
+          for (const p of prevOpusPkts) this._room._enviarFrame(p);
+          for (const p of prevAdpcmPkts) this._room._enviarFrame(p);
+        }
         this._room._enviarFrame(eos);
       };
 
@@ -1115,7 +1125,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           }
           const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode, txSeq);
           this._room._enviarFrame(pkt);
-          for (const p of prevAdpcmPkts) this._room._enviarFrame(p); // copias redundantes
+          if (txHolgado()) for (const p of prevAdpcmPkts) this._room._enviarFrame(p); // copias redundantes
           prevAdpcmPkts.push(pkt);
           if (prevAdpcmPkts.length > VOZ_REDUNDANCIA - 1) prevAdpcmPkts.shift();
         }
@@ -1807,7 +1817,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
     _enviarFrame(pkt) {
       if (pkt && pkt[0] === 0x01 && pkt.length >= 4) this._registrarVozTx(pkt);
-      if (this._ws && this._ws.readyState === WebSocket.OPEN && this._ws.bufferedAmount < 12 * 1024) {
+      // 48 KB ≈ 4-8 s de voz: TCP encola en ráfagas y vacía solo; con el
+      // umbral viejo de 12 KB la subida móvil encolaba TODA la frase en
+      // _txCola y los oyentes la oían recién al soltar el PTT.
+      if (this._ws && this._ws.readyState === WebSocket.OPEN && this._ws.bufferedAmount < 48 * 1024) {
         try { this._ws.send(pkt); return; } catch {}
       }
       // ~16 MB ≈ 35-40 min de voz a 10 kbps: jamás descartar paquetes en
@@ -1821,7 +1834,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
     _programarFlushTx() {
       if (this._txFlushT) return;
-      this._txFlushT = setTimeout(() => { this._txFlushT = null; this._drenarTx(); }, 300);
+      this._txFlushT = setTimeout(() => { this._txFlushT = null; this._drenarTx(); }, 120);
     }
 
     // ---------- retransmisión de MI voz (el servidor pide lo que perdió) ----------

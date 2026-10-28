@@ -164,6 +164,12 @@ func (c *clienteWS) enviarCtrl(b []byte) {
 // fallando en la red, subir a 3 para triple redundancia.
 const redundanciaAudio = 2
 
+// colaAudioMax: techo de la cola de voz por oyente (~160 paquetes ≈ 6 s).
+// Sin tope, en una bajada móvil lenta la cola crece sin fin y el retraso se
+// acumula durante toda la frase — "el audio llega al soltar el PTT". Lo que
+// se suelta por tope el oyente lo repara con 'falta' o el .seg descargado.
+const colaAudioMax = 160
+
 func (c *clienteWS) enviarBinarioAudio(b []byte) {
 	select {
 	case <-c.cerrado:
@@ -175,14 +181,21 @@ func (c *clienteWS) enviarBinarioAudio(b []byte) {
 	// Redundancia inmediata: el paquete nuevo viaja acompañado de la copia de
 	// los anteriores — si un envío se pierde en la red móvil del oyente, el
 	// siguiente ya trae su repuesto. El oyente deduplica por (aid, idx).
-	for _, prev := range c.audioPrev {
-		c.audioCola = append(c.audioCola, prev)
+	// Solo con holgura: si la bajada va congestionada duplicar la ahoga más.
+	if len(c.audioCola) < 50 {
+		for _, prev := range c.audioPrev {
+			c.audioCola = append(c.audioCola, prev)
+		}
 	}
 	copia := append([]byte(nil), b...)
 	c.audioPrev = append(c.audioPrev, copia)
 	if len(c.audioPrev) > redundanciaAudio-1 {
 		copy(c.audioPrev, c.audioPrev[1:])
 		c.audioPrev = c.audioPrev[:redundanciaAudio-1]
+	}
+	for len(c.audioCola) > colaAudioMax {
+		c.audioCola[0] = nil
+		c.audioCola = c.audioCola[1:]
 	}
 	c.audioMu.Unlock()
 	select {
