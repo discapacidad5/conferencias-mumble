@@ -104,6 +104,7 @@ type clienteWS struct {
 	connSid   string
 	conn      *websocket.Conn
 	ctrlCh    chan []byte   // Señalización JSON (prioridad alta, nunca se descarta por audio)
+	audioPrev [][]byte      // Últimas copias de voz reenviadas: redundancia inmediata
 	audioCh   chan struct{} // Notificación de voz pendiente en audioCola
 	audioMu   sync.Mutex
 	audioCola [][]byte    // Cola FIFO elástica de voz (jamás descarta ningún paquete)
@@ -158,6 +159,11 @@ func (c *clienteWS) enviarCtrl(b []byte) {
 	}
 }
 
+// redundanciaAudio: cuántas copias en total viaja cada paquete de voz hacia
+// cada oyente (2 = paquete nuevo + copia del anterior). Si con doble sigue
+// fallando en la red, subir a 3 para triple redundancia.
+const redundanciaAudio = 2
+
 func (c *clienteWS) enviarBinarioAudio(b []byte) {
 	select {
 	case <-c.cerrado:
@@ -166,6 +172,18 @@ func (c *clienteWS) enviarBinarioAudio(b []byte) {
 	}
 	c.audioMu.Lock()
 	c.audioCola = append(c.audioCola, b)
+	// Redundancia inmediata: el paquete nuevo viaja acompañado de la copia de
+	// los anteriores — si un envío se pierde en la red móvil del oyente, el
+	// siguiente ya trae su repuesto. El oyente deduplica por (aid, idx).
+	for _, prev := range c.audioPrev {
+		c.audioCola = append(c.audioCola, prev)
+	}
+	copia := append([]byte(nil), b...)
+	c.audioPrev = append(c.audioPrev, copia)
+	if len(c.audioPrev) > redundanciaAudio-1 {
+		copy(c.audioPrev, c.audioPrev[1:])
+		c.audioPrev = c.audioPrev[:redundanciaAudio-1]
+	}
 	c.audioMu.Unlock()
 	select {
 	case c.audioCh <- struct{}{}:

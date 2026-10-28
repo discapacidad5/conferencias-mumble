@@ -891,11 +891,13 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // codificado — imposible desalinear etiquetas con el audio como pasaba
       // con la cola paralela opusTags/opusPending.
       const opusPares = new Map(); // tag -> [chunk20ms, ...]
-      // Redundancia inmediata: cada emisión va acompañada de la copia del
-      // paquete anterior de la misma familia — si un envío se pierde en la
+      // Redundancia inmediata: cada emisión va acompañada de la copia de los
+      // paquetes anteriores de la misma familia — si un envío se pierde en la
       // red móvil, el siguiente ya trae su repuesto. El servidor deduplica
       // por (aid, idx) así que nunca se arma ni reenvía dos veces.
-      let prevOpusPkt = null, prevAdpcmPkt = null;
+      // VOZ_REDUNDANCIA=2 = doble envío; si aún se pierden, subir a 3.
+      const VOZ_REDUNDANCIA = 2;
+      const prevOpusPkts = [], prevAdpcmPkts = [];
       const emitirOpusPkt = (tag, partes) => {
         if (!this._room || !partes || !partes.length) return;
         const s = tag & 0xffff;
@@ -918,8 +920,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           pkt.set(b2, o + 2);
         }
         this._room._enviarFrame(pkt);
-        if (prevOpusPkt) this._room._enviarFrame(prevOpusPkt); // copia redundante
-        prevOpusPkt = pkt;
+        for (const p of prevOpusPkts) this._room._enviarFrame(p); // copias redundantes
+        prevOpusPkts.push(pkt);
+        if (prevOpusPkts.length > VOZ_REDUNDANCIA - 1) prevOpusPkts.shift();
       };
       const emitirOpusParesRestantes = () => {
         for (const [t, p] of opusPares) emitirOpusPkt(t, p);
@@ -1053,6 +1056,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         const s = txSeq & 0xffff;
         const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
         this._room._enviarFrame(eos);
+        // La cola del audio viaja duplicada de inmediato: la última trama
+        // queda cubierta sin esperar a la siguiente frase, y la propia
+        // marca EOS también se envía dos veces (cerrar es idempotente)
+        for (const p of prevOpusPkts) this._room._enviarFrame(p);
+        for (const p of prevAdpcmPkts) this._room._enviarFrame(p);
+        this._room._enviarFrame(eos);
       };
 
       // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz). Si empieza un
@@ -1107,8 +1116,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           }
           const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode, txSeq);
           this._room._enviarFrame(pkt);
-          if (prevAdpcmPkt) this._room._enviarFrame(prevAdpcmPkt); // copia redundante
-          prevAdpcmPkt = pkt;
+          for (const p of prevAdpcmPkts) this._room._enviarFrame(p); // copias redundantes
+          prevAdpcmPkts.push(pkt);
+          if (prevAdpcmPkts.length > VOZ_REDUNDANCIA - 1) prevAdpcmPkts.shift();
         }
       };
 
