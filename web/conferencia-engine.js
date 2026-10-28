@@ -898,12 +898,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // VOZ_REDUNDANCIA=2 = doble envío; si aún se pierden, subir a 3.
       const VOZ_REDUNDANCIA = 2;
       const prevOpusPkts = [], prevAdpcmPkts = [];
-      // Redundancia solo con holgura: si la cola TCP ya va llena (>32 KB)
+      // Redundancia solo con holgura: si la cola TCP ya va llena (>16 KB)
       // duplicar paquetes ahoga la subida y la voz llega tarde — el hueco
       // lo repara el servidor pidiendo 'falta' desde la semilla _vozTxPend.
       const txHolgado = () => {
         const w = this._room && this._room._ws;
-        return !w || w.bufferedAmount < 32 * 1024;
+        return !w || w.bufferedAmount < 16 * 1024;
       };
       const emitirOpusPkt = (tag, partes) => {
         if (!this._room || !partes || !partes.length) return;
@@ -1828,7 +1828,27 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (this._txBytes + pkt.length <= 16777216) {
         this._txCola.push(pkt);
         this._txBytes += pkt.length;
+        this._purgarTxViejo();
         this._programarFlushTx();
+      }
+    }
+
+    // Con la subida ahogada conviene soltar el audio MÁS VIEJO de la cola
+    // (el servidor re-pide cada hueco por 'falta' y la pieza se reenvía
+    // desde la semilla _vozTxPend) en vez de dejar crecer el retraso en
+    // vivo hasta el final de la frase — preferimos ~4 s de atraso acotado
+    // + huecos reparados que una ráfaga tardía. EOS y control jamás se
+    // sueltan: cierran la frase y el piso.
+    _purgarTxViejo() {
+      while (this._txBytes > 49152) {
+        let i = -1;
+        for (let k = 0; k < this._txCola.length; k++) {
+          const p = this._txCola[k];
+          if (p && p[0] === 0x01 && p[1] !== 0) { i = k; break; }
+        }
+        if (i < 0) break;
+        const p = this._txCola.splice(i, 1)[0];
+        this._txBytes -= p.length;
       }
     }
 
@@ -2361,7 +2381,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   seg._ultRepIntento = ahoraMs;
                   this._programarReparacion(seg);
                 }
-                if (ahoraMs - seg._huecoDesde < 8000) {
+                // >2.5 s esperando la pieza: el vivo salta el hueco; el
+                // .seg descargado la reincorpora íntegra en el archivo
+                if (ahoraMs - seg._huecoDesde < 2500) {
                   break;
                 }
               }

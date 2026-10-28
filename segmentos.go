@@ -293,12 +293,12 @@ func drenarContiguos(sg *segmento) [][]byte {
 		tx := sg.proxEnvTx
 		idx := int(idxDeTx(tx))
 		if _, falta := sg.faltan[tx]; falta {
-			if sg.faltaDesde == nil || ahora()-sg.faltaDesde[tx] < 4000 {
+			if sg.faltaDesde == nil || ahora()-sg.faltaDesde[tx] < 1200 {
 				break // pieza faltante reciente: esperarla antes de soltar
 			}
-			// >4 s sin llegar: el vivo avanza con un salto mínimo en vez de
-			// congelarse para siempre — la pieza SIGUE pidiéndose y cuando
-			// llegue completa la grabación del archivo vía reparar()
+			// >1.2 s sin llegar: el vivo avanza con un salto mínimo en vez de
+			// congelarse — la pieza SIGUE pidiéndose y cuando llegue completa
+			// la grabación del archivo vía reparar()
 		}
 		b0, ok0 := sg.porTx[uint32(tx)<<1|0]
 		b1, ok1 := sg.porTx[uint32(tx)<<1|1]

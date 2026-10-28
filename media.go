@@ -712,13 +712,10 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		pingTk := time.NewTicker(5 * time.Second)
 		defer pingTk.Stop()
 		for {
-			// 1. Drenar primero cualquier paquete de voz o control pendiente
-			if amsg, ok := c.popAudio(); ok {
-				if !escribirAudio(amsg) {
-					return
-				}
-				continue
-			}
+			// 1. Control SIEMPRE primero: seg_ini/seg_fin/falta/seg_ack son
+			// diminutos pero destraban la reproducción en vivo del oyente.
+			// Si esperaban detrás de la cola de voz llena, la frase entera
+			// parecía "llegar al soltar el PTT".
 			select {
 			case <-c.cerrado:
 				return
@@ -728,6 +725,13 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				}
 				continue
 			default:
+			}
+			// 2. Un paquete de voz por iteración
+			if amsg, ok := c.popAudio(); ok {
+				if !escribirAudio(amsg) {
+					return
+				}
+				continue
 			}
 
 			// 2. Si no hay voz ni control esperando, atender cualquier canal
