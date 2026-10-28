@@ -952,6 +952,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
         txIdx = -1;
         enFrase = true;
+        // Mi nota "grabando" sale al instante sin esperar el eco del
+        // servidor: si ese seg_ini se perdiera en la red, el provisional
+        // adopta el seq real cuando llegue el eco o el seg_fin
+        if (this._room) this._room.emit('voz_propia_ini', { inicio: Date.now() });
       };
       let hablandoActivo = false;
 
@@ -1013,11 +1017,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 application: 'voip',
                 frameDuration: 20000,
                 complexity: 5,
-                // FEC in-band (LBRR): cada paquete lleva incrustada una
-                // copia de bajo bitrate del frame anterior — pérdidas
-                // aisladas se tapan en el decodificador sin retransmisión
-                useinbandfec: true,
-                packetlossperc: 25,
               },
             });
             opusListo = true;
@@ -3932,6 +3931,21 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             this._marcarFinHablaRemota(pipe);
           }
           return;
+        }
+
+        // Dedup temprano en ventana deslizante: la copia redundante del
+        // mismo paquete NO debe entrar al decodificador — Opus y ADPCM son
+        // decoders CON ESTADO (historial/predictor) y decodificar la misma
+        // trama dos veces corrompe el estado y ensucia los frames
+        // siguientes ("basurita" de fondo). Ventana corta: cubre reenvíos
+        // sin tropezar con seqs repetidos cuando aid (4 bits) da la vuelta.
+        if (rateCode >= 10 && payload.length >= 3) {
+          const seqWire = payload[1] | (payload[2] << 8);
+          if (!pipe._txVistos) { pipe._txVistos = new Set(); pipe._txOrden = []; }
+          if (pipe._txVistos.has(seqWire)) return;
+          pipe._txVistos.add(seqWire);
+          pipe._txOrden.push(seqWire);
+          if (pipe._txOrden.length > 512) pipe._txVistos.delete(pipe._txOrden.shift());
         }
 
         // 1. Trama Opus nativa ultraligera (14 / 22 / 32 kbps)

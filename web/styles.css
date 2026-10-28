@@ -15,7 +15,7 @@
   --violeta2: #8b5cf6;
 }
 * { box-sizing: border-box; margin: 0; }
-html, body { height: 100%; }
+html, body { height: 100%; overscroll-behavior: none; }
 body {
   background: var(--bg); color: var(--texto);
   font-family: system-ui, "Segoe UI", Roboto, sans-serif;
@@ -99,7 +99,12 @@ label.check input { width: auto; }
 /* Pulsadores PTT compartidos (botón del micro, centro de mi asiento y botón
    del chat): amarillo = piso libre · verde = otra persona habla ·
    rojo = yo estoy hablando · gris = sin permiso */
-.ptt-sup { touch-action: none; user-select: none; -webkit-user-select: none; }
+.ptt-sup { touch-action: none; user-select: none; -webkit-user-select: none;
+  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+/* hitbox invisible ~19px más grande por lado en el botón del micro:
+   el dedo puede desviarse un poco fuera del círculo sin soltar el gesto
+   (fondo transparente + margen negativo = ni se ve ni mueve el layout) */
+.btn.ctl.ptt-sup { padding: .75rem; margin: -.6rem; }
 #chat-enviar { min-width: 46px; font-size: 1.05rem; }
 .btn.ctl.ptt-libre { box-shadow: 0 0 0 3px var(--ambar); }
 .btn.ctl.ptt-ocupado { box-shadow: 0 0 0 3px var(--verde); }

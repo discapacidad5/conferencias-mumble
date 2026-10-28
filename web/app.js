@@ -1663,6 +1663,9 @@ function wirePttButton(el, gate) {
   if (!el || el._pttWired) return;
   el._pttWired = true;
   const libre = () => !gate || gate();
+  // Android: mantener el dedo ~500 ms dispara contextmenu y el navegador
+  // manda pointercancel -> soltaba el PTT solo. Se bloquea aquí de raíz.
+  el.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); });
   el.addEventListener('pointerdown', (e) => {
     if (S.audio.retirando || S.ptt.modo === 'lock' || S.ptt.modo === 'auto' || !libre()) return;
     e.preventDefault();
@@ -2256,6 +2259,7 @@ function cablearRoom(room) {
     manejarData(d, participant);
   });
   // --- notas de voz en vivo (segmentos confiables) ---
+  room.on('voz_propia_ini', (m) => agregarNotaPropiaPendiente(m && m.inicio));
   room.on('seg_ini', (m) => {
     if (!m) return;
     S._ultimoSeg = Math.max(S._ultimoSeg || 0, m.seq || 0);
@@ -4654,7 +4658,41 @@ function insertarNotaOrdenada(lista, el, seq) {
 // ● grabando + tiempo corriendo. No se puede rebobinar (aún no termina),
 // pero tocarla te adelanta hasta el audio en tiempo real — igual que el
 // chip "Ir al presente" cuando vas atrasado.
+// Mi nota "grabando" se crea en el instante en que el cliente empieza a
+// transmitir — no espera el eco del servidor. Lleva un seq provisional
+// alto (ordena al final); cuando llega el seg_ini/seg_fin real con mi
+// identidad, el provisional ADOPTA ese seq y sigue siendo la misma nota.
+let _nvMiaPend = 0, _nvMiaN = 0;
+function agregarNotaPropiaPendiente(inicio) {
+  if (_nvMiaPend && !S._nvEls.has(_nvMiaPend)) _nvMiaPend = 0;
+  if (_nvMiaPend) return; // ya hay una nota mía grabando
+  _nvMiaPend = 2e9 + (++_nvMiaN);
+  agregarNotaVozEnVivo({ seq: _nvMiaPend, de: S.identidad, nombre: S.nombre || 'Yo', inicio });
+}
+// El provisional de mi nota "grabando" adopta el seq real del servidor.
+// Devuelve true si adoptó (la nota ya existe bajo la nueva llave).
+function adoptarSeqPropia(meta) {
+  if (!meta || meta.de !== S.identidad || meta.seq <= 0) return false;
+  const prov = _nvMiaPend;
+  if (!prov || prov === meta.seq) return false;
+  const el = S._nvEls.get(prov);
+  _nvMiaPend = 0;
+  if (!el || !el.classList.contains('grabando')) return false;
+  if (S._nvEls.has(meta.seq)) return false; // ya existía con seq real
+  S._nvEls.delete(prov);
+  S._nvEls.set(meta.seq, el);
+  const i = S._nvSeqs.indexOf(prov);
+  if (i >= 0) { S._nvSeqs[i] = meta.seq; S._nvSeqs.sort((a, b) => a - b); }
+  el.querySelectorAll('[data-seq]').forEach(b => { b.dataset.seq = meta.seq; });
+  const lista = $('#chat-lista');
+  el.remove();
+  insertarNotaOrdenada(lista, el, meta.seq);
+  return true;
+}
+
 function agregarNotaVozEnVivo(meta) {
+  // Mi provisional adopta el seq real: la nota "grabando" ya existe
+  if (adoptarSeqPropia(meta)) return;
   if (!meta || meta.seq <= 0 || S._nvEls.has(meta.seq) || nvBorrados().has(meta.seq)) return;
   const lista = $('#chat-lista');
   const el = document.createElement('div');
@@ -4734,6 +4772,9 @@ async function sincronizarNotas() {
     const vivos = new Set((man.segmentos || []).map(m => m.seq));
     if (man.abierto && man.abierto.seq) vivos.add(man.abierto.seq);
     S._nvEls.forEach((el, seq) => {
+      // las provisionales (mi frase en curso, seq aún sin asignar por el
+      // servidor) no son fantasmas: adoptan su seq al llegar seg_ini/fin
+      if (seq >= 2e9) return;
       if (el.classList.contains('grabando') && !vivos.has(seq))
         marcarNotaVoz(seq, 'perdida');
     });
@@ -4743,6 +4784,9 @@ async function sincronizarNotas() {
 
 function agregarNotaVoz(meta) {
   if (!meta || meta.seq <= 0) return;
+  // si el seg_ini se perdió, mi provisional adopta el seq del seg_fin
+  // y cae en el flujo normal que la convierte en nota cerrada
+  adoptarSeqPropia(meta);
   if (nvBorrados().has(meta.seq)) {
     // nota borrada por el usuario: si quedó una copia "grabando", fuera
     const v = S._nvEls.get(meta.seq);
