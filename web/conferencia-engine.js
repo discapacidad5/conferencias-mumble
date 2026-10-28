@@ -891,6 +891,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // codificado — imposible desalinear etiquetas con el audio como pasaba
       // con la cola paralela opusTags/opusPending.
       const opusPares = new Map(); // tag -> [chunk20ms, ...]
+      // Redundancia inmediata: cada emisión va acompañada de la copia del
+      // paquete anterior de la misma familia — si un envío se pierde en la
+      // red móvil, el siguiente ya trae su repuesto. El servidor deduplica
+      // por (aid, idx) así que nunca se arma ni reenvía dos veces.
+      let prevOpusPkt = null, prevAdpcmPkt = null;
       const emitirOpusPkt = (tag, partes) => {
         if (!this._room || !partes || !partes.length) return;
         const s = tag & 0xffff;
@@ -913,6 +918,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           pkt.set(b2, o + 2);
         }
         this._room._enviarFrame(pkt);
+        if (prevOpusPkt) this._room._enviarFrame(prevOpusPkt); // copia redundante
+        prevOpusPkt = pkt;
       };
       const emitirOpusParesRestantes = () => {
         for (const [t, p] of opusPares) emitirOpusPkt(t, p);
@@ -1003,6 +1010,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 application: 'voip',
                 frameDuration: 20000,
                 complexity: 5,
+                // FEC in-band (LBRR): cada paquete lleva incrustada una
+                // copia de bajo bitrate del frame anterior — pérdidas
+                // aisladas se tapan en el decodificador sin retransmisión
+                useinbandfec: true,
+                packetlossperc: 25,
               },
             });
             opusListo = true;
@@ -1095,6 +1107,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           }
           const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode, txSeq);
           this._room._enviarFrame(pkt);
+          if (prevAdpcmPkt) this._room._enviarFrame(prevAdpcmPkt); // copia redundante
+          prevAdpcmPkt = pkt;
         }
       };
 
@@ -1684,6 +1698,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._feedT = null;
       this._feedUltimo = 0;
       this._fetchSegs = new Set();      // seqs con descarga en curso
+      this._vozOidos = new Set();       // seqs ya escuchadas o saltadas:
+                                        // sobrevive reconexiones — una nota
+                                        // oída JAMÁS se vuelve a reproducir
       this._replayQ = [];               // notas re-escuchadas (prioridad)
       this._replayPendMs = 0;           // ms de nota ya en el reproductor sin sonar
       this._replayPlayedMs = 0;         // ms acumulados de nota ya escuchados
@@ -1963,6 +1980,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       } : null;
     }
 
+    // Marca una seq como ya escuchada: el set sobrevive a las reconexiones
+    // del socket, así las notas re-descargadas tras un corte se archivan
+    // pero no se repiten por el altavoz
+    _marcarOido(seq) {
+      if (typeof seq !== 'number' || seq <= 0) return;
+      this._vozOidos.add(seq);
+      if (this._vozOidos.size > 600) {
+        this._vozOidos = new Set([...this._vozOidos].slice(-300));
+      }
+    }
+
     _vozSegNuevo(seq, de, nombre, abierto, meta) {
       let seg = this._vozSegs.get(seq);
       if (!seg) {
@@ -1994,6 +2022,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       }
       if (abierto && de) this._segPorHablante.set(de, seq);
       if (typeof seq === 'number' && seq > 0) this._ultimoSeg = Math.max(this._ultimoSeg, seq);
+      if (typeof seq === 'number' && seq > 0 && this._vozOidos.has(seq)) {
+        seg.reproducido = true; // ya sonó: se archiva/actualiza pero no se repite
+      }
       return seg;
     }
 
@@ -2322,6 +2353,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               (seg.completo || seg.finLocal) && !seg.finAvisado) {
             seg.finAvisado = true;
             seg.reproducido = true;
+            this._marcarOido(seg.seq);
             this.emit('seg_reproducido', this._segMeta(seg));
           }
         }
@@ -2402,6 +2434,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           s.alimentado = s.bloques.length; // seguir la frase actual desde su borde
         } else {
           s.saltado = true;
+          this._marcarOido(s.seq); // "ir al presente" también recuerda: no repetir
         }
       }
       this._replayQ.length = 0;
@@ -2512,7 +2545,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           if (seg) {
             // Ya existía en mi sesión: actualizar su cierre y rellenar si tuvo huecos
             this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
-            if (!seg.descargado && !seg.reproducido && (seg.huecos || !seg.bloques.length)) {
+            // Se baja aunque ya esté reproducida: completa el archivo local
+            // (IndexedDB) y el _feedVoz jamás repite un reproducido
+            if (!seg.descargado && (seg.huecos || !seg.bloques.length)) {
               this._bajarSeg(meta.seq);
             }
           } else if (meta.seq > base) {
@@ -2660,6 +2695,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     // ---------- re-escucha de notas de voz ----------
     _encolarReplay(seq, bloques) {
       if (!bloques.length) return false;
+      // Una misma nota jamás entra dos veces: si ya está sonando o encolada,
+      // se da por encolada y no se duplica la reproducción
+      if ((this._replayProg[0] && this._replayProg[0].seq === seq) ||
+          this._replayQ.some((r) => r.seq === seq)) return true;
       // La nueva nota interrumpe de inmediato: se descarta lo que sonaba
       // (otra re-escucha o el audio vivo encolado). Al terminar, el vivo
       // continúa por donde va su retraso — lo perdido queda en el historial.
