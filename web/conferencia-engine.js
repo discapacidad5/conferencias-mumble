@@ -886,8 +886,38 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let opusEncoder = null;
       let opusListo = false;
       let opusTimestampUs = 0;
-      let opusPending = [];
-      let opusTags = [];
+      // Pareo Opus por timestamp: la etiqueta (aid<<12|idx) viaja DENTRO del
+      // propio AudioData.timestamp (txSeq*40000) y sale intacta en el chunk
+      // codificado — imposible desalinear etiquetas con el audio como pasaba
+      // con la cola paralela opusTags/opusPending.
+      const opusPares = new Map(); // tag -> [chunk20ms, ...]
+      const emitirOpusPkt = (tag, partes) => {
+        if (!this._room || !partes || !partes.length) return;
+        const s = tag & 0xffff;
+        const rateCode = maxBr <= 11000 ? 10 : (maxBr <= 20000 ? 11 : 12);
+        const b1 = partes[0];
+        const b2 = partes.length > 1 ? partes[1] : null;
+        const pkt = new Uint8Array(7 + b1.length + (b2 ? 2 + b2.length : 0));
+        pkt[0] = FRAME_AUDIO;
+        pkt[1] = rateCode;
+        pkt[2] = s & 0xff;
+        pkt[3] = (s >> 8) & 0xff;
+        pkt[4] = 0xA5; // marca de paquete Opus (1 o 2 sub-tramas de 20 ms)
+        pkt[5] = b1.length & 0xff;
+        pkt[6] = (b1.length >> 8) & 0xff;
+        pkt.set(b1, 7);
+        if (b2) {
+          const o = 7 + b1.length;
+          pkt[o] = b2.length & 0xff;
+          pkt[o + 1] = (b2.length >> 8) & 0xff;
+          pkt.set(b2, o + 2);
+        }
+        this._room._enviarFrame(pkt);
+      };
+      const emitirOpusParesRestantes = () => {
+        for (const [t, p] of opusPares) emitirOpusPkt(t, p);
+        opusPares.clear();
+      };
       // Cada audio nuevo cambia su identificador aid (1..15) y vuelve a
       // empezar su índice de trama en 0 (0, 1, 2...): así al soltar el PTT
       // y volver a pisar, el servidor termina de recibir las tramas que
@@ -935,35 +965,30 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 if (n <= 0) return;
                 const bytes = new Uint8Array(n);
                 chunk.copyTo(bytes);
-                opusPending.push(bytes);
                 opusListo = true;
-                // Agrupamos 2 sub-tramas Opus de 20 ms (= 40 ms por paquete WebSocket)
-                if (opusPending.length >= 2) {
-                  const b1 = opusPending.shift();
-                  const b2 = opusPending.shift();
-                  const tagOpus = opusTags.length ? opusTags.shift() : txSeq;
-                  const rateCode = maxBr <= 11000 ? 10 : (maxBr <= 20000 ? 11 : 12);
-                  const s = tagOpus & 0xffff;
-                  const pkt = new Uint8Array(9 + b1.length + b2.length);
-                  pkt[0] = FRAME_AUDIO;
-                  pkt[1] = rateCode;
-                  pkt[2] = s & 0xff;
-                  pkt[3] = (s >> 8) & 0xff;
-                  pkt[4] = 0xA5; // marca de paquete Opus dual (2 x 20ms)
-                  pkt[5] = b1.length & 0xff;
-                  pkt[6] = (b1.length >> 8) & 0xff;
-                  pkt.set(b1, 7);
-                  const off2 = 7 + b1.length;
-                  pkt[off2] = b2.length & 0xff;
-                  pkt[off2 + 1] = (b2.length >> 8) & 0xff;
-                  pkt.set(b2, off2 + 2);
+                // La etiqueta sale del timestamp del propio chunk: nunca se
+                // desalinea con el audio aunque el encoder retrase la salida
+                const tag = Math.floor((chunk.timestamp || 0) / 40000) & 0xffff;
+                const par = opusPares.get(tag);
+                if (par) {
+                  par.push(bytes);
+                  opusPares.delete(tag);
                   // Encolado confiable: nunca se pierde la voz del emisor
                   // ante micro-cortes — sale en ráfaga al volver el socket
-                  this._room._enviarFrame(pkt);
+                  emitirOpusPkt(tag, par);
+                } else {
+                  opusPares.set(tag, [bytes]);
+                  // Si el gemelo no llega en 90 ms (pérdida interna del
+                  // encoder), emitir la mitad sola: mejor 20 ms que nada
+                  setTimeout(() => {
+                    const p = opusPares.get(tag);
+                    if (p) { opusPares.delete(tag); emitirOpusPkt(tag, p); }
+                  }, 90);
                 }
               },
               error: () => {
                 opusListo = false;
+                emitirOpusParesRestantes();
               },
             });
           }
@@ -1025,9 +1050,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         if (!enFrase || txIdx >= 4090) abrirNuevoAudio();
         txIdx = (txIdx + 1) & 0x0fff;
         txSeq = ((aid & 0x0f) << 12) | txIdx;
-        if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
-          opusTags.push(txSeq);
-        }
 
         let enviadoOpus = false;
         if (opusEncoder && opusEncoder.state === 'configured' && opusListo) {
@@ -1039,10 +1061,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 sampleRate: 48000,
                 numberOfFrames: 960,
                 numberOfChannels: 1,
-                timestamp: opusTimestampUs,
+                // la etiqueta del audio viaja en el timestamp: sale intacta
+                // en chunk.timestamp al otro lado del encoder
+                timestamp: txSeq * 40000 + half * 20000,
                 data: sub20ms,
               });
-              opusTimestampUs += 20000;
               opusEncoder.encode(ad);
               ad.close();
             }
@@ -1197,7 +1220,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 if (window.S.ptt.quiero && window.S.ptt.tengo) {
                   if (!hablandoActivo) {
                     hablandoActivo = true;
-                    opusPending.length = 0;
                     // ~80 ms de audio vacío al abrir la frase: da margen a
                     // que el receptor cree el segmento y no se coma el
                     // ataque de la primera sílaba
@@ -1230,7 +1252,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                     (rms >= umbralAbrir || silencioCola > 0 || quieroPtt)) {
                   if (!hablandoActivo) {
                     hablandoActivo = true;
-                    opusPending.length = 0;
                     ultimoPedirPiso = performance.now();
                     autoPreTs = ultimoPedirPiso;
                     if (this._room) this._room.tomarPiso();
@@ -1319,11 +1340,18 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._micCleanup = () => {
           micCerrado = true;
           this._actualizarBitrateMic = null;
-          // Al soltar el PTT manual, enviar el EOS con (aid, ultimoIdx)
-          // antes de cerrar el codificador para que el servidor sepa cuál
-          // fue la última trama de este audio y reclame cualquier hueco.
-          try { if (opusEncoder && opusEncoder.state === 'configured') opusEncoder.flush(); } catch {}
-          if (enFrase) enviarMarcadorEOS();
+          // Al soltar el PTT manual: vaciar el encoder (emitir las sub-tramas
+          // que quedaran sueltas) y LUEGO enviar el EOS con (aid, ultimoIdx)
+          // para que el servidor sepa cuál fue la última trama de este audio.
+          const cerrarFrase = () => {
+            emitirOpusParesRestantes();
+            if (enFrase) enviarMarcadorEOS();
+          };
+          try {
+            if (opusEncoder && opusEncoder.state === 'configured') {
+              opusEncoder.flush().then(cerrarFrase, cerrarFrase);
+            } else cerrarFrase();
+          } catch { cerrarFrase(); }
           try { if (opusEncoder && opusEncoder.state !== 'closed') opusEncoder.close(); } catch {}
           opusEncoder = null;
           try { if (txWorklet) txWorklet.disconnect(); } catch {}
@@ -1789,10 +1817,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._vozTxBytes += pkt.length;
       if (rc === 0) {
         // EOS: también se guarda — al reenviar tras un corte "sella" el
-        // final de la frase en el servidor. Cierra la frase local:
-        // quedan reenviables las 2 últimas
+        // final de la frase en el servidor. Cierra la fase local, PERO la
+        // semilla NO se descarta: solo se suelta cuando el servidor confirma
+        // con {t:'seg_ack'} que ese aid llegó completo, o por el tope
+        // defensivo de memoria (16 MB ≈ 35 min de voz).
         this._vozTxFaseAct = null;
-        while (this._vozTxFases.length > 2) this._soltarVozFase(this._vozTxFases[0]);
         return;
       }
       // tope de seguridad ~16 MB (≈35 min de voz): suelta la frase
@@ -1833,6 +1862,27 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
         if (++n >= 96) break;
       }
+    }
+
+    // El servidor confirma ({t:'seg_ack'}) que recibió completo ese audio
+    // (aid): se suelta su semilla de retransmisión. Protocolo semilla P2P —
+    // conservar cada audio hasta que el otro extremo confirme recepción.
+    _ackVoz(aid) {
+      aid = Number(aid) & 0x0f;
+      if (!aid || !this._vozTxPend.size) return;
+      // clave = (tx<<1)|fam → aid = tx>>12 = clave>>13
+      for (const [k, p] of this._vozTxPend) {
+        if (((k >> 13) & 0x0f) === aid) {
+          this._vozTxPend.delete(k);
+          this._vozTxBytes -= p.length;
+        }
+      }
+      for (const fase of this._vozTxFases) {
+        for (let i = fase.length - 1; i >= 0; i--) {
+          if (((fase[i] >> 13) & 0x0f) === aid) fase.splice(i, 1);
+        }
+      }
+      this._vozTxFases = this._vozTxFases.filter(f => f.length);
     }
 
     // Tras reconectar, TODO lo enviado que el servidor no llegó a confirmar
@@ -2512,7 +2562,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         const tx = fr[1] | (fr[2] << 8);
         if (seg && seg.vistos.has(tx)) continue;
         if (rc >= 10 && rc <= 19) {
-          ops.push({ tx, fr, nSub: (fr.length > 8 && fr[3] === 0xA5) ? 2 : 1 });
+          ops.push({ tx, fr, esDual: fr.length > 8 && fr[3] === 0xA5, nSub: 1 });
         } else if (rc >= 20 && rc <= 39) {
           const base = rc >= 30 ? rc - 10 : rc;
           const esV2 = fr.length >= 7 && fr[6] === 0x5A;
@@ -2539,7 +2589,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           let ts = 0;
           for (const o of ops) {
             const fr = o.fr;
-            if (o.nSub === 2) {
+            o.nSub = 0; // cuenta REAL de chunks decodificados de este paquete
+            if (o.esDual) {
               const len1 = fr[4] | (fr[5] << 8);
               const off1 = 6;
               if (off1 + len1 <= fr.length && len1 > 0) {
@@ -2548,6 +2599,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   data: fr.subarray(off1, off1 + len1),
                 }));
                 ts += 20000;
+                o.nSub++;
               }
               const off2 = off1 + len1;
               if (off2 + 2 <= fr.length) {
@@ -2558,6 +2610,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                     data: fr.subarray(off2 + 2, off2 + 2 + len2),
                   }));
                   ts += 20000;
+                  o.nSub++;
                 }
               }
             } else {
@@ -2565,6 +2618,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 type: 'key', timestamp: ts, duration: 20000, data: fr.subarray(3),
               }));
               ts += 20000;
+              o.nSub++;
             }
           }
           await dec.flush().catch(() => {});
@@ -3276,6 +3330,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           this._reenviosVoz(m.txs);
           break;
 
+        case 'seg_ack':
+          // El servidor ya recibió completo ese audio (aid): suelto su
+          // semilla — hasta este punto NUNCA se descartó ni una trama
+          this._ackVoz(m.aid);
+          break;
+
         case 'permisos':
           this._canMic = !!m.canMic;
           this._canCam = !!m.canCam;
@@ -3510,6 +3570,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         jitterMs: 15,
         opusDecoder: null,
         opusTimestampUs: 0,
+        // Pareo de sub-tramas Opus de 20 ms -> bloque de 40 ms: la cola lleva
+        // {seq, crudo} por cada chunk decodificado y el mapa junta las 2
+        // mitades del mismo seq antes de alimentar la cola de segmentos
+        _opusSeqQ: [],
+        _opusAcc: new Map(),
       };
 
       const esVoz = source === TrackSource.Microphone;
@@ -3829,12 +3894,42 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 output: (audioData) => {
                   const sRate = audioData.sampleRate || 48000;
                   const pcm = extraerFloat32DeAudioData(audioData);
-                  const seqOut = pipe._pendingOpusSeq;
-                  pipe._pendingOpusSeq = -1;
                   audioData.close();
-                  this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo, seqOut, payload);
+                  const it = (pipe._opusSeqQ && pipe._opusSeqQ.length)
+                    ? pipe._opusSeqQ.shift() : { seq: -1, crudo: null };
+                  if (it.seq < 0) {
+                    this._empujarMuestrasRemotas(pipe, pcm, sRate, fromId, ftipo, -1, it.crudo);
+                    return;
+                  }
+                  // Cada paquete trae 2 sub-tramas de 20 ms con el MISMO seq:
+                  // se juntan en un solo bloque de 40 ms (1 bloque = 1 idx) —
+                  // antes la 2ª mitad entraba suelta con seq=-1 y el orden
+                  // de la cola quedaba revuelto (trozos repetidos/cortados)
+                  let acc = pipe._opusAcc.get(it.seq);
+                  if (!acc) {
+                    acc = { parts: [], crudo: it.crudo, timer: 0 };
+                    acc.timer = setTimeout(() => {
+                      const a = pipe._opusAcc.get(it.seq);
+                      if (!a) return;
+                      pipe._opusAcc.delete(it.seq);
+                      this._empujarMuestrasRemotas(pipe, a.parts[0], sRate, fromId, ftipo, -1, a.crudo);
+                    }, 120);
+                    pipe._opusAcc.set(it.seq, acc);
+                  }
+                  acc.parts.push(pcm);
+                  if (acc.parts.length >= 2) {
+                    clearTimeout(acc.timer);
+                    pipe._opusAcc.delete(it.seq);
+                    const j = new Float32Array(acc.parts[0].length + acc.parts[1].length);
+                    j.set(acc.parts[0]);
+                    j.set(acc.parts[1], acc.parts[0].length);
+                    this._empujarMuestrasRemotas(pipe, j, sRate, fromId, ftipo, it.seq, acc.crudo);
+                  }
                 },
-                error: () => {},
+                error: () => {
+                  // mantener la alineación seq<->salida tras un error del decoder
+                  if (pipe._opusSeqQ && pipe._opusSeqQ.length) pipe._opusSeqQ.shift();
+                },
               });
               pipe.opusDecoder.configure({
                 codec: 'opus',
@@ -3844,13 +3939,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             }
             // Formato v2 dual (2 sub-tramas Opus de 20 ms con secuencia):
             // payload = [rateCode, seqLo, seqHi, 0xA5, len1Lo, len1Hi, ...b1..., len2Lo, len2Hi, ...b2...]
+            if (!pipe._opusSeqQ) { pipe._opusSeqQ = []; pipe._opusAcc = new Map(); }
             if (payload.length > 8 && payload[3] === 0xA5) {
               const seq = payload[1] | (payload[2] << 8);
               const len1 = payload[4] | (payload[5] << 8);
               const off1 = 6;
               if (off1 + len1 <= payload.length && len1 > 0) {
                 const b1 = payload.subarray(off1, off1 + len1);
-                pipe._pendingOpusSeq = seq;
+                pipe._opusSeqQ.push({ seq, crudo: payload });
                 const ch1 = new window.EncodedAudioChunk({
                   type: 'key',
                   timestamp: pipe.opusTimestampUs,
@@ -3865,6 +3961,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 const len2 = payload[off2] | (payload[off2 + 1] << 8);
                 if (off2 + 2 + len2 <= payload.length && len2 > 0) {
                   const b2 = payload.subarray(off2 + 2, off2 + 2 + len2);
+                  pipe._opusSeqQ.push({ seq, crudo: payload });
                   const ch2 = new window.EncodedAudioChunk({
                     type: 'key',
                     timestamp: pipe.opusTimestampUs,
@@ -3878,6 +3975,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             } else {
               // Retrocompatibilidad con trama Opus simple
               const opusBytes = payload.subarray(1);
+              pipe._opusSeqQ.push({ seq: -1, crudo: payload });
               const chunk = new window.EncodedAudioChunk({
                 type: 'key',
                 timestamp: pipe.opusTimestampUs,

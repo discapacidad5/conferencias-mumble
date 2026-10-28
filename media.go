@@ -925,6 +925,7 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					if sgR, listosR := mr.seg.reparar(c.identidad, payload); sgR != nil {
 						difundirTramas(listosR)
 						mr.seg.pedirFaltantes(sgR)
+						mr.seg.ackSegSiCompleto(sgR)
 						if (rc == 0 || len(sgR.faltan) == 0) && sgR.DurMs >= 700 {
 							mr.notificarSegFin(sgR)
 						}
@@ -969,6 +970,7 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				if cerrado != nil {
 					mr.notificarSegFin(cerrado)
 				}
+				mr.seg.ackSegSiCompleto(cerrado)
 				if len(faltan) > 0 {
 					msg, _ := json.Marshal(map[string]any{"t": "falta", "txs": faltan})
 					c.enviarCtrl(append([]byte{1}, msg...))

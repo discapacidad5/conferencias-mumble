@@ -61,16 +61,18 @@ type segmento struct {
 	// aid (4 bits altos de tx: 1..15) y su contador de trama desde 0 (12 bits
 	// bajos: 0..4095). Al soltar el PTT y volver a pisar cambia aid y la
 	// trama vuelve a 0, separando sin ambigüedad el audio viejo del nuevo.
-	aid       uint8               // identificador de audio del emisor (1..15)
-	vistos    map[uint32]struct{} // (tx<<1 | familia) ya archivados
-	porTx     map[uint32][]byte   // (tx<<1 | familia) -> payload retenido hasta estar en secuencia
-	faltan    map[uint16]struct{} // txs detectados como perdidos
-	ultTx     uint16              // tx más alto visto en este aid
-	proxEnvTx uint16              // siguiente tx que toca liberar en secuencia hacia los oyentes
-	tieneTx   bool                // ya llegó al menos una trama numerada
-	ultFalta  int64               // último aviso "falta" enviado al emisor
-	reparaH   int64               // >0: cerrado pero reparable hasta este instante
-	eosVisto  bool                // cerrado por EOS del emisor (no por corte)
+	aid        uint8               // identificador de audio del emisor (1..15)
+	vistos     map[uint32]struct{} // (tx<<1 | familia) ya archivados
+	porTx      map[uint32][]byte   // (tx<<1 | familia) -> payload retenido hasta estar en secuencia
+	faltan     map[uint16]struct{} // txs detectados como perdidos
+	faltaDesde map[uint16]int64    // cuándo se detectó cada faltante (el vivo espera máx ~4 s)
+	ackOk      bool                // ya se confirmó al emisor la recepción completa
+	ultTx      uint16              // tx más alto visto en este aid
+	proxEnvTx  uint16              // siguiente tx que toca liberar en secuencia hacia los oyentes
+	tieneTx    bool                // ya llegó al menos una trama numerada
+	ultFalta   int64               // último aviso "falta" enviado al emisor
+	reparaH    int64               // >0: cerrado pero reparable hasta este instante
+	eosVisto   bool                // cerrado por EOS del emisor (no por corte)
 }
 
 type segStore struct {
@@ -246,6 +248,9 @@ func insertarTrama(sg *segmento, tx uint16, tieneTx bool, cp []byte) {
 func marcarHuecos(sg *segmento, tx uint16) []uint16 {
 	idx := int(idxDeTx(tx))
 	var nuevos []uint16
+	if sg.faltaDesde == nil {
+		sg.faltaDesde = map[uint16]int64{}
+	}
 	if !sg.tieneTx {
 		// Primera trama vista de este audio: debería ser idx == 0. Si llegó
 		// idx > 0, se perdieron las tramas iniciales 0..idx-1.
@@ -253,6 +258,7 @@ func marcarHuecos(sg *segmento, tx uint16) []uint16 {
 			miss := armarTx(sg.aid, uint16(k))
 			if _, ok := sg.faltan[miss]; !ok {
 				sg.faltan[miss] = struct{}{}
+				sg.faltaDesde[miss] = ahora()
 				nuevos = append(nuevos, miss)
 			}
 		}
@@ -267,6 +273,7 @@ func marcarHuecos(sg *segmento, tx uint16) []uint16 {
 		miss := armarTx(sg.aid, uint16((ultIdx+k)&0x0fff))
 		if _, ok := sg.faltan[miss]; !ok {
 			sg.faltan[miss] = struct{}{}
+			sg.faltaDesde[miss] = ahora()
 			nuevos = append(nuevos, miss)
 		}
 	}
@@ -286,7 +293,12 @@ func drenarContiguos(sg *segmento) [][]byte {
 		tx := sg.proxEnvTx
 		idx := int(idxDeTx(tx))
 		if _, falta := sg.faltan[tx]; falta {
-			break // pieza faltante: prohibido avanzar hasta que llegue
+			if sg.faltaDesde == nil || ahora()-sg.faltaDesde[tx] < 4000 {
+				break // pieza faltante reciente: esperarla antes de soltar
+			}
+			// >4 s sin llegar: el vivo avanza con un salto mínimo en vez de
+			// congelarse para siempre — la pieza SIGUE pidiéndose y cuando
+			// llegue completa la grabación del archivo vía reparar()
 		}
 		b0, ok0 := sg.porTx[uint32(tx)<<1|0]
 		b1, ok1 := sg.porTx[uint32(tx)<<1|1]
@@ -366,20 +378,21 @@ func (s *segStore) appendFrame(id, nombre string, grupo int, payload []byte, for
 
 	if sg == nil {
 		sg = &segmento{
-			Seq:       s.proxSeq,
-			Grupo:     grupo,
-			De:        id,
-			Nombre:    nombre,
-			Inicio:    ahora(),
-			Abierto:   true,
-			ultFrame:  ahora(),
-			aid:       aid,
-			vistos:    map[uint32]struct{}{},
-			porTx:     map[uint32][]byte{},
-			faltan:    map[uint16]struct{}{},
-			ultTx:     armarTx(aid, 0),
-			proxEnvTx: armarTx(aid, 0),
-			tieneTx:   false,
+			Seq:        s.proxSeq,
+			Grupo:      grupo,
+			De:         id,
+			Nombre:     nombre,
+			Inicio:     ahora(),
+			Abierto:    true,
+			ultFrame:   ahora(),
+			aid:        aid,
+			vistos:     map[uint32]struct{}{},
+			porTx:      map[uint32][]byte{},
+			faltan:     map[uint16]struct{}{},
+			faltaDesde: map[uint16]int64{},
+			ultTx:      armarTx(aid, 0),
+			proxEnvTx:  armarTx(aid, 0),
+			tieneTx:    false,
 		}
 		s.proxSeq++
 		s.abiertos[id] = sg
@@ -475,7 +488,11 @@ func (s *segStore) reparar(id string, payload []byte) (*segmento, [][]byte) {
 			continue
 		}
 		_, eraFalta := sg.faltan[tx]
-		mismoAudio := aid != 0 && sg.aid == aid && !sg.eosVisto
+		// Toda trama del MISMO aid de este segmento es una pieza real de la
+		// grabación — se acepta aunque el EOS ya haya llegado (el vivo pudo
+		// haber saltado el hueco por el límite de 4 s, pero el archivo debe
+		// quedar completo) o aunque no esté en faltan (cola rezagada).
+		mismoAudio := aid != 0 && sg.aid == aid
 		if !eraFalta && !mismoAudio {
 			continue
 		}
@@ -542,7 +559,7 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 			sg.reparaH = ahora() + 45_000
 			s.recientes = append(s.recientes, sg)
 		} else {
-			sg.frames, sg.vistos, sg.porTx, sg.faltan = nil, nil, nil, nil
+			sg.frames, sg.vistos, sg.porTx, sg.faltan, sg.faltaDesde = nil, nil, nil, nil, nil
 		}
 		return sg
 	}
@@ -566,10 +583,10 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 		for len(s.recientes) > 8 {
 			viejo := s.recientes[0]
 			s.recientes = s.recientes[1:]
-			viejo.frames, viejo.vistos, viejo.porTx, viejo.faltan = nil, nil, nil, nil
+			viejo.frames, viejo.vistos, viejo.porTx, viejo.faltan, viejo.faltaDesde = nil, nil, nil, nil, nil
 		}
 	} else {
-		sg.frames, sg.vistos, sg.porTx, sg.faltan = nil, nil, nil, nil
+		sg.frames, sg.vistos, sg.porTx, sg.faltan, sg.faltaDesde = nil, nil, nil, nil, nil
 	}
 	return sg
 }
@@ -631,7 +648,7 @@ func (s *segStore) tick() {
 					incompletos = append(incompletos, sg)
 				}
 			} else {
-				sg.frames, sg.vistos, sg.porTx, sg.faltan = nil, nil, nil, nil
+				sg.frames, sg.vistos, sg.porTx, sg.faltan, sg.faltaDesde = nil, nil, nil, nil, nil
 			}
 		}
 		s.recientes = vivos
@@ -901,6 +918,28 @@ func (s *segStore) pedirFaltantes(sg *segmento) {
 		return
 	}
 	msg, _ := json.Marshal(map[string]any{"t": "falta", "seq": sg.Seq, "txs": txs})
+	c.enviarCtrl(append([]byte{1}, msg...))
+}
+
+// ackSegSiCompleto confirma al EMISOR que su audio llegó íntegro (su EOS fue
+// visto y ya no falta ninguna trama): solo entonces puede soltar la "semilla"
+// local de retransmisión de ese aid. Hasta ese ACK el cliente conserva todo.
+func (s *segStore) ackSegSiCompleto(sg *segmento) {
+	if sg == nil {
+		return
+	}
+	s.mu.Lock()
+	if sg.ackOk || !sg.eosVisto || len(sg.faltan) > 0 {
+		s.mu.Unlock()
+		return
+	}
+	sg.ackOk = true
+	s.mu.Unlock()
+	c := s.mr.clienteDe(sg.De)
+	if c == nil {
+		return
+	}
+	msg, _ := json.Marshal(map[string]any{"t": "seg_ack", "aid": sg.aid, "seq": sg.Seq})
 	c.enviarCtrl(append([]byte{1}, msg...))
 }
 
