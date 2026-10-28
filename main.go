@@ -1788,12 +1788,13 @@ func barrerParticipantes() {
 					limpiarVotos(e)
 					cambio = true
 				}
-				// Watchdog del piso: si el dueño lleva >6 s sin mandar tramas
-				// ni latidos de PTT (corte de WiFi, pestaña muerta), se libera.
+				// Watchdog del piso: si el dueño lleva >45 s sin mandar tramas
+				// ni latidos de PTT (pestaña muerta), se libera; baches móviles
+				// de 5-30 s conservan su piso y entregan la ráfaga completa.
 				if e.Piso != "" {
 					vivo := false
 					for _, p := range lista {
-						if p.identidad == e.Piso && ahora()-p.ultimoHabl < 6_000 {
+						if p.identidad == e.Piso && ahora()-p.ultimoHabl < 45_000 {
 							vivo = true
 							break
 						}

@@ -103,8 +103,10 @@ type clienteWS struct {
 	esAdmin   bool
 	connSid   string
 	conn      *websocket.Conn
-	ctrlCh    chan []byte // Señalización JSON (prioridad alta, nunca se descarta por audio)
-	audioCh   chan []byte // Voz binaria en tiempo real (máx 10 tramas = 400ms, cero retraso acumulado)
+	ctrlCh    chan []byte   // Señalización JSON (prioridad alta, nunca se descarta por audio)
+	audioCh   chan struct{} // Notificación de voz pendiente en audioCola
+	audioMu   sync.Mutex
+	audioCola [][]byte    // Cola FIFO elástica de voz (jamás descarta ningún paquete)
 	videoCh   chan []byte // Video y Pantalla (drop-oldest si la red celular es lenta)
 	cerrado   chan struct{}
 	once      sync.Once
@@ -160,19 +162,28 @@ func (c *clienteWS) enviarBinarioAudio(b []byte) {
 		return
 	default:
 	}
+	c.audioMu.Lock()
+	c.audioCola = append(c.audioCola, b)
+	c.audioMu.Unlock()
 	select {
-	case c.audioCh <- b:
+	case c.audioCh <- struct{}{}:
 	default:
-		// Cola de 256 paquetes (~10 s) llena por corte severo: descartar el más antiguo
-		select {
-		case <-c.audioCh:
-		default:
-		}
-		select {
-		case c.audioCh <- b:
-		default:
-		}
 	}
+}
+
+func (c *clienteWS) popAudio() ([]byte, bool) {
+	c.audioMu.Lock()
+	defer c.audioMu.Unlock()
+	if len(c.audioCola) == 0 {
+		return nil, false
+	}
+	b := c.audioCola[0]
+	c.audioCola[0] = nil
+	c.audioCola = c.audioCola[1:]
+	if len(c.audioCola) == 0 {
+		c.audioCola = nil
+	}
+	return b, true
 }
 
 func (c *clienteWS) enviarVideoLigero(b []byte) {
@@ -573,8 +584,8 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		esAdmin:   cl.RoomAdmin,
 		connSid:   r.URL.Query().Get("sid"),
 		conn:      conn,
-		ctrlCh:    make(chan []byte, 128),
-		audioCh:   make(chan []byte, 512), // ~20 s de ráfaga celular: jamás descartar tramas cuando llegan juntas tras un bache
+		ctrlCh:    make(chan []byte, 512),
+		audioCh:   make(chan struct{}, 1), // señalizador de audioCola (elástica, cero descarte)
 		videoCh:   make(chan []byte, 2),   // máximo 2 frames en cola: cero latencia acumulada
 		cerrado:   make(chan struct{}),
 		canMic:    canMic,
@@ -652,14 +663,15 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 		defer pingTk.Stop()
 		for {
 			// 1. Drenar primero cualquier paquete de voz o control pendiente
-			select {
-			case <-c.cerrado:
-				return
-			case amsg := <-c.audioCh:
+			if amsg, ok := c.popAudio(); ok {
 				if !escribirAudio(amsg) {
 					return
 				}
 				continue
+			}
+			select {
+			case <-c.cerrado:
+				return
 			case msg := <-c.ctrlCh:
 				if !escribirCtrl(msg) {
 					return
@@ -672,9 +684,15 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			select {
 			case <-c.cerrado:
 				return
-			case amsg := <-c.audioCh:
-				if !escribirAudio(amsg) {
-					return
+			case <-c.audioCh:
+				for {
+					amsg, ok := c.popAudio()
+					if !ok {
+						break
+					}
+					if !escribirAudio(amsg) {
+						return
+					}
 				}
 			case msg := <-c.ctrlCh:
 				if !escribirCtrl(msg) {

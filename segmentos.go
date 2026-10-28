@@ -37,8 +37,8 @@ import (
 
 const (
 	segRetencionMs  = int64(3600_000) // 1 h en el servidor
-	segMaxDurMs     = int64(90_000)   // subdivide intervenciones muy largas
-	segIdleCierreMs = int64(1600)     // sin tramas -> frase cerrada
+	segMaxDurMs     = int64(180_000)  // subdivide intervenciones muy largas (3 min)
+	segIdleCierreMs = int64(45_000)   // baches móviles de hasta 45 s no parten la frase (soltar PTT cierra al instante por EOS/piso_soltar)
 	segMaxBytesSala = int64(64 << 20) // tope defensivo por sala
 	segMagic        = "CSEG"
 	segVer          = 1
