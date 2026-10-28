@@ -577,10 +577,20 @@ func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 // cerrarHablante cierra el segmento abierto de un hablante (al soltar el piso,
 // desconectarse o ser interrumpido).
 func (s *segStore) cerrarHablante(id string, interrumpida bool) *segmento {
+	return s.cerrarHablanteAid(id, 0, interrumpida)
+}
+
+// cerrarHablanteAid cierra el segmento abierto del hablante solo si coincide
+// con aid (o si aid == 0); si el segmento abierto ya pertenece a un aid nuevo
+// (p.ej. aid=2 cuando llega tarde el piso_soltar de aid=1), no cierra aid=2.
+func (s *segStore) cerrarHablanteAid(id string, aid uint8, interrumpida bool) *segmento {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sg := s.abiertos[id]
 	if sg == nil {
+		return nil
+	}
+	if aid != 0 && sg.aid != 0 && sg.aid != aid {
 		return nil
 	}
 	return s.cerrarSeg(sg, interrumpida)

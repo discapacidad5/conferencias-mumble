@@ -1314,7 +1314,12 @@ function aplicarEstado(d, fuente = 'http') {
   // el estado es la red de seguridad: si el servidor me (re)concedió el
   // piso —p.ej. soy La Palabra y el interrumplente soltó— se refleja aquí
   const pisoMio = !!(S.estado && S.estado.piso === S.identidad);
-  if (pisoMio && S.ptt.quiero && !S.ptt.tengo) {
+  if (pisoMio && !S.ptt.quiero && !(S.room && S.room._quieroPiso)) {
+    // Yo ya solté el PTT localmente: prevalece mi estado suelto
+    S.estado.piso = '';
+    S.estado.pisoNombre = '';
+    S.ptt.tengo = false;
+  } else if (pisoMio && S.ptt.quiero && !S.ptt.tengo) {
     S.ptt.tengo = true;
     if (S.audio.pub && S.audio.pub.isMuted) S.audio.pub.unmute().catch(() => {});
   } else if (!pisoMio && S.ptt.tengo) {
@@ -1622,19 +1627,28 @@ async function pttOff(inmediato) {
   S.ptt.quiero = false;
   S.ptt.tengo = false;
   S.ptt._bloqueado = false;
-  ocultarGestosPtt();
-  if (S.room) S.room.soltarPiso();
-  const resta = S.ptt.desde ? Math.max(0, 900 - (Date.now() - S.ptt.desde)) : 0;
   S.ptt.desde = 0;
+  ocultarGestosPtt();
+  // Soltar localmente DE INMEDIATO sin esperar al servidor:
+  // 1) mutear el micrófono ya mismo para no grabar ni una trama más,
+  // 2) apagar mi propio indicador de hablando y limpiar mi piso local,
+  // 3) pintar el botón suelto al instante antes de cualquier await.
+  if (S.ptt.modo !== 'auto' && S.audio.pub && !S.audio.pub.isMuted) {
+    try { S.audio.pub.mute().catch(() => {}); } catch {}
+  }
+  if (S.activo === S.identidad) S.activo = null;
+  if (S.estado && S.estado.piso === S.identidad) {
+    S.estado.piso = '';
+    S.estado.pisoNombre = '';
+  }
+  if (S.room) S.room.soltarPiso();
+  renderControles();
+  renderAsientos();
   if (S.ptt.modo === 'auto') {
     // el micro sigue abierto en local para que el VAD siga escuchando
     S.audio.on = true;
-  } else if (resta > 0) {
-    // pulsación mínima ~1 s: un tap accidental no produce una nota de 0 s
-    // ni tumba el hardware que aún se está abriendo
-    setTimeout(() => { if (!S.ptt.quiero) retirarMic(); }, resta);
   } else {
-    // manual: liberar el hardware del micrófono entre pulsaciones
+    // manual: liberar el hardware del micrófono de inmediato
     await retirarMic();
     S.audio.liberar = true;
   }
@@ -2215,7 +2229,8 @@ function cablearRoom(room) {
     if (S.prefAudio === 'auto' && S.audio.pub) actualizarCalidadAudioEnVivo();
   });
   room.on(LC.RoomEvent.ActiveSpeakersChanged, (speakers) => {
-    const nuevo = speakers.length ? speakers[0].identity : null;
+    const filtrados = speakers.filter(s => s.identity !== S.identidad || S.ptt.quiero);
+    const nuevo = filtrados.length ? filtrados[0].identity : null;
     if (nuevo === S.activo) return;
     S.activo = nuevo;
     // Actualizar el borde verde en caliente SIN reconstruir el DOM de los
@@ -2310,6 +2325,23 @@ function cablearRoom(room) {
       toast(`⚠️ ${(m && m.por) || 'Otra persona'} tomó el piso`, 4500);
     }
     renderControles();
+  });
+  room.on('piso_estado', (m) => {
+    // En cuanto alguien suelta el PTT, el servidor difunde piso_estado a
+    // todos los clientes por el WebSocket de medios: los demás clientes
+    // siguen escuchando el audio que les queda en cola, pero su PTT se
+    // libera de inmediato (pasa a amarillo) para que puedan pisar e
+    // interrumpir sin esperar a que termine de sonar la cola atrasada.
+    if (!S.estado) return;
+    const nuevoPiso = (m && m.piso) || '';
+    if (nuevoPiso === S.identidad && !S.ptt.quiero) {
+      S.estado.piso = '';
+      S.estado.pisoNombre = '';
+    } else {
+      S.estado.piso = nuevoPiso;
+      S.estado.pisoNombre = (m && m.nombre) || '';
+    }
+    renderPttEstados();
   });
   room.on(LC.RoomEvent.Disconnected, (razon) => {
     // no reconectar si salimos a propósito, si este Room ya fue reemplazado

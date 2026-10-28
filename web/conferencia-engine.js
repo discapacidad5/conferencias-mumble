@@ -898,8 +898,18 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let enFrase = false;
       const abrirNuevoAudio = () => {
         if (!this._room) return;
-        this._room._vozAid = (((this._room._vozAid || 0) % 15) + 1);
-        aid = this._room._vozAid;
+        // Si tomarPiso() ya reservó un aid nuevo para esta pulsación de PTT,
+        // usarlo para que piso_tomar, las tramas de audio y piso_soltar
+        // compartan exactamente el mismo aid (p.ej. 1 para el primer PTT y 2
+        // para el segundo). Si aún no había o ya se usó, avanzar al siguiente.
+        if (this._room._pisoAidPend && this._room._pisoAidPend !== aid) {
+          aid = this._room._pisoAidPend;
+          this._room._pisoAidPend = 0;
+        } else {
+          this._room._vozAid = (((this._room._vozAid || 0) % 15) + 1);
+          aid = this._room._vozAid;
+          this._room._pisoAidAct = aid;
+        }
         txIdx = -1;
         enFrase = true;
       };
@@ -1858,17 +1868,27 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     }
 
     // ---------- piso exclusivo (PTT) ----------
+    // Cada pulsación de PTT asigna un identificador de audio nuevo (aid 1..15)
+    // y tanto piso_tomar como piso_soltar llevan ese mismo aid para que el
+    // servidor nunca confunda el soltar del audio 1 con el pisar del audio 2.
     tomarPiso() {
       this._quieroPiso = true;
-      this._enviarJson({ t: 'piso_tomar' }, true);
+      this._vozAid = (((this._vozAid || 0) % 15) + 1);
+      this._pisoAidAct = this._vozAid;
+      this._pisoAidPend = this._vozAid;
+      this._enviarJson({ t: 'piso_tomar', aid: this._pisoAidAct }, true);
       this._latidoPiso();
     }
 
     soltarPiso() {
+      const aidSuelto = this._pisoAidAct || this._vozAid || 0;
+      this._ultAidSuelto = aidSuelto;
+      this._pisoAidPend = 0;
       this._quieroPiso = false;
       this._tengoPiso = false;
+      this._marcarHablandoLocal(false);
       if (this._pisoHoldT) { clearInterval(this._pisoHoldT); this._pisoHoldT = null; }
-      this._enviarJson({ t: 'piso_soltar' }, true);
+      this._enviarJson({ t: 'piso_soltar', aid: aidSuelto }, true);
     }
 
     // Latido mientras se tiene el piso: el watchdog del servidor lo suelta a
@@ -2962,10 +2982,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // levantado, sin candado, VAD callado) se lo declaro SUELTO para
           // que cierre el piso y la frase que pueda conservar de antes
           if (this._quieroPiso) {
-            this._enviarJson({ t: 'piso_tomar' });
+            this._enviarJson({ t: 'piso_tomar', aid: this._pisoAidAct || this._vozAid || 0 });
             setTimeout(() => this._drenarTx(), 350);
           } else {
-            this._enviarJson({ t: 'piso_soltar' });
+            this._enviarJson({ t: 'piso_soltar', aid: this._ultAidSuelto || this._pisoAidAct || 0 });
             this._programarFlushTx();
           }
           // Voz propia en vuelo cuando murió el socket anterior: la reenvío
@@ -3219,8 +3239,23 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
 
         case 'piso_ok':
+          // Si este piso_ok corresponde a un aid que ya solté localmente,
+          // ignorarlo y confirmar que ese aid está suelto
+          if (!this._quieroPiso || (m.aid && m.aid === this._ultAidSuelto && m.aid !== this._pisoAidAct)) {
+            this._tengoPiso = false;
+            this._enviarJson({ t: 'piso_soltar', aid: m.aid || this._ultAidSuelto || 0 }, true);
+            break;
+          }
           this._tengoPiso = true;
-          this.emit('piso', { estado: 'mio' });
+          this.emit('piso', { estado: 'mio', aid: m.aid || this._pisoAidAct || 0 });
+          break;
+
+        case 'piso_estado':
+          // El servidor avisa al instante a todos los clientes quién tiene el
+          // PTT (o "" cuando se liberó): los oyentes siguen escuchando el
+          // audio en cola, pero su PTT queda desbloqueado de inmediato para
+          // que puedan pisar e interrumpir sin esperar a que termine la cola.
+          this.emit('piso_estado', { piso: m.piso || '', nombre: m.nombre || '' });
           break;
 
         case 'piso_ocupado':

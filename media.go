@@ -119,6 +119,8 @@ type clienteWS struct {
 	canPan     bool
 	opusRx     bool
 	pisoSuelto bool  // true tras piso_soltar: tramas rezagadas reparan la frase cerrada, no reabren el piso
+	pisoAid    uint8 // identificador aid (1..15) del PTT actualmente activo
+	aidSuelto  uint8 // último aid cuyo PTT ya fue soltado por el cliente
 	ultimoHabl int64 // unix ms de su última trama de voz aceptada (watchdog de piso)
 	avisPiso   int64 // rate-limit del aviso piso_ocupado
 }
@@ -418,18 +420,31 @@ func (r *mediaRoom) clienteDe(id string) *clienteWS {
 // frase (segmento) que tuviera abierta. Interrumpida marca la nota de voz
 // como cortada por otro hablante.
 func liberarPisoDe(sala, id string, interrumpida bool) {
+	liberarPisoDeAid(sala, id, 0, interrumpida)
+}
+
+func liberarPisoDeAid(sala, id string, aid uint8, interrumpida bool) {
 	mr := media.room(sala)
-	if sg := mr.seg.cerrarHablante(id, interrumpida); sg != nil {
+	if sg := mr.seg.cerrarHablanteAid(id, aid, interrumpida); sg != nil {
 		mr.notificarSegFin(sg)
 		mr.seg.pedirFaltantes(sg)
 	}
 	sv := hub.sala(sala)
 	sv.mu.Lock()
+	g := sv.grupoDe[id]
 	solto, reasignado := sv.soltarPisoEn(sv.estadoDe(id), id)
 	if solto {
 		sv.broadcast(&Evento{Tipo: "piso"})
 	}
 	sv.mu.Unlock()
+	if solto {
+		// Avisar de inmediato por el WebSocket de medios a todos los clientes
+		// del grupo que el PTT quedó libre (o pasó a reasignado), para que
+		// puedan pisar el PTT e interrumpir ya mismo aunque sigan escuchando
+		// en segundo plano el final del audio en cola.
+		pisoMsg, _ := json.Marshal(map[string]any{"t": "piso_estado", "piso": reasignado})
+		mr.enviarCtrlGrupo(g, append([]byte{1}, pisoMsg...))
+	}
 	if reasignado != "" {
 		// el piso volvió solo a quien tiene La Palabra: su cliente lo toma
 		// como concedido y su micro sigue activo sin tocar nada
@@ -466,8 +481,10 @@ func (r *mediaRoom) tomarPisoWS(c *clienteWS) {
 	switch res {
 	case pisoYaMio, pisoTomado:
 		c.ultimoHabl = ahora()
-		msg, _ := json.Marshal(map[string]any{"t": "piso_ok"})
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ok", "aid": c.pisoAid})
 		c.enviarCtrl(append([]byte{1}, msg...))
+		pisoMsg, _ := json.Marshal(map[string]any{"t": "piso_estado", "piso": c.identidad, "nombre": c.nombre})
+		r.enviarCtrlGrupo(c.grupo, append([]byte{1}, pisoMsg...))
 	case pisoRobado:
 		c.ultimoHabl = ahora()
 		if sg := r.seg.cerrarHablante(anterior, true); sg != nil {
@@ -478,8 +495,10 @@ func (r *mediaRoom) tomarPisoWS(c *clienteWS) {
 			msg, _ := json.Marshal(map[string]any{"t": "piso_perdido", "por": c.nombre})
 			oc.enviarCtrl(append([]byte{1}, msg...))
 		}
-		msg, _ := json.Marshal(map[string]any{"t": "piso_ok"})
+		msg, _ := json.Marshal(map[string]any{"t": "piso_ok", "aid": c.pisoAid})
 		c.enviarCtrl(append([]byte{1}, msg...))
+		pisoMsg, _ := json.Marshal(map[string]any{"t": "piso_estado", "piso": c.identidad, "nombre": c.nombre})
+		r.enviarCtrlGrupo(c.grupo, append([]byte{1}, pisoMsg...))
 	case pisoOcupadoR:
 		msg, _ := json.Marshal(map[string]any{"t": "piso_ocupado", "nombre": holderNombre, "faltan": faltan})
 		c.enviarCtrl(append([]byte{1}, msg...))
@@ -737,10 +756,30 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			tipo, _ := m["t"].(string)
 			switch tipo {
 			case "piso_tomar":
+				if af, ok := m["aid"].(float64); ok && af > 0 {
+					c.pisoAid = uint8(int(af) & 0x0f)
+				}
+				c.pisoSuelto = false
 				mr.tomarPisoWS(c)
 
 			case "piso_soltar":
-				liberarPisoDe(sala, c.identidad, false)
+				var aid uint8
+				if af, ok := m["aid"].(float64); ok && af > 0 {
+					aid = uint8(int(af) & 0x0f)
+					c.aidSuelto = aid
+				}
+				// Si el cliente ya pisó un audio nuevo (pisoAid=2) y llega
+				// retrasado el piso_soltar del audio anterior (aid=1), solo
+				// cerrar el segmento de aid=1 SIN soltar el piso de aid=2.
+				if aid != 0 && c.pisoAid != 0 && c.pisoAid != aid {
+					if sg := mr.seg.cerrarHablanteAid(c.identidad, aid, false); sg != nil {
+						mr.notificarSegFin(sg)
+						mr.seg.pedirFaltantes(sg)
+					}
+					continue
+				}
+				c.pisoSuelto = true
+				liberarPisoDeAid(sala, c.identidad, aid, false)
 
 			case "piso_hold":
 				// Latido del PTT sostenido: mantiene vivo el piso aunque el
@@ -882,6 +921,7 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 				// mientras el emisor ya empezó un aid nuevo), se archiva en su
 				// propio segmento y destraba las tramas consecutivas.
 				if len(payload) >= 3 {
+					aidTrama := aidDeTx(txDeTrama(payload))
 					if sgR, listosR := mr.seg.reparar(c.identidad, payload); sgR != nil {
 						difundirTramas(listosR)
 						mr.seg.pedirFaltantes(sgR)
@@ -889,6 +929,18 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 							mr.notificarSegFin(sgR)
 						}
 						continue
+					}
+					// Si esta trama lleva el aid de un PTT que el cliente YA
+					// soltó (aidSuelto), o el cliente ya soltó el PTT y no ha
+					// cambiado a un aid nuevo, jamás volver a tomar ni bloquear
+					// el piso por tramas atrasadas en la red.
+					if (aidTrama != 0 && aidTrama == c.aidSuelto) ||
+						(c.pisoSuelto && (aidTrama == 0 || aidTrama == c.pisoAid)) {
+						continue
+					}
+					if aidTrama != 0 && aidTrama != c.pisoAid {
+						c.pisoAid = aidTrama
+						c.pisoSuelto = false
 					}
 				}
 				// Piso exclusivo: solo pasa la voz del dueño del piso; hablar
