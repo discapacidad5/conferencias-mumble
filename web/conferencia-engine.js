@@ -1732,6 +1732,40 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._pseudoN = 0;
       this._vozHeadSeq = null;
       this._autoPresente = false;
+      // Identidades de OTRAS instancias de esta app en el mismo dispositivo
+      // (BroadcastChannel): sus audios se tratan como propios — sin esto,
+      // tener la sala abierta en PWA + navegador te devolvía tu propia voz
+      this._idsMios = new Map(); // identidad ajena-misma-app -> expira
+      this._bc = null;
+      this._bcT = null;
+    }
+
+    _anunciarIdentidad() {
+      const mi = this.localParticipant.identity;
+      if (!mi) return;
+      if (!this._bc) {
+        try {
+          const sala = (window.S && window.S.sala) || '';
+          this._bc = new BroadcastChannel('conf-misma-instancia-' + sala);
+          this._bc.onmessage = (ev) => {
+            const d = ev.data;
+            if (!d || d.t !== 'soy' || !d.id || d.id === this.localParticipant.identity) return;
+            // la otra copia local es "yo también": su audio no se reproduce
+            // en vivo aquí (15 s de vida, renovada por su heartbeat)
+            this._idsMios.set(d.id, Date.now() + 15000);
+          };
+        } catch { this._bc = null; return; }
+      }
+      try { this._bc.postMessage({ t: 'soy', id: mi }); } catch {}
+      // heartbeat: mientras la instancia viva, las demás la reconocen
+      if (!this._bcT) {
+        this._bcT = setInterval(() => {
+          try {
+            const id = this.localParticipant.identity;
+            if (id) this._bc.postMessage({ t: 'soy', id });
+          } catch {}
+        }, 5000);
+      }
     }
 
     _asegurarRxAudioCtx() {
@@ -2303,19 +2337,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       }
     }
 
-    // ¿Es mío? La identidad exacta y también el prefijo (nombre slug):
-    // si esta sala se abrió dos veces con el mismo nombre (otra pestaña,
-    // PWA + navegador, identidad nueva por mayúsculas/espacios distintos),
-    // la otra instancia trae OTRA identidad — sin el prefijo yo me
-    // escucharía a mí mismo por el altavoz como si fuera otra persona.
+    // ¿Es mío? La identidad exacta, y también las identidades que OTRA
+    // instancia de esta app en el MISMO dispositivo anunció por
+    // BroadcastChannel (pestaña duplicada, PWA + navegador): sin el
+    // filtro la otra copia descargaba y reproducía mi voz y yo me
+    // escuchaba a mí mismo con retraso. Un monitor en OTRO equipo con el
+    // mismo nombre sí se escucha — no comparte el BroadcastChannel.
     _esPropio(de) {
       if (!de) return false;
-      const mi = this.localParticipant.identity;
-      if (de === mi) return true;
-      if (!mi) return false;
-      const a = de.slice(0, de.lastIndexOf('-'));
-      const b = mi.slice(0, mi.lastIndexOf('-'));
-      return a.length > 0 && a === b;
+      if (de === this.localParticipant.identity) return true;
+      const exp = this._idsMios && this._idsMios.get(de);
+      return !!exp && exp > Date.now();
     }
 
     _vozSegNuevo(seq, de, nombre, abierto, meta) {
@@ -3602,6 +3634,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._canCam = !!claims.cam;
         this._canPan = !!claims.pan;
       } catch {}
+      this._anunciarIdentidad();
 
       const sala = (window.S && window.S.sala) || new URLSearchParams(location.search).get('sala') || '';
       const wsBase = (baseUrl || location.origin).replace(/^http/, 'ws').replace(/\/$/, '');
@@ -3763,6 +3796,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._pingTimer = null;
       }
       if (this._feedT) { clearInterval(this._feedT); this._feedT = null; }
+      if (this._bcT) { clearInterval(this._bcT); this._bcT = null; }
+      if (this._bc) { try { this._bc.close(); } catch {} this._bc = null; }
       if (this._pisoHoldT) { clearInterval(this._pisoHoldT); this._pisoHoldT = null; }
       if (this._txFlushT) { clearTimeout(this._txFlushT); this._txFlushT = null; }
       this._txCola.length = 0;
@@ -3827,6 +3862,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
         case 'bienvenida':
           this.localParticipant.identity = m.identidad || this.localParticipant.identity;
+          this._anunciarIdentidad();
           this._canMic = !!m.canMic;
           this._canCam = !!m.canCam;
           this._canPan = !!m.canPan;
