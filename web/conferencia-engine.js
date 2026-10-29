@@ -1717,6 +1717,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._vozOidos = new Set();       // seqs ya escuchadas o saltadas:
                                         // sobrevive reconexiones — una nota
                                         // oída JAMÁS se vuelve a reproducir
+      this._txOidos = new Map();        // de -> Map(tx -> ts): pedazos ya
+                                        // sonados POR HABLANTE — un audio
+                                        // revivido con otro seq se descarta
       this._replayQ = [];               // notas re-escuchadas (prioridad)
       this._replayPendMs = 0;           // ms de nota ya en el reproductor sin sonar
       this._replayPlayedMs = 0;         // ms acumulados de nota ya escuchados
@@ -2268,6 +2271,38 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       }
     }
 
+    // Dedup del lado oyente por PEDAZO de audio: cada trama lleva tx
+    // (aid+índice) único por hablante. Si el servidor revive una frase ya
+    // cerrada como segmento nuevo (reenvío de semilla tras un corte), sus
+    // bloques traen txs que YA sonaron — se saltan sin importar el seq o la
+    // conexión por la que lleguen. Ventana 90 s: cubre la ráfaga de reenvío
+    // tras reconectar y queda por debajo de los ~164 s que tarda el
+    // contador de trama (12 bits) en dar la vuelta, así el segundo paso de
+    // un monólogo larguísimo con los mismos números jamás se descarta.
+    _txYaSono(de, tx) {
+      const m = this._txOidos.get(de);
+      if (!m) return false;
+      const t = m.get(tx);
+      if (t == null) return false;
+      if (performance.now() - t > 90000) { m.delete(tx); return false; }
+      return true;
+    }
+
+    _txMarcarSono(de, tx) {
+      if (!de) return;
+      let m = this._txOidos.get(de);
+      if (!m) { m = new Map(); this._txOidos.set(de, m); }
+      m.set(tx, performance.now());
+      if (m.size > 3000) {
+        const viejo = performance.now() - 90000;
+        for (const [k, t] of m) { if (t < viejo) m.delete(k); }
+        if (m.size > 3000) {
+          let n = 0;
+          for (const k of m.keys()) { m.delete(k); if (++n > 1000) break; }
+        }
+      }
+    }
+
     _vozSegNuevo(seq, de, nombre, abierto, meta) {
       let seg = this._vozSegs.get(seq);
       if (!seg) {
@@ -2626,6 +2661,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             // o un idx intermedio de este audio, pedir la pieza faltante al
             // servidor (reintentando cada 800 ms) y esperar a que encaje.
             if (typeof bl.tx === 'number' && bl.tx >= 0) {
+              // Este pedazo de ESTE hablante ya salió por el altavoz: la
+              // frase revivida con otro seq se drena sin sonar otra vez
+              if (this._txYaSono(seg.de, bl.tx)) { seg.alimentado++; continue; }
               const idx = bl.tx & 0x0fff;
               const espIdx = typeof seg.ultTxEmp === 'number' ? ((seg.ultTxEmp + 1) & 0x0fff) : 0;
               const diff = (idx - espIdx) & 0x0fff;
@@ -2643,7 +2681,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               }
             }
             seg._huecoDesde = 0;
-            if (typeof bl.tx === 'number' && bl.tx >= 0) seg.ultTxEmp = bl.tx & 0x0fff;
+            if (typeof bl.tx === 'number' && bl.tx >= 0) {
+              seg.ultTxEmp = bl.tx & 0x0fff;
+              this._txMarcarSono(seg.de, bl.tx);
+            }
             seg.alimentado++;
             this._vozEmpujar(bl.pcm);
           }
