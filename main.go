@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,21 @@ import (
 
 //go:embed web
 var webFS embed.FS
+
+// assetVer es un hash corto de los assets embebidos: cambia en cada build,
+// así index.html referencia ?v=<hash> y el teléfono descarga el JS/CSS
+// nuevo aunque tenga el anterior en caché — sin depender de Ctrl+F5.
+var assetVer = func() string {
+	h := sha256.New()
+	for _, p := range []string{"web/index.html", "web/app.js", "web/conferencia-engine.js", "web/styles.css", "web/sw.js"} {
+		if b, err := webFS.ReadFile(p); err == nil {
+			h.Write(b)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:8]
+}()
+
+var indexVerRe = regexp.MustCompile(`\?v=[0-9A-Za-z]+`)
 
 var (
 	appSecret  = env("APP_SECRET", "conferencia-secret-0123456789abcdef")
@@ -121,18 +137,37 @@ func main() {
 
 func spaHandler(fsys fs.FS) http.Handler {
 	fh := http.FileServer(http.FS(fsys))
+	// index.html sale con ?v=<hash de los assets>: la URL de cada JS/CSS
+	// cambia cuando cambia su contenido y el navegador no puede servir una
+	// copia vieja — el historial del móvil se actualiza solo al recargar
+	indexVerzado, errIdx := fs.ReadFile(fsys, "index.html")
+	if errIdx == nil {
+		indexVerzado = indexVerRe.ReplaceAll(indexVerzado, []byte("?v="+assetVer))
+	}
+	servirIndex := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexVerzado)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
 		p := strings.TrimPrefix(r.URL.Path, "/")
-		if p == "" {
-			p = "index.html"
-		}
-		if f, err := fsys.Open(p); err == nil {
-			f.Close()
-			w.Header().Set("Cache-Control", "no-cache")
+		if p == "" || p == "index.html" {
+			if errIdx == nil {
+				servirIndex(w)
+				return
+			}
 			fh.ServeHTTP(w, r)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-cache")
+		if f, err := fsys.Open(p); err == nil {
+			f.Close()
+			fh.ServeHTTP(w, r)
+			return
+		}
+		if errIdx == nil {
+			servirIndex(w)
+			return
+		}
 		r2 := r.Clone(r.Context())
 		r2.URL.Path = "/"
 		fh.ServeHTTP(w, r2)
