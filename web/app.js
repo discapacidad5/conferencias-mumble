@@ -4759,7 +4759,16 @@ function adoptarSeqPropia(meta) {
   const el = S._nvEls.get(prov);
   _nvMiaPend = 0;
   if (!el || !el.classList.contains('grabando')) return false;
-  if (S._nvEls.has(meta.seq)) return false; // ya existía con seq real
+  if (S._nvEls.has(meta.seq)) {
+    // La nota real ya existe (la creó la resincronización del manifiesto):
+    // la provisional "grabando" sobra — borrarla o queda fantasma para
+    // siempre marcando ● grabando sin terminar nunca
+    clearInterval(el._recTimer);
+    S._nvEls.delete(prov);
+    const i = S._nvSeqs.indexOf(prov); if (i >= 0) S._nvSeqs.splice(i, 1);
+    el.remove();
+    return false;
+  }
   S._nvEls.delete(prov);
   S._nvEls.set(meta.seq, el);
   const i = S._nvSeqs.indexOf(prov);

@@ -2152,6 +2152,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     programarSoltarPiso(ms) {
       if (this._sueltaProgT) return;
       const aid = this._pisoAidAct || this._vozAid || 0;
+      // Marcar la intención de soltar YA: si no, el timer vería _quieroPiso
+      // aún true y jamás soltaría (el heartbeat seguiría reteniendo el piso
+      // y la frase quedaría abierta hasta el timeout del servidor).
+      // tomarPiso() la vuelve true si repiso antes de que venza.
+      this._quieroPiso = false;
       this._sueltaProgT = setTimeout(() => {
         this._sueltaProgT = null;
         if (this._quieroPiso) return; // repisé antes de soltar: no suelto nada
