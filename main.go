@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"embed"
@@ -99,6 +100,12 @@ func main() {
 	mux.HandleFunc("GET /api/salas/{sala}/info", hInfoSala)
 	mux.HandleFunc("GET /api/salas/{sala}/espera", hEspera)
 	mux.HandleFunc("GET /api/config", hConfig)
+	// Versión del build embebido: el cliente la compara con la suya y se
+	// auto-recarga cuando el servidor cambió — nadie debe limpiar caché
+	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		escribirJSON(w, 200, map[string]string{"v": assetVer})
+	})
 
 	// --- participante (Bearer o query token HMAC) ---
 	mux.HandleFunc("GET /api/salas/{sala}/media", conParticipante(hMediaWS))
@@ -143,6 +150,9 @@ func spaHandler(fsys fs.FS) http.Handler {
 	indexVerzado, errIdx := fs.ReadFile(fsys, "index.html")
 	if errIdx == nil {
 		indexVerzado = indexVerRe.ReplaceAll(indexVerzado, []byte("?v="+assetVer))
+		// también expone al cliente su propia versión de build (para
+		// compararla contra /api/version y auto-recargarse)
+		indexVerzado = bytes.ReplaceAll(indexVerzado, []byte("__CONF_VER__"), []byte(assetVer))
 	}
 	servirIndex := func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

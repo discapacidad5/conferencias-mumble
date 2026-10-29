@@ -1,6 +1,39 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v208 (2.1.8)';
-console.log('[conf] build', CONF_BUILD);
+const CONF_BUILD = 'v209 (2.1.9)';
+const CONF_VER = window.__CONF_VER || 'dev';
+console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
+
+// Auto-actualización: si el servidor tiene un build distinto al que este
+// cliente cargó, se recarga solo — nadie debe limpiar caché ni forzar
+// refresco en el teléfono. Corre al entrar, cada minuto y al volver a
+// la pestaña/app.
+let _verChkOcupado = false;
+async function comprobarVersion() {
+  if (CONF_VER === 'dev' || S._recargando || _verChkOcupado) return;
+  _verChkOcupado = true;
+  try {
+    const r = await fetch('/api/version', { cache: 'no-store' });
+    if (r.ok) {
+      const d = await r.json().catch(() => ({}));
+      if (d.v && d.v !== CONF_VER) {
+        S._recargando = true;
+        toast('Hay una versión nueva — actualizando…');
+        // renovar también el service worker antes del reload
+        try {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg) await reg.update();
+        } catch {}
+        setTimeout(() => location.reload(), 1200);
+      }
+    }
+  } catch {}
+  _verChkOcupado = false;
+}
+setInterval(comprobarVersion, 60000);
+setTimeout(comprobarVersion, 4000); // también al arrancar, antes de entrar
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) comprobarVersion();
+});
 const LC = window.LivekitClient;
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
