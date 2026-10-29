@@ -5278,20 +5278,14 @@ function detenerNota(seq) {
   else marcarNotaVoz(seq, 'oido');
 }
 
-// Al terminar de re-escuchar una nota, sigue con la siguiente cerrada del historial
+// Al terminar de re-escuchar una nota queda marcada como oída y punto:
+// el historial JAMÁS encadena la siguiente nota solo — cada audio suena
+// únicamente cuando el usuario le pisa ▶ (la cadena automática podía
+// agarrar un segmento recién cerrado y sonarlo entero de nuevo)
 function reproducirSiguienteNota(seq) {
   marcarNotaVoz(seq, 'oido');
   if (S._nvPausas) S._nvPausas.delete(seq);
-  if (S._nvRepro !== seq) return;
-  for (const s of S._nvSeqs) {
-    if (s <= seq) continue;
-    const el = S._nvEls.get(s);
-    if (el && !el.classList.contains('grabando')) {
-      reproducirNota(s);
-      return;
-    }
-  }
-  S._nvRepro = 0;
+  if (S._nvRepro === seq) S._nvRepro = 0;
 }
 
 // El botón del chat es PTT cuando el campo está vacío (mismos permisos y
