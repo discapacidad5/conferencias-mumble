@@ -440,7 +440,7 @@ class VozRxProcessor extends AudioWorkletProcessor {
     this.fadeInLen = Math.ceil(rate * 0.005);
     this.readRate = 1.0;
     this.velMax = 1.0;
-    this.targetSamples = Math.ceil(rate * 0.3); // ~300 ms de colchón al arrancar:
+    this.targetSamples = Math.ceil(rate * 0.4); // ~400 ms de colchón al arrancar:
                                                 // con menos, cualquier jitter de red
                                                 // paraba/reanudaba el reproductor (micro-cortes)
     this.capMs = 28;
@@ -546,10 +546,10 @@ class VozRxProcessor extends AudioWorkletProcessor {
         if (Math.abs(this.lastOut) < 0.0001) this.lastOut = 0;
         out[i] = this.lastOut;
         this.underrunSamples++;
-        // ~400 ms de hueco tolerado con cola amortiguada antes de parar:
+        // ~500 ms de hueco tolerado con cola amortiguada antes de parar:
         // el tope viejo de 80 ms detenía y reanudaba el reproductor en
         // cada bache de red — cada ciclo sonaba como un micro-corte
-        if (this.eosPending || this.underrunSamples > this.rate * 0.4) {
+        if (this.eosPending || this.underrunSamples > this.rate * 0.5) {
           this.playing = false;
           this.eosPending = false;
           this.waitSamples = 0;
@@ -990,13 +990,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                   // ante micro-cortes — sale en ráfaga al volver el socket
                   emitirOpusPkt(tag, par);
                 } else {
+                  // Sin timeout: la pareja espera lo que tarde su gemelo.
+                  // Emitir la mitad a los 90 ms generaba paquetes de 20 ms
+                  // que pasaban el ACK completos pero traían media trama —
+                  // un hueco de 20 ms GRABADO en la nota (la "basurita" que
+                  // sonaba igual en vivo y en el historial), y el gemelo
+                  // tardío se descartaba después como duplicado. Si el
+                  // encoder perdió el gemelo de verdad, el sobrante sale
+                  // rellenado con el EOS.
                   opusPares.set(tag, [bytes]);
-                  // Si el gemelo no llega en 90 ms (pérdida interna del
-                  // encoder), emitir la mitad sola: mejor 20 ms que nada
-                  setTimeout(() => {
-                    const p = opusPares.get(tag);
-                    if (p) { opusPares.delete(tag); emitirOpusPkt(tag, p); }
-                  }, 90);
                 }
               },
               error: () => {
@@ -1051,6 +1053,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const enviarMarcadorEOS = () => {
         if (!this._room || !enFrase) return;
         enFrase = false;
+        // Vacía las medias-tramas que quedaron esperando su gemelo: salen
+        // como paquete de 20 ms ANTES del EOS, en el mismo trozo — el
+        // servidor las archiva en su hueco y nada queda pendiente
+        emitirOpusParesRestantes();
         const s = txSeq & 0xffff;
         const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
         // El EOS cierra el trozo en armado y sale en su propio POST al
@@ -2440,7 +2446,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           pipe.worklet = wn;
           try {
             wn.port.postMessage({ t: 'cap', ms: 28000 });
-            wn.port.postMessage({ t: 'target', ms: 300 });
+            wn.port.postMessage({ t: 'target', ms: 400 });
           } catch {}
           if (pipe.proc) { try { pipe.proc.disconnect(); } catch {} pipe.proc = null; }
           return true;
@@ -3167,7 +3173,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           oi += o.nSub;
           if (!partes.length) continue;
           const total = partes.reduce((a, p) => a + p.length, 0);
-          const pcm = new Float32Array(total);
+          // Un paquete dual que solo trajo una sub-trama (20 ms) se rellena
+          // a 40 ms: si entra corto, toda la frase siguiente queda corrida
+          const pcm = new Float32Array(o.esDual ? Math.max(1920, total) : total);
           let w = 0;
           for (const p of partes) { pcm.set(p, w); w += p.length; }
           out.push({ tx: o.tx, pcm: remuestrearA(rsDe(48000), pcm, 48000, ctxRate) });
@@ -4503,7 +4511,18 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                       const a = pipe._opusAcc.get(it.seq);
                       if (!a) return;
                       pipe._opusAcc.delete(it.seq);
-                      this._empujarMuestrasRemotas(pipe, a.parts[0], sRate, fromId, ftipo, -1, a.crudo);
+                      // Media trama real (el emisor perdió el gemelo):
+                      // rellenar a 40 ms conservando el seq — antes se
+                      // encolaba suelta con seq=-1, fuera de orden, y con
+                      // 20 ms menos desplazaba el resto de la frase
+                      const solo = a.parts[0];
+                      const pad = new Float32Array(Math.max(1920, solo.length));
+                      pad.set(solo);
+                      const fade0 = Math.max(0, solo.length - 240);
+                      for (let k = fade0; k < solo.length; k++) {
+                        pad[k] *= (solo.length - k) / 240;
+                      }
+                      this._empujarMuestrasRemotas(pipe, pad, sRate, fromId, ftipo, it.seq, a.crudo);
                     }, 120);
                     pipe._opusAcc.set(it.seq, acc);
                   }
