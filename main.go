@@ -386,7 +386,7 @@ func hEspera(w http.ResponseWriter, r *http.Request) {
 		sv.lobby[id] = it
 	}
 	admitido := sv.lobbyOk[id]
-	rechazado := sv.lobbyNo[id] > 0
+	rechazado := sv.lobbyNo[id] > 0 || sv.expulsados[id] > ahora()
 	if sl := store.BuscarSala(r.PathValue("sala")); sl != nil && sl.Acceso == "admin" && !admitido && !rechazado && sv.staffPresente() {
 		sv.lobbyOk[id] = true
 		delete(sv.lobby, id)
@@ -431,6 +431,22 @@ func hObtenerAcceso(w http.ResponseWriter, r *http.Request) {
 		sv.mu.Unlock()
 		escribirJSON(w, 403, map[string]string{
 			"error": "estás baneado hasta " + time.UnixMilli(hasta).Format("15:04:05"),
+		})
+		return
+	}
+	// Expulsado de esta reunión: ni con la identidad vieja ni con un nombre
+	// igual puede reingresar hasta que pase la marca (24 h) o el moderador
+	// lo vuelva a invitar
+	expulsado := func() bool {
+		if req.Identidad != "" && sv.expulsados[req.Identidad] > ahora() {
+			return true
+		}
+		return sv.expulsados["n:"+slug(req.Nombre)] > ahora()
+	}
+	if expulsado() {
+		sv.mu.Unlock()
+		escribirJSON(w, 403, map[string]string{
+			"error": "un moderador te expulsó de esta reunión",
 		})
 		return
 	}
@@ -1044,6 +1060,18 @@ func hModerar(w http.ResponseWriter, r *http.Request, g *Claims) {
 		delete(sv.pantallaBloq, obj)
 		delete(sv.docBloq, obj)
 		expulsarID = obj
+		// Marcar la expulsión ANTES de borrar nombres/grupoDe: el cliente
+		// reconecta solo al cerrarse el socket y sin la marca obtenía una
+		// identidad nueva y volvía a entrar como participante fresco.
+		// Se recuerda por identidad y por nombre (24 h): cubre reingreso
+		// aunque pida otro nombre de usuario o identidad distinta.
+		if obj != "" {
+			hasta := ahora() + 24*3600*1000
+			sv.expulsados[obj] = hasta
+			if nom := sv.nombres[obj]; nom != "" {
+				sv.expulsados["n:"+slug(nom)] = hasta
+			}
+		}
 		delete(sv.grupoDe, obj)
 		delete(sv.nombres, obj)
 	}

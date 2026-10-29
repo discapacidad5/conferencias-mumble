@@ -92,6 +92,7 @@ type salaViva struct {
 	modsFijos        map[string]string // identidad -> nombre (delegados, persistidos)
 	admins           map[string]bool   // identidades con RoomAdmin (para la corona 👑)
 	baneados         map[string]int64  // slug(nombre) o identidad -> expira unix ms
+	expulsados       map[string]int64  // identidad o "n:slug" expulsada de la sala -> expira unix ms
 	invitaciones     map[string]string // identidad -> "sentar" | "palabra"
 	tiempoInvitacion map[string]int
 	micBloq          map[string]bool     // micro bloqueado por moderación
@@ -150,6 +151,7 @@ func (h *Hub) sala(nombre string) *salaViva {
 			grupos:           map[int]*GrupoInfo{},
 			plan:             map[int]map[string]bool{},
 			baneados:         map[string]int64{},
+			expulsados:       map[string]int64{},
 			invitaciones:     map[string]string{},
 			tiempoInvitacion: map[string]int{},
 			micBloq:          map[string]bool{},
