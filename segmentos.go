@@ -929,6 +929,7 @@ func parsearArchivoSeg(b []byte) (*segmento, [][]byte, bool) {
 func (s *segStore) notificarSegIni(sg *segmento) {
 	msg, _ := json.Marshal(map[string]any{
 		"t": "seg_ini", "seq": sg.Seq, "de": sg.De, "nombre": sg.Nombre, "g": sg.Grupo,
+		"inicio": sg.Inicio,
 	})
 	s.mr.enviarCtrlGrupo(sg.Grupo, append([]byte{1}, msg...))
 }
@@ -937,6 +938,7 @@ func (r *mediaRoom) notificarSegFin(sg *segmento) {
 	msg, _ := json.Marshal(map[string]any{
 		"t": "seg_fin", "seq": sg.Seq, "de": sg.De, "nombre": sg.Nombre, "g": sg.Grupo,
 		"durMs": sg.DurMs, "bytes": sg.Bytes, "interrumpida": sg.Cortado,
+		"inicio": sg.Inicio,
 	})
 	r.enviarCtrlGrupo(sg.Grupo, append([]byte{1}, msg...))
 }
@@ -1012,6 +1014,7 @@ func (s *segStore) notificarChunk(sg *segmento) {
 	sg.ultChunkNotif = ahora()
 	seq, de, aid, g := sg.Seq, sg.De, int(sg.aid), sg.Grupo
 	nombre := sg.Nombre
+	ini := sg.Inicio
 	ult := -1
 	if sg.tieneTx {
 		ult = int(idxDeTx(sg.ultTx))
@@ -1020,7 +1023,7 @@ func (s *segStore) notificarChunk(sg *segmento) {
 	s.mu.Unlock()
 	msg, _ := json.Marshal(map[string]any{
 		"t": "chunk", "seq": seq, "de": de, "aid": aid, "ult": ult, "cerr": cerr,
-		"nombre": nombre,
+		"nombre": nombre, "inicio": ini,
 	})
 	s.mr.enviarCtrlGrupo(g, append([]byte{1}, msg...))
 }

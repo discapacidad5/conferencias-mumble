@@ -2624,12 +2624,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // jamás se descarta nada) y _feedVoz la va pasando al altavoz a 1.0x:
       // esa misma ráfaga que suena a tiempo real ES el buffer natural que
       // cubre los siguientes baches.
+      // REPRODUCTOR ÚNICO: mientras suena una nota del historial el audio
+      // en vivo NO se alimenta — sus bloques esperan en seg.bloques y se
+      // reanudan al terminar la nota. Antes ambos alimentaban el mismo
+      // pipe en el mismo tick y se oían las dos voces mezcladas.
+      const replayActivo = !!(this._replayQ.length || this._replayProg.length ||
+        this._replayPendMs > 60);
       let seg = null;
-      for (const s of this._vozOrden) {
-        // la frase propia se archiva en el chat pero jamás suena en vivo
-        if (s.saltado || s.reproducido || s.propio) continue;
-        seg = s;
-        break;
+      if (!replayActivo) {
+        for (const s of this._vozOrden) {
+          // la frase propia se archiva en el chat pero jamás suena en vivo
+          if (s.saltado || s.reproducido || s.propio) continue;
+          seg = s;
+          break;
+        }
       }
       if (seg) {
         if (seg.bajando) {
@@ -3925,7 +3933,13 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           const de = m.de || '';
           if (!seq || de === this.localParticipant.identity) break;
           let seg = this._vozSegs.get(seq);
-          if (!seg) seg = this._vozSegNuevo(seq, de, m.nombre || de, !m.cerr, m);
+          if (!seg) {
+            // La frase se conoció por 'chunk' (su seg_ini se perdió en la
+            // red): la nota debe aparecer ya en el chat, no recién en el
+            // seg_fin — por eso "los audios aparecían al rato"
+            seg = this._vozSegNuevo(seq, de, m.nombre || de, !m.cerr, m);
+            this.emit(m.cerr ? 'seg_fin' : 'seg_ini', this._segMeta(seg));
+          }
           if (m.cerr) { seg.completo = true; this._programarBajadaArchivo(seg); }
           if (m.nombre) seg.nombre = m.nombre;
           this._bajarTramos(seg);
