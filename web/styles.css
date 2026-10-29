@@ -390,6 +390,19 @@ label.check input { width: auto; }
 .msg.nota-voz.grabando { border-left-color: var(--peligro); }
 .nv-relleno.rec { width: 100% !important; background: var(--peligro); animation: pulsa 1s infinite; }
 
+/* historial viejo: barra de acceso + separadores de fecha */
+.hist-bar {
+  display: flex; gap: .4rem; align-items: center; justify-content: center;
+  padding: .5rem .3rem; border-bottom: 1px dashed var(--borde); margin-bottom: .3rem;
+  position: sticky; top: 0; background: var(--bg2); z-index: 5;
+}
+.hist-bar input[type="date"] {
+  background: var(--bg3); color: var(--texto); border: 1px solid var(--borde);
+  border-radius: 8px; padding: .3rem .4rem; font-size: .8rem; max-width: 9.5rem;
+  color-scheme: dark;
+}
+.msg.hist-sep { background: none; text-align: center; padding: .15rem; border-left: none; }
+
 #barra-controles {
   grid-column: 1 / -1; background: var(--bg2); border-top: 1px solid var(--borde);
   display: flex; gap: .6rem; justify-content: center; align-items: flex-start; padding: .6rem;

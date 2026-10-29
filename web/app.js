@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v215 (2.1.10)';
+const CONF_BUILD = 'v216 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -4860,7 +4860,13 @@ function agregarChat(quien, texto, propio) {
   ponerOpcionesMsg(el);
   const lista = $('#chat-lista');
   lista.appendChild(el);
-  while (lista.children.length > 200) lista.firstChild.remove();
+  while (lista.children.length > 200) {
+    const prim = lista.firstChild;
+    // la barra de historial no se elimina: se poda el mensaje siguiente
+    if (prim && prim.id === 'hist-bar' && prim.nextElementSibling)
+      prim.nextElementSibling.remove();
+    else prim.remove();
+  }
   lista.scrollTop = lista.scrollHeight;
 }
 
@@ -5110,14 +5116,17 @@ function agregarNotaVoz(meta) {
   ponerOpcionesMsg(el);
   insertarNotaOrdenada(lista, el, meta.seq, meta.inicio || Date.now());
   while (lista.children.length > 200) {
-    const viejo = lista.firstChild;
-    if (viejo && viejo.classList.contains('nota-voz')) {
+    let viejo = lista.firstChild;
+    // la barra de historial no se elimina: se poda el mensaje siguiente
+    if (viejo && viejo.id === 'hist-bar') viejo = viejo.nextElementSibling;
+    if (!viejo) break;
+    if (viejo.classList.contains('nota-voz')) {
       const seq = +(viejo.querySelector('.nv-play')?.dataset.seq || 0);
       if (seq) { S._nvEls.delete(seq); const i = S._nvSeqs.indexOf(seq); if (i >= 0) S._nvSeqs.splice(i, 1); }
     }
     viejo.remove();
   }
-  lista.scrollTop = lista.scrollHeight;
+  if (!S._histCargando) lista.scrollTop = lista.scrollHeight;
   S._nvEls.set(meta.seq, el);
   S._nvSeqs.push(meta.seq);
   S._nvSeqs.sort((a, b) => a - b);
@@ -5508,10 +5517,94 @@ async function idbVaciar() {
   });
 }
 
-// Al entrar a la sala: el historial de notas vuelve a verse en el chat
+// Al entrar a la sala: solo vuelve lo de ESTA conversación (última hora).
+// Todo lo anterior queda detrás del botón "Ver historial anterior" — el
+// chat no amanece inundado de reuniones viejas.
 async function precargarNotasVoz() {
   const recs = await idbListarSala();
-  for (const r of recs.slice(-80)) agregarNotaVoz(r);
+  const corte = Date.now() - 3600000;
+  const nuevas = recs.filter(r => (r.inicio || 0) >= corte && !nvBorrados().has(r.seq));
+  for (const r of nuevas.slice(-80)) agregarNotaVoz(r);
+  if (recs.length > nuevas.length) armarHistorialBar();
+}
+
+// Barra fija arriba del chat: "Ver historial anterior" carga la tanda
+// previa de 40 audios, y el selector de fecha salta directo a un día
+// concreto (p.ej. "lo de ayer"). Cada tanda lleva su separador de fecha.
+function armarHistorialBar() {
+  const lista = $('#chat-lista');
+  if (!lista || $('#hist-bar')) return;
+  const bar = document.createElement('div');
+  bar.id = 'hist-bar';
+  bar.className = 'hist-bar';
+  bar.innerHTML =
+    `<button class="btn mini" id="hist-mas">🗂️ Ver historial anterior</button>` +
+    `<input type="date" id="hist-fecha" title="Ir a un día">` +
+    `<button class="btn mini" id="hist-ir">Ir</button>`;
+  lista.prepend(bar);
+  bar.querySelector('#hist-mas').onclick = () => cargarHistorialMas();
+  bar.querySelector('#hist-ir').onclick = () =>
+    cargarHistorialFecha(bar.querySelector('#hist-fecha').value);
+}
+
+// Inserta un separador "— 📅 lunes, 12 de enero —" en su posición temporal
+function insertarSepHistorial(ordMs) {
+  const lista = $('#chat-lista');
+  const sep = document.createElement('div');
+  sep.className = 'msg hist-sep';
+  sep.dataset.ord = ordMs;
+  sep.innerHTML = `<div class="quien muted">— 📅 ${new Date(ordMs).toLocaleDateString([],
+    { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} —</div>`;
+  insertarNotaOrdenada(lista, sep, 0, ordMs);
+  return sep;
+}
+
+// "Ver historial anterior": la tanda de 40 audios más viejos que lo ya
+// visible, con su separador de fecha — el usuario tira del hilo hacia atrás
+async function cargarHistorialMas() {
+  const lista = $('#chat-lista');
+  if (!lista) return;
+  let minOrd = Infinity;
+  for (const ch of lista.children) {
+    const o = +(ch.dataset?.ord || 0);
+    if (o && o < minOrd) minOrd = o;
+  }
+  const recs = await idbListarSala();
+  const pend = recs.filter(r =>
+    (r.inicio || 0) < minOrd - 1 && !S._nvEls.has(r.seq) && !nvBorrados().has(r.seq));
+  const lote = pend.slice(-40);
+  if (!lote.length) { toast('No hay más historial guardado'); return; }
+  S._histCargando = true;
+  try {
+    const sep = insertarSepHistorial(lote[0].inicio || 1);
+    for (const r of lote) agregarNotaVoz(r);
+    sep.scrollIntoView({ block: 'start' });
+  } finally { S._histCargando = false; }
+}
+
+// "Ir" a un día: trae todos los audios de esa fecha guardados en el equipo
+async function cargarHistorialFecha(fecha) {
+  if (!fecha) { toast('Elige una fecha para buscar'); return; }
+  const d0 = new Date(fecha + 'T00:00:00').getTime();
+  if (isNaN(d0)) return;
+  const d1 = d0 + 86400000;
+  const recs = await idbListarSala();
+  const del = recs.filter(r =>
+    (r.inicio || 0) >= d0 && (r.inicio || 0) < d1 && !nvBorrados().has(r.seq));
+  if (!del.length) { toast('No hay audios guardados ese día'); return; }
+  const lista = $('#chat-lista');
+  S._histCargando = true;
+  try {
+    let sep = null;
+    for (const r of del) {
+      if (S._nvEls.has(r.seq)) continue;
+      if (!sep) sep = insertarSepHistorial(d0);
+      agregarNotaVoz(r);
+    }
+    (sep || lista.querySelector(`.msg[data-ord="${d0 - 1}"]`) ||
+      $('#hist-bar').nextElementSibling || lista.firstChild)
+      .scrollIntoView({ block: 'start' });
+  } finally { S._histCargando = false; }
 }
 
 // ---------- descarga de fondo: todo audio cerrado queda en el teléfono ----------
