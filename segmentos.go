@@ -24,7 +24,9 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1060,9 +1062,29 @@ func (s *segStore) tramosDesde(sg *segmento, desde uint16) ([][]byte, bool) {
 func (r *mediaRoom) enviarCtrlGrupo(grupo int, raw []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	var dest []string
 	for _, c := range r.clientes {
 		if c.grupo == grupo {
 			c.enviarCtrl(raw)
+			dest = append(dest, c.identidad)
+		}
+	}
+	// Diagnóstico de notas/historial: a qué grupo va cada evento de
+	// segmento y qué clientes (con su grupo) lo reciben — si un oyente
+	// falta aquí con otro grupo, el filtro lo está excluyendo del historial
+	if len(raw) > 1 && raw[0] == 1 {
+		var head struct {
+			T   string `json:"t"`
+			Seq uint32 `json:"seq"`
+		}
+		if json.Unmarshal(raw[1:], &head) == nil &&
+			(head.T == "seg_ini" || head.T == "seg_fin") {
+			todos := make([]string, 0, len(r.clientes))
+			for _, c := range r.clientes {
+				todos = append(todos, fmt.Sprintf("%s(g%d)", c.identidad, c.grupo))
+			}
+			log.Printf("[seg] %s seq=%d g=%d → %d/%d destino: %v | conectados: %v",
+				head.T, head.Seq, grupo, len(dest), len(r.clientes), dest, todos)
 		}
 	}
 }
