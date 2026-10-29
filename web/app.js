@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v224 (2.1.10)';
+const CONF_BUILD = 'v225 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -2642,6 +2642,15 @@ function cablearRoom(room) {
     if (razon === undefined) razon = room.disconnectReason;
     if (LC.DisconnectReason && razon === LC.DisconnectReason.DUPLICATE_IDENTITY) {
       mostrarSesionDuplicada();
+      return;
+    }
+    // Expulsado por un moderador (cierre 4003 del servidor): salir de la
+    // sala por completo — la reconexión automática volvía a pedir acceso
+    // y reingresaba invisible, por eso "la expulsión no expulsaba"
+    if (LC.DisconnectReason && razon === LC.DisconnectReason.PARTICIPANT_REMOVED) {
+      toast('Un moderador te sacó de la reunión', 5000);
+      S.saliendo = true;
+      setTimeout(() => salir(), 1200);
       return;
     }
     reconectar();
