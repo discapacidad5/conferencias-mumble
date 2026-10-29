@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v220 (2.1.10)';
+const CONF_BUILD = 'v221 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -1716,10 +1716,20 @@ async function pttOn() {
   try {
     if (!S.audio.pub && !pisoAjeno) {
       const track = await construirMicTrack();
-      S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+      // Soltó el PTT mientras getUserMedia abría el micro: no publicarlo —
+      // si se publica ya nadie lo retira y queda clavado impidiendo usar
+      // el micrófono en otra app
+      if (!S.ptt.quiero) { try { track.stop(); } catch {} }
+      else S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
     }
-    if (S.audio.pub) await S.audio.pub.unmute();
-    S.audio.on = true;
+    if (S.audio.pub && !S.ptt.quiero) {
+      // soltó durante la publicación: retiro ya
+      await retirarMic();
+      S.audio.liberar = true;
+    } else if (S.audio.pub) {
+      await S.audio.pub.unmute();
+      S.audio.on = true;
+    }
   } catch (e) {
     S.ptt.quiero = false;
     if (S.room && S.room.soltarPiso) S.room.soltarPiso();
@@ -2148,10 +2158,16 @@ async function chequearGrupo() {
         if (modoPtt() && S.ptt.quiero) {
           if (!S.audio.pub) {
             const track = await construirMicTrack();
-            S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+            if (S.ptt.quiero) {
+              S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+            } else {
+              try { track.stop(); } catch {}
+            }
           }
-          S.room.tomarPiso();
-          S.audio.on = true;
+          if (S.ptt.quiero) {
+            S.room.tomarPiso();
+            S.audio.on = true;
+          }
         }
       } catch {}
     }
@@ -2531,7 +2547,15 @@ function cablearRoom(room) {
         (async () => {
           try {
             const track = await construirMicTrack();
+            // Soltó mientras el micro abría: detener el hardware y no
+            // publicar — el retiro de pttOff ya corrió con pub aún null
+            if (!S.ptt.quiero) { try { track.stop(); } catch {} return; }
             const pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+            if (!S.ptt.quiero) {
+              try { await S.room.localParticipant.unpublishTrack(pub.track).catch(() => {}); } catch {}
+              try { pub.track.stop(); } catch {}
+              return;
+            }
             S.audio.pub = pub;
             await pub.unmute();
             S.audio.on = true;
@@ -2722,10 +2746,16 @@ async function reconectar() {
           if (modoPtt() && S.ptt.quiero) {
             if (!S.audio.pub) {
               const track = await construirMicTrack();
-              S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+              if (S.ptt.quiero) {
+                S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+              } else {
+                try { track.stop(); } catch {}
+              }
             }
-            S.room.tomarPiso();
-            S.audio.on = true;
+            if (S.ptt.quiero) {
+              S.room.tomarPiso();
+              S.audio.on = true;
+            }
           }
         } catch {}
       }
