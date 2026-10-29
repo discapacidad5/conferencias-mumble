@@ -1693,6 +1693,8 @@ function wirePttButton(el, gate) {
     e.stopPropagation();
     // si quedó bloqueado, un toque lo desbloquea y suelta
     if (S.ptt._bloqueado) { S.ptt._bloqueado = false; pttOff(); return; }
+    // Volvió a pisar dentro de la ventana de soltado: cancela el relevo
+    if (S.ptt._soltarT) { clearTimeout(S.ptt._soltarT); S.ptt._soltarT = null; }
     pttOn();
     // Sin setPointerCapture a propósito: el seguimiento ya es global en
     // window, y capturar contra un elemento de asiento (que renderAsientos
@@ -1778,11 +1780,25 @@ function wireGestoGlobal() {
     // cuenta cuando ya no queda ningún dedo apoyado en la pantalla
     if (g && !esMio(e)) return;
     if (g && e.type && e.type.startsWith('touch') && e.touches && e.touches.length > 0) return;
+    const cancelado = e.type === 'pointercancel' || e.type === 'touchcancel';
     if (g) e.stopPropagation();
     ocultarGestosPtt();
     if (g && g.el.style.transform) g.el.style.transform = ''; // soltar el arrastre
     S.ptt._gesto = null;
     if (!g || !S.ptt.quiero) return;
+    if (cancelado) {
+      // pointercancel/touchcancel NO es levantar el dedo: el navegador se
+      // robó el gesto (scroll, gesto del sistema) y quizá ya no llegue un
+      // "up" real. Soltar aquí cortaba la frase en seco por un micro-
+      // movimiento. En su lugar el PTT queda mantenido como si fuera el
+      // candado: el próximo toque al botón lo suelta limpio.
+      if (g.lock || g.auto || S.ptt.modo === 'lock' || S.ptt._bloqueado) return;
+      S.ptt._bloqueado = true;
+      S.ptt._tragarClick = true;
+      toast('📌 PTT mantenido — toca el botón para soltar');
+      renderControles();
+      return;
+    }
     if (g.lock) {
       // candado: sigue hablando sin mantener el dedo; un toque suelta.
       // El click que el navegador dispara tras este pointerup hay que
@@ -1802,7 +1818,16 @@ function wireGestoGlobal() {
       cambiarModoPtt(aAuto ? 'auto' : 'hold');
       return;
     }
-    if (S.ptt.modo !== 'lock' && !S.ptt._bloqueado) pttOff();
+    if (S.ptt.modo !== 'lock' && !S.ptt._bloqueado) {
+      // Levantar el dedo real: un respiro antes de soltar — un temblor o
+      // micro-levantada de 50-150 ms no debe cortar la frase en seco.
+      // Si en esa ventana vuelve a pisar, el nuevo gesto lo cancela.
+      if (S.ptt._soltarT) clearTimeout(S.ptt._soltarT);
+      S.ptt._soltarT = setTimeout(() => {
+        S.ptt._soltarT = null;
+        if (S.ptt.quiero && !S.ptt._bloqueado) pttOff();
+      }, 160);
+    }
   };
   window.addEventListener('pointerup', fin);
   window.addEventListener('pointercancel', fin);
@@ -2333,6 +2358,9 @@ function cablearRoom(room) {
   room.on('seg_replay_fin', (seq) => reproducirSiguienteNota(seq));
   room.on('seg_progreso', (p) => { if (p) marcarNotaVoz(p.seq, 'progreso', p); });
   room.on('voz_retraso', (ms) => renderRetraso(ms));
+  // El .seg completo llegó (reparación/respaldo): persistir la nota con el
+  // audio íntegro — en el seg_fin la copia pudo estar aún incompleta
+  room.on('seg_archivado', (seq) => idbGuardarSeg(seq));
   // --- piso exclusivo (PTT) ---
   room.on('piso', (m) => {
     if (m && m.estado === 'mio') {

@@ -102,8 +102,10 @@ label.check input { width: auto; }
 /* !important: el media query móvil da touch-action:manipulation a .btn y
    .asiento (permite scroll) y por venir después pisaba esta regla — el
    navegador se robaba el gesto a mitad de pulsación (pointercancel) y el
-   PTT se soltaba solo / el arrastre al candado moría antes de disparar */
-.ptt-sup { touch-action: none !important; user-select: none; -webkit-user-select: none;
+   PTT se soltaba solo / el arrastre al candado moría antes de disparar.
+   #chat-enviar también es pulsador (mantener para hablar): misma regla,
+   si no el arrastre hacia el candado se interpreta como scroll */
+.ptt-sup, #chat-enviar { touch-action: none !important; user-select: none; -webkit-user-select: none;
   -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
 /* hitbox invisible ~19px más grande por lado en el botón del micro:
    el dedo puede desviarse un poco fuera del círculo sin soltar el gesto

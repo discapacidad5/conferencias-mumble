@@ -2771,6 +2771,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         sg.bajando = false;
         sg.descargado = !parsed.sg.abierto;
         if (!parsed.sg.abierto) sg.huecos = false;
+        // El archivo completo llegó del servidor: avisar para que la app
+        // persista la nota en IndexedDB — en el seg_fin la cola aún podía
+        // estar en vuelo e idbGuardarSeg descartaba la copia incompleta
+        if (sg.descargado) this.emit('seg_archivado', seq);
         sg.ultRxT = performance.now(); // si sigue abierta, re-sondear en ~4 s
         if (!parsed.sg.abierto) { sg.completo = true; sg.finLocal = true; }
         if (parsed.sg.durMs) sg.durMs = parsed.sg.durMs;
@@ -3739,10 +3743,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               'reproducido', seg.reproducido, 'saltado', seg.saltado);
             // Cola final de la frase + huecos: la racha contigua primero;
             // el .seg completo unos segundos después, como respaldo — lo
-            // que aún viajaba cuando llegó seg_fin llega igual y suena
-            this._bajarTramos(seg);
-            this._programarBajadaArchivo(seg);
-            if (seg.huecos && !seg.descargado) this._bajarSeg(m.seq);
+            // que aún viajaba cuando llegó seg_fin llega igual y suena.
+            // Solo la primera vez: el servidor re-emite seg_fin en cada
+            // resincronización y duplicar el sondeo no aporta nada.
+            if (!seg._finVisto) {
+              seg._finVisto = true;
+              this._bajarTramos(seg);
+              this._programarBajadaArchivo(seg);
+              if (seg.huecos && !seg.descargado) this._bajarSeg(m.seq);
+            }
           } else {
             // Nunca vimos la frase (corte largo): crearla y descargarla —
             // salvo si es mía: mi propia voz no se reproduce ni se descarga
