@@ -5278,20 +5278,24 @@ function detenerNota(seq) {
   else marcarNotaVoz(seq, 'oido');
 }
 
-// Al terminar de re-escuchar una nota sigue con la siguiente del historial
-// que AÚN NO haya sonado en vivo (_vozOidos): la cola avanza sola desde
-// donde el usuario le dio ▶, pero una frase que se cerró en vivo durante
-// la re-escucha jamás se repite — el motor la recuerda como oída
+// Al terminar de re-escuchar una nota sigue con la siguiente cerrada del
+// historial — salvo la que ACABA de sonar en vivo (ventana de ~20 s, es
+// el caso del segmento recién cerrado que se duplicaba) o la que está
+// sonando en vivo en este momento. Pasada la ventana, toda nota vuelve a
+// re-escucharse normal con ▶ o cuando la cola la alcance
 function reproducirSiguienteNota(seq) {
   marcarNotaVoz(seq, 'oido');
   if (S._nvPausas) S._nvPausas.delete(seq);
   if (S._nvRepro !== seq) return;
-  const oidos = S.room && S.room._vozOidos;
+  const segs = S.room && S.room._vozSegs;
   for (const s of S._nvSeqs) {
     if (s <= seq) continue;
     const el = S._nvEls.get(s);
     if (!el || el.classList.contains('grabando')) continue;
-    if (oidos && oidos.has(s)) continue; // ya sonó en vivo: no repetir
+    const sg = segs && segs.get(s);
+    if (sg && sg._finT && performance.now() - sg._finT < 20000) continue;
+    const b = el.querySelector('.nv-play');
+    if (b && b.classList.contains('sonando')) continue; // sonando en vivo
     reproducirNota(s);
     return;
   }
