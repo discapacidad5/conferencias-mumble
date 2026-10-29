@@ -3079,12 +3079,22 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       };
       const out = [];
       const ops = [];
+      // Dedup por tx ENTRE familias: el emisor manda cada trama en Opus y
+      // en ADPCM cuando hay oyentes sin Opus, y el .seg/archivo local guarda
+      // ambas. Sin seg (re-escuchas de notas descargadas) no había dedup:
+      // cada 40 ms se decodificaba dos veces en dos formatos — la
+      // "basurita" que se oía también en el historial. La primera variante
+      // decodificable de cada tx gana (Opus si hay decoder; si no, ADPCM).
+      const txDecod = new Set();
       for (const fr of frames) {
         const rc = fr[0];
         if (rc === 0 || fr.length < 2) continue;
         const tx = fr[1] | (fr[2] << 8);
         if (seg && seg.vistos.has(tx)) continue;
+        if (txDecod.has(tx)) continue;
         if (rc >= 10 && rc <= 19) {
+          if (!SOPORTE_OPUS_RX || typeof window.AudioDecoder !== 'function') continue;
+          txDecod.add(tx);
           ops.push({ tx, fr, esDual: fr.length > 8 && fr[3] === 0xA5, nSub: 1 });
         } else if (rc >= 20 && rc <= 39) {
           const base = rc >= 30 ? rc - 10 : rc;
@@ -3093,11 +3103,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             ? (base === 21 ? 8000 : (base === 22 ? 12000 : 16000))
             : (base === 21 ? 6000 : (base === 22 ? 8000 : (base === 23 ? 12000 : 16000)));
           const { pcm } = decodificarBloqueADPCM(fr);
-          if (pcm.length) out.push({ tx, pcm: remuestrearA(rsDe(sr), pcm, sr, ctxRate) });
+          if (pcm.length) {
+            txDecod.add(tx);
+            out.push({ tx, pcm: remuestrearA(rsDe(sr), pcm, sr, ctxRate) });
+          }
         } else if (rc === 1 || rc === 2) {
           const sr = rc === 1 ? 8000 : 12000;
           const pcm = new Float32Array(fr.length - 1);
           for (let i = 1; i < fr.length; i++) pcm[i - 1] = ulawDecodeTable[fr[i]];
+          txDecod.add(tx);
           out.push({ tx, pcm: remuestrearA(rsDe(sr), pcm, sr, ctxRate) });
         }
       }
