@@ -1658,6 +1658,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._rxAudioCtx = null;
       this._rxPipelines = new Map(); // sid -> pipeline continuo con ring buffer
       this._speakers = new Map();    // identity -> expireTs
+      this._pisoDe = '';             // quién tiene el piso (piso_estado)
       this._speakerTimer = null;
       this._pingTimer = null;
       this._rttMs = 90;
@@ -1773,6 +1774,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
     _actualizarSpeakers() {
       const now = Date.now();
+      // Quien tiene el piso sigue "hablando" aunque sus tramas no lleguen
+      // (lag o corte del emisor): el indicador solo se apaga cuando suelta
+      // el PTT y además se drena su cola — no antes
+      if (this._pisoDe && this._pisoDe !== this.localParticipant.identity) {
+        this._speakers.set(this._pisoDe, now + 900);
+      }
+      // Mientras su frase suena de verdad también se sostiene la marca:
+      // tras el piso_soltar dejan de llegar tramas pero la cola sigue
+      // reproduciéndose — "dejó de hablar" = soltó Y terminó su audio
+      const act = this._vozHeadSeq != null ? this._vozSegs.get(this._vozHeadSeq) : null;
+      if (act && !act.propio && !act.saltado && !act.reproducido &&
+          act.alimentado < act.bloques.length) {
+        this._speakers.set(act.de, now + 900);
+      }
       const activos = [];
       for (const [id, exp] of this._speakers.entries()) {
         if (exp > now) {
@@ -3681,6 +3696,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._resetVozTxPend();
       this._quieroPiso = false;
       this._tengoPiso = false;
+      this._pisoDe = '';
       if (this._vozPipe) {
         const vp = this._vozPipe;
         this._vozPipe = null;
@@ -3892,6 +3908,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // PTT (o "" cuando se liberó): los oyentes siguen escuchando el
           // audio en cola, pero su PTT queda desbloqueado de inmediato para
           // que puedan pisar e interrumpir sin esperar a que termine la cola.
+          this._pisoDe = m.piso || '';
           this.emit('piso_estado', { piso: m.piso || '', nombre: m.nombre || '' });
           break;
 

@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v214 (2.1.10)';
+const CONF_BUILD = 'v215 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -1702,6 +1702,11 @@ async function pttOn() {
       '✋ Levantar la mano');
     return;
   }
+  // Si el piso es de otro, NO abrir el micro todavía: en el móvil solo
+  // abrirlo (getUserMedia con echoCancellation) cambia el modo de audio y
+  // el oyente deja de escuchar al que habla aunque el piso le sea negado.
+  // El micro se abre cuando el servidor confirme ('piso' → mio).
+  const pisoAjeno = !!(S.estado && S.estado.piso && S.estado.piso !== S.identidad);
   S.ptt.quiero = true;
   S.ptt.desde = Date.now(); // mientras quiero y !tengo el pulsador gira "conectando"
   // Repisé dentro del colchón de soltado: el retiro diferido del micro se
@@ -1709,11 +1714,11 @@ async function pttOn() {
   if (S.ptt._sueltaMicT) { clearTimeout(S.ptt._sueltaMicT); S.ptt._sueltaMicT = null; }
   S.room.tomarPiso();
   try {
-    if (!S.audio.pub) {
+    if (!S.audio.pub && !pisoAjeno) {
       const track = await construirMicTrack();
       S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
     }
-    await S.audio.pub.unmute();
+    if (S.audio.pub) await S.audio.pub.unmute();
     S.audio.on = true;
   } catch (e) {
     S.ptt.quiero = false;
@@ -2520,6 +2525,19 @@ function cablearRoom(room) {
         return;
       }
       S.ptt.tengo = true;
+      // Pedí el piso estando ocupado por otro: el micro no se abrió (para
+      // no cortar la escucha si me lo negaban). Ya es mío — se abre ahora.
+      if (S.ptt.quiero && !S.audio.pub) {
+        (async () => {
+          try {
+            const track = await construirMicTrack();
+            const pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+            S.audio.pub = pub;
+            await pub.unmute();
+            S.audio.on = true;
+          } catch (e) { toast('No se pudo hablar: ' + e.message); }
+        })();
+      }
       // si el micro quedó muteado (p.ej. soy la palabra y me interrumpieron)
       // vuelve solo: con La Palabra el micro no se apaga con el botón
       if (S.ptt.quiero && S.audio.pub && S.audio.pub.isMuted)
@@ -4837,6 +4855,7 @@ function menuMensaje(el, x, y) {
 function agregarChat(quien, texto, propio) {
   const el = document.createElement('div');
   el.className = 'msg' + (propio ? ' propio' : '');
+  el.dataset.ord = Date.now(); // orden temporal unificado con las notas de voz
   el.innerHTML = `<div class="quien">${esc(quien)}</div>${esc(texto)}`;
   ponerOpcionesMsg(el);
   const lista = $('#chat-lista');
@@ -4865,13 +4884,19 @@ const fmtDurSeg = (ms) => {
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 };
 
-// Inserta una nota de voz en #chat-lista respetando el orden numérico de seq
-// (para que una nota recuperada tras un corte no quede abajo de notas más nuevas)
-function insertarNotaOrdenada(lista, el, seq) {
+// Inserta un mensaje en #chat-lista respetando el orden temporal real
+// (data-ord = ms de inicio del audio / llegada del texto). Ordenar por seq
+// rompía la posición: las provisionales "grabando" llevan seq 2e9 y si una
+// quedaba fantasma, toda nota nueva caía ANTES de ella (a media lista) y
+// los textos se amontonaban al final. Con tiempo real, una nota recuperada
+// también cae en su sitio histórico.
+function insertarNotaOrdenada(lista, el, seq, ord) {
   el.dataset.seq = seq;
+  const nOrd = ord || Date.now();
+  el.dataset.ord = nOrd;
   for (const ch of lista.children) {
-    const cSeq = +(ch.dataset?.seq || ch.querySelector('.nv-play')?.dataset.seq || 0);
-    if (cSeq > seq) {
+    const cOrd = +(ch.dataset?.ord || 0);
+    if (cOrd && cOrd > nOrd) {
       lista.insertBefore(el, ch);
       return;
     }
@@ -4900,9 +4925,12 @@ function agregarNotaPropiaPendiente(inicio) {
 // Devuelve true si adoptó (la nota ya existe bajo la nueva llave).
 function adoptarSeqPropia(meta) {
   const miIdSala = S.room && S.room.localParticipant && S.room.localParticipant.identity;
-  // la app y el engine pueden referirme distinto (claims.sub vs nombre):
-  // cualquiera de las dos identidades cuenta como "mi" voz
-  if (!meta || (meta.de !== S.identidad && meta.de !== miIdSala) || meta.seq <= 0) return false;
+  // la app y el engine pueden referirme distinto (claims.sub vs nombre) y el
+  // servidor a veces cambia las mayúsculas ("cergio" vs "Cergio"): comparar
+  // sin caso — si no, la provisional jamás adoptaba su seq y quedaba
+  // fantasma "grabando" desordenando el chat para siempre
+  const miIds = [S.identidad, miIdSala].filter(Boolean).map(s => String(s).toLowerCase());
+  if (!meta || meta.seq <= 0 || !miIds.includes(String(meta.de || '').toLowerCase())) return false;
   const prov = _nvMiaPend;
   if (!prov || prov === meta.seq) return false;
   const el = S._nvEls.get(prov);
@@ -4925,7 +4953,7 @@ function adoptarSeqPropia(meta) {
   el.querySelectorAll('[data-seq]').forEach(b => { b.dataset.seq = meta.seq; });
   const lista = $('#chat-lista');
   el.remove();
-  insertarNotaOrdenada(lista, el, meta.seq);
+  insertarNotaOrdenada(lista, el, meta.seq, meta.inicio || Date.now());
   return true;
 }
 
@@ -4944,7 +4972,7 @@ function agregarNotaVozEnVivo(meta) {
     `<div class="nv-pista"><div class="nv-relleno rec"></div></div>` +
     `<span class="nv-tiempo">● 0:00</span></div>`;
   // sin ⋮ mientras graba: no hay nada que seleccionar/descargar/borrar
-  insertarNotaOrdenada(lista, el, meta.seq);
+  insertarNotaOrdenada(lista, el, meta.seq, inicio);
   lista.scrollTop = lista.scrollHeight;
   el._nvIni = Date.now(); // cuánto lleva "grabando" local (limpieza de fantasmas)
   S._nvEls.set(meta.seq, el);
@@ -5080,7 +5108,7 @@ function agregarNotaVoz(meta) {
     `<div class="nv-pista"><div class="nv-relleno"></div></div>` +
     `<span class="nv-tiempo">${fmtDurSeg(meta.durMs)}</span></div>`;
   ponerOpcionesMsg(el);
-  insertarNotaOrdenada(lista, el, meta.seq);
+  insertarNotaOrdenada(lista, el, meta.seq, meta.inicio || Date.now());
   while (lista.children.length > 200) {
     const viejo = lista.firstChild;
     if (viejo && viejo.classList.contains('nota-voz')) {

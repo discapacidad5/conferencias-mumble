@@ -972,7 +972,7 @@ body.compartiendo .asiento-pin, body.compartiendo .tile-pin { display: none; }
   #barra-controles.plegada > *:not(#ctl-plegar) { display: none !important; }
   #barra-controles.plegada { padding-top: .15rem; gap: 0; }
 
-  .fila-asientos { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .55rem; margin-bottom: .55rem; }
+  .fila-asientos { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .55rem; margin-bottom: .55rem; }
   .asiento, .fila-mod .asiento, .asiento.palabra { width: 100%; min-width: 0; aspect-ratio: 4 / 3; }
   /* top sin bottom:auto estiraba la cajita a toda la altura del tile:
      era la "franja" oscura vertical que se veía debajo del número */
