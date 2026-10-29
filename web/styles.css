@@ -1070,3 +1070,10 @@ body.compartiendo .asiento-pin, body.compartiendo .tile-pin { display: none; }
 #cr-num.peligro { color: var(--peligro); }
 #cr-barra { width: min(60vw, 420px); height: 8px; border-radius: 4px; background: var(--bg3); overflow: hidden; }
 #cr-fill { height: 100%; background: var(--ambar); transition: width .3s linear; }
+
+/* banda de "hay una versión nueva": fija arriba hasta que la toquen */
+.upd-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+  background: linear-gradient(90deg, #0a84ff, #5e5ce6); color: #fff;
+  text-align: center; padding: 10px 12px; font-size: .85rem; cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0,0,0,.4); animation: updPulse 2s infinite; }
+@keyframes updPulse { 0%,100% { filter: brightness(1); } 50% { filter: brightness(1.25); } }

@@ -8,6 +8,24 @@ console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 // refresco en el teléfono. Corre al entrar, cada minuto y al volver a
 // la pestaña/app.
 let _verChkOcupado = false;
+async function _actualizarCliente() {
+  // renovar también el service worker antes del reload — con las URL
+  // ?v=<hash> el navegador no puede servir código viejo de su caché
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) await reg.update();
+  } catch {}
+  location.reload();
+}
+function mostrarBannerActualizacion() {
+  if ($('#upd-banner')) return;
+  const b = document.createElement('div');
+  b.id = 'upd-banner';
+  b.className = 'upd-banner';
+  b.innerHTML = '⚡ Hay una versión nueva — <b>toca para actualizar</b>';
+  b.onclick = _actualizarCliente;
+  document.body.appendChild(b);
+}
 async function comprobarVersion() {
   if (CONF_VER === 'dev' || S._recargando || _verChkOcupado) return;
   _verChkOcupado = true;
@@ -16,14 +34,14 @@ async function comprobarVersion() {
     if (r.ok) {
       const d = await r.json().catch(() => ({}));
       if (d.v && d.v !== CONF_VER) {
-        S._recargando = true;
-        toast('Hay una versión nueva — actualizando…');
-        // renovar también el service worker antes del reload
-        try {
-          const reg = await navigator.serviceWorker.getRegistration();
-          if (reg) await reg.update();
-        } catch {}
-        setTimeout(() => location.reload(), 1200);
+        // dentro de la sala el aviso espera al toque (una recarga a la
+        // fuerza cortaría la conversación); fuera, se aplica sola
+        if ($('#vista-sala') && !$('#vista-sala').classList.contains('oculto')) {
+          mostrarBannerActualizacion();
+        } else {
+          S._recargando = true;
+          await _actualizarCliente();
+        }
       }
     }
   } catch {}
