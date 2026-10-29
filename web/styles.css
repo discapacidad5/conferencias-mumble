@@ -106,7 +106,7 @@ label.check input { width: auto; }
    #chat-enviar también es pulsador (mantener para hablar): misma regla,
    si no el arrastre hacia el candado se interpreta como scroll */
 .ptt-sup, #chat-enviar { touch-action: none !important; user-select: none; -webkit-user-select: none;
-  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; -webkit-user-drag: none; }
 /* hitbox invisible ~19px más grande por lado en el botón del micro:
    el dedo puede desviarse un poco fuera del círculo sin soltar el gesto
    (fondo transparente + margen negativo = ni se ve ni mueve el layout) */

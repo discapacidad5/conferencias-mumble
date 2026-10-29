@@ -2074,6 +2074,23 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._lanzarSubida();
     }
 
+    // fetch a /api de audio con token vivo: un 401 renueva el token de
+    // sala (la sesión del login sigue viva aunque el token expire) y
+    // reintenta UNA vez — sin esto un token viejo tiraba los trozos en
+    // silencio y no quedaba ni segmento ni historial
+    async _fetchAuth(url, opts) {
+      const conTok = () => ({
+        ...(opts || {}),
+        headers: { ...((opts && opts.headers) || {}), Authorization: 'Bearer ' + ((window.S && window.S.token) || '') },
+      });
+      let r = await fetch(url, conTok());
+      if (r.status === 401 && window._refrescarToken) {
+        try { await window._refrescarToken(); } catch {}
+        r = await fetch(url, conTok());
+      }
+      return r;
+    }
+
     _lanzarSubida() {
       const sala = (window.S && window.S.sala) || '';
       const tok = (window.S && window.S.token) || '';
@@ -2094,9 +2111,22 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }).then(async (r) => {
           this._chunkEnVuelo--;
           // 409 (socket de medios aún no conectado) y 5xx: reintentar el
-          // trozo por otra conexión; el resto de 4xx es permanente y se suelta
+          // trozo por otra conexión; un 401 renueva el token y reencola —
+          // NUNCA soltar el trozo: es voz del usuario y perderla corta la
+          // frase y el historial
           if (r.status === 409 || r.status >= 500) {
             this._chunkPend.unshift(body);
+            this._programarRetrySubida();
+          } else if (r.status === 401) {
+            this._chunkPend.unshift(body);
+            console.warn('[voz] subir 401 — renovando token y reintentando');
+            const ahora = Date.now();
+            if (!this._ultRefTok || ahora - this._ultRefTok > 10000) {
+              this._ultRefTok = ahora;
+              if (window._refrescarToken) {
+                try { await window._refrescarToken(); } catch {}
+              }
+            }
             this._programarRetrySubida();
           } else if (r.ok) {
             // ACK del trozo: el servidor confirma hasta qué índice contiguo
@@ -2107,6 +2137,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 this._soltarSemillaHasta(j.aid, j.contig);
               }
             } catch {}
+          } else {
+            // 4xx que no se recupera solo (400 cuerpo inválido, 410
+            // purgado…): queda en el log — antes se tragaba en silencio
+            console.warn('[voz] subir descartó trozo: HTTP', r.status);
           }
           this._lanzarSubida();
         }).catch(() => {
@@ -2539,8 +2573,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       }
       if (seg) {
         if (seg.bajando) {
-          // esperar la descarga; si se atascó >8 s se declara perdida
-          if (ahoraMs - seg.bajaDesde > 8000) {
+          // esperar la descarga; >16 s se declara perdida (el fetch tiene
+          // timeout propio de 12 s — no matarla antes de que aborte)
+          if (ahoraMs - seg.bajaDesde > 16000) {
             seg.bajando = false;
             seg.perdido = true;
             seg.saltado = true;
@@ -2726,10 +2761,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const ctrl = new AbortController();
       const ctrlT = setTimeout(() => { try { ctrl.abort(); } catch {} }, 12000);
       try {
-        const r = await fetch(
+        const r = await this._fetchAuth(
           `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seq}`,
-          { headers: { Authorization: 'Bearer ' + (window.S.token || '') },
-            signal: ctrl.signal });
+          { signal: ctrl.signal });
         if (!r.ok) {
           if (seg) {
             seg.bajando = false;
@@ -2842,10 +2876,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const ctrlT = setTimeout(() => { try { ctrl.abort(); } catch {} }, 9000);
       try {
         const desde = seg.proxIdxDesc || 0;
-        const r = await fetch(
+        const r = await this._fetchAuth(
           `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seg.seq}/tramos?desde=${desde}`,
-          { headers: { Authorization: 'Bearer ' + (window.S.token || '') },
-            signal: ctrl.signal });
+          { signal: ctrl.signal });
         if (!r.ok) {
           if (r.status === 404 && !seg.bloques.length && !seg.completo) {
             seg.completo = true;
@@ -2944,13 +2977,15 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     async _rellenarHuecos(hasta) {
       const sala = (window.S && window.S.sala) || '';
       if (!sala) return;
-      const g = (window.S && window.S.grupoActual) || 0;
       try {
         // ventana con solape: no solo lo nuevo — también repara frases
-        // abiertas en local cuyo seg_fin se perdió durante el corte
-        const r = await fetch(
-          `/api/salas/${encodeURIComponent(sala)}/audio?desde=${Math.max(0, this._ultimoSeg - 40)}&g=${g}`,
-          { headers: { Authorization: 'Bearer ' + ((window.S && window.S.token) || '') } });
+        // abiertas en local cuyo seg_fin se perdió durante el corte.
+        // Sin g= : el servidor filtra por el grupo del token — el mismo
+        // que usa para los eventos WS, siempre consistente (un g= que no
+        // coincide devolvía manifiesto vacío y las notas se borraban como
+        // fantasmas)
+        const r = await this._fetchAuth(
+          `/api/salas/${encodeURIComponent(sala)}/audio?desde=${Math.max(0, this._ultimoSeg - 40)}`);
         if (!r.ok) return;
         const man = await r.json();
         const vivos = new Set(); // seq que el servidor conoce (cerradas o abiertas)

@@ -1,4 +1,6 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
+const CONF_BUILD = 'v207 (2.1.7+)';
+console.log('[conf] build', CONF_BUILD);
 const LC = window.LivekitClient;
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -179,6 +181,45 @@ function elegirTiempoPalabra(titulo, fn) {
     const total = (+$('#pt-min').value || 0) * 60 + (+$('#pt-seg').value || 0);
     cerrarModal('modal-gen'); fn(Math.max(0, total));
   };
+}
+
+// Renovar el token de sala cuando los /api devuelven 401: la sesión del
+// login (cookie, 24h) sigue viva aunque el token (12h) haya expirado, así
+// que re-pedir obtener-acceso devuelve uno fresco sin molestar al usuario.
+// Antes un 401 tiraba los trozos de voz en silencio — sin segmentos ni
+// historial — mientras el audio en vivo seguía sonando por el socket.
+let _refTokenP = null;
+async function refrescarToken() {
+  if (_refTokenP) return _refTokenP;
+  _refTokenP = (async () => {
+    try {
+      const r = await fetch('/api/obtener-acceso', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sala: S.sala, nombre: S.nombre, clave: S.clave || '', identidad: S.identidad }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d && d.token) {
+        console.log('[conf] token de sala renovado');
+        S.token = d.token;
+        return true;
+      }
+    } catch {}
+    return false;
+  })().finally(() => { _refTokenP = null; });
+  return _refTokenP;
+}
+window._refrescarToken = refrescarToken;
+
+// fetch a /api con token: un 401 reintenta UNA vez con token renovado
+async function fetchAuth(url, opts = {}) {
+  const conToken = () => ({ ...(opts || {}), headers: { ...(opts && opts.headers), Authorization: 'Bearer ' + S.token } });
+  let r = await fetch(url, conToken());
+  if (r.status === 401 && S.sala && S.nombre) {
+    await refrescarToken();
+    r = await fetch(url, conToken());
+  }
+  return r;
 }
 
 async function api(path, body, opts = {}) {
@@ -979,7 +1020,8 @@ async function entrar() {
 
 function entrarVistaSala() {
   mostrar('#vista-sala');
-  $('#st-nombre-sala').textContent = (S.salaNombre || S.sala) + ' — ' + S.nombre;
+  $('#st-nombre-sala').textContent = (S.salaNombre || S.sala) + ' — ' + S.nombre + ' · ' + CONF_BUILD;
+  toast('Build ' + CONF_BUILD);
   $('#st-panel-admin').classList.toggle('oculto', false); // se re-evalúa con el estado
   // botón "atrás" del teléfono: cada capa abierta (panel, modal, menú,
   // popups) empuja su propia entrada de historial. "Atrás" consume la
@@ -1687,6 +1729,9 @@ function wirePttButton(el, gate) {
   // Android: mantener el dedo ~500 ms dispara contextmenu y el navegador
   // manda pointercancel -> soltaba el PTT solo. Se bloquea aquí de raíz.
   el.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); });
+  // El arrastre nativo HTML5 del botón (long-press + mover) secuestra el
+  // gesto en algunos WebViews: fuera
+  el.addEventListener('dragstart', (e) => { e.preventDefault(); e.stopPropagation(); });
   el.addEventListener('pointerdown', (e) => {
     if (S.audio.retirando || S.ptt.modo === 'lock' || S.ptt.modo === 'auto' || !libre()) return;
     e.preventDefault();
@@ -1819,16 +1864,41 @@ function wireGestoGlobal() {
       return;
     }
     if (S.ptt.modo !== 'lock' && !S.ptt._bloqueado) {
-      // Levantar el dedo real: un respiro antes de soltar — un temblor o
-      // micro-levantada de 50-150 ms no debe cortar la frase en seco.
-      // Si en esa ventana vuelve a pisar, el nuevo gesto lo cancela.
+      // Levantar el dedo real: margen antes de soltar — un temblor o una
+      // micro-levantada no debe cortar la frase en seco. Si en la ventana
+      // el dedo "vuelve" (repisa o el teléfono lo recicla como puntero
+      // nuevo — rechazo de palma), el gesto se retoma y NO se suelta.
+      S.ptt._gestoUltimo = g;
       if (S.ptt._soltarT) clearTimeout(S.ptt._soltarT);
       S.ptt._soltarT = setTimeout(() => {
         S.ptt._soltarT = null;
+        S.ptt._gestoUltimo = null;
         if (S.ptt.quiero && !S.ptt._bloqueado) pttOff();
-      }, 160);
+      }, 700);
     }
   };
+  // Re-enganche: un pointerdown/touchstart dentro del margen de soltado es
+  // el MISMO dedo reclasificado por el teléfono (rechazo de palma marca el
+  // contacto como "nuevo" al arrastrar sobre la pantalla). Si cae sobre el
+  // botón PTT su propio handler gestiona; sobre cualquier otro punto, se
+  // retoma el arrastre donde iba — así el dedo puede llegar al candado
+  // aunque el sistema cambie el pointerId a mitad de camino.
+  const reenganche = (e) => {
+    if (!S.ptt._soltarT || !S.ptt.quiero) return;
+    if (e.target && e.target.closest && e.target.closest('.ptt-sup')) return;
+    const g0 = S.ptt._gestoUltimo;
+    clearTimeout(S.ptt._soltarT);
+    S.ptt._soltarT = null;
+    S.ptt._gestoUltimo = null;
+    if (!g0 || !document.contains(g0.el)) return;
+    const t = (e.touches && e.touches[0]) || e;
+    S.ptt._gesto = { x0: t.clientX, y0: t.clientY, el: g0.el,
+      pid: e.pointerId != null ? e.pointerId : null,
+      sinGesto: g0.sinGesto, lock: false, auto: false };
+    if (!g0.sinGesto) mostrarGestosPtt(g0.el);
+  };
+  window.addEventListener('pointerdown', reenganche, true);
+  window.addEventListener('touchstart', reenganche, true);
   window.addEventListener('pointerup', fin);
   window.addEventListener('pointercancel', fin);
   window.addEventListener('touchend', fin, { passive: true });
@@ -4848,9 +4918,8 @@ async function sincronizarNotas() {
     // se descarga recién al darle ▶ a una nota. Al entrar se piden las
     // últimas 40; después solo el rango desde lo último conocido.
     const q = ultimo > 0 ? `desde=${Math.max(0, ultimo - 40)}` : 'ultimos=40';
-    const r = await fetch(
-      `/api/salas/${encodeURIComponent(S.sala)}/audio?${q}&g=${S.miGrupo || 0}`,
-      { headers: { Authorization: 'Bearer ' + S.token } });
+    const r = await fetchAuth(
+      `/api/salas/${encodeURIComponent(S.sala)}/audio?${q}`);
     if (!r.ok) return;
     const man = await r.json();
     // al entrar (desde=0) solo se siembran las ~40 últimas notas: el chat
@@ -5059,8 +5128,7 @@ async function exportarNotas(seqs) {
     }
     if (!bl) {
       try {
-        const r = await fetch(`/api/salas/${encodeURIComponent(S.sala)}/audio/${seq}`,
-          { headers: { Authorization: 'Bearer ' + S.token } });
+        const r = await fetchAuth(`/api/salas/${encodeURIComponent(S.sala)}/audio/${seq}`);
         if (r.ok) bl = await S.room.bloquesDeArchivo(await r.arrayBuffer());
       } catch {}
     }
@@ -5124,8 +5192,7 @@ async function reproducirNota(seq) {
     }
   } catch {}
   try {
-    const r = await fetch(`/api/salas/${S.sala}/audio/${seq}`,
-      { headers: { Authorization: 'Bearer ' + S.token } });
+    const r = await fetchAuth(`/api/salas/${S.sala}/audio/${seq}`);
     if (r.ok) {
       const buf = await r.arrayBuffer();
       await S.room.reproducirArchivo(buf, seq);
@@ -5398,9 +5465,8 @@ async function _bgProcesarSeg() {
     } catch {}
     // 3) descargar el .seg completo del servidor (incluye mi propia voz,
     //    que nunca pasa por mi cola en vivo)
-    const r = await fetch(
-      `/api/salas/${encodeURIComponent(S.sala)}/audio/${seq}`,
-      { headers: { Authorization: 'Bearer ' + S.token } });
+    const r = await fetchAuth(
+      `/api/salas/${encodeURIComponent(S.sala)}/audio/${seq}`);
     if (!r.ok) {
       if (r.status === 404 || r.status === 410) {
         _bgSeg.muertos.add(seq); // el servidor ya la purgó
