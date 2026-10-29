@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v222 (2.1.10)';
+const CONF_BUILD = 'v223 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -2739,7 +2739,13 @@ async function reconectar() {
       S.icePolicy = r.icePolicy || ''; S.iceServers = r.iceServers || null;
       const room = nuevaRoom();
       videoEls.clear();
+      // Matar el room viejo ANTES de conectar el nuevo: si su socket siguió
+      // abierto quedaba como participante fantasma (yo dos veces en sala),
+      // seguía descargando y reproduciendo el audio (me escuchaba a mí
+      // mismo con otra identidad) y su publicación retenía el micrófono
+      const viejo = S.room;
       S.room = room;
+      if (viejo && viejo !== room) { try { viejo.disconnect(); } catch {} }
       cablearRoom(room);
       await conectarRoom(room, r.url, r.token);
       // conservar el historial de voz: el Room nuevo parte del último seq

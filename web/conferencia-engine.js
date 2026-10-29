@@ -2303,13 +2303,28 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       }
     }
 
+    // ¿Es mío? La identidad exacta y también el prefijo (nombre slug):
+    // si esta sala se abrió dos veces con el mismo nombre (otra pestaña,
+    // PWA + navegador, identidad nueva por mayúsculas/espacios distintos),
+    // la otra instancia trae OTRA identidad — sin el prefijo yo me
+    // escucharía a mí mismo por el altavoz como si fuera otra persona.
+    _esPropio(de) {
+      if (!de) return false;
+      const mi = this.localParticipant.identity;
+      if (de === mi) return true;
+      if (!mi) return false;
+      const a = de.slice(0, de.lastIndexOf('-'));
+      const b = mi.slice(0, mi.lastIndexOf('-'));
+      return a.length > 0 && a === b;
+    }
+
     _vozSegNuevo(seq, de, nombre, abierto, meta) {
       let seg = this._vozSegs.get(seq);
       if (!seg) {
         seg = {
           seq, de: de || '', nombre: nombre || de || '',
           abierto: !!abierto, completo: !abierto, finLocal: !abierto,
-          propio: !!de && de === this.localParticipant.identity,
+          propio: !!de && this._esPropio(de),
           pseudo: false,
           durMs: (meta && meta.durMs) || 0,
           interrumpida: !!(meta && (meta.interrumpida || meta.cortado)),
@@ -2325,7 +2340,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._vozOrden.splice(i, 0, seg);
       } else {
         if (de && !seg.de) seg.de = de;
-        if (de) seg.propio = de === this.localParticipant.identity;
+        if (de) seg.propio = this._esPropio(de);
         if (nombre) seg.nombre = nombre;
         // el servidor la da por cerrada: también el borde local, o la frase
         // queda abierta bloqueando la cabeza de la cola en vivo para siempre
@@ -2353,7 +2368,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const seq = -(++this._pseudoN);
       const p = this.remoteParticipants.get(fromId);
       const seg = {
-        seq, pseudo: true, de: fromId,
+        seq, pseudo: true, de: fromId, propio: this._esPropio(fromId),
         nombre: (p && (p.name || p.identity)) || fromId,
         abierto: true, completo: false, finLocal: false,
         durMs: 0, interrumpida: false, inicio: Date.now(),
@@ -3112,7 +3127,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             this._bajarSeg(meta.seq);
           }
         }
-        if (man.abierto && man.abierto.de !== miId) {
+        if (man.abierto && !this._esPropio(man.abierto.de)) {
           vivos.add(man.abierto.seq);
           if (!this._vozSegs.get(man.abierto.seq) && man.abierto.seq > base) {
             const ns = this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
@@ -3555,7 +3570,18 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       await promesaDeteccionOpus;
       this._closedByClient = false;
       if (!this._connSid) {
-        this._connSid = Math.random().toString(36).slice(2, 10);
+        // sid estable por pestaña (sessionStorage): al reconectar el
+        // servidor reconoce que es la MISMA sesión y cierra el socket
+        // viejo en silencio — antes cada Room traía sid nuevo, la
+        // desconexión caía al camino de "identidad duplicada" y el
+        // fantasma tardaba un timeout TCP en desaparecer
+        try {
+          this._connSid = sessionStorage.getItem('conf_sid') ||
+            ('s' + Math.random().toString(36).slice(2, 10));
+          sessionStorage.setItem('conf_sid', this._connSid);
+        } catch {
+          this._connSid = 's' + Math.random().toString(36).slice(2, 10);
+        }
       }
       if (this._reconnectTimer) {
         clearTimeout(this._reconnectTimer);
@@ -3822,7 +3848,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         case 'seg_ini': {
           // Aviso de que alguien empezó una frase (segmento abierto)
           const de = m.de || '';
-          if (de === this.localParticipant.identity) {
+          if (this._esPropio(de)) {
             // Mi propia voz no se encola ni se reproduce, pero la UI sí
             // muestra la nota "grabando" en el historial al instante
             this.emit('seg_ini', {
@@ -3877,7 +3903,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
         case 'seg_fin': {
           // La frase terminó (EOS): el segmento es una nota de voz cerrada
-          if (m.de === this.localParticipant.identity) {
+          if (this._esPropio(m.de)) {
             this._ultimoSeg = Math.max(this._ultimoSeg, m.seq || 0);
             // Mi propia frase no suena en vivo, pero sí se queda guardada
             // en el chat igual que la de los demás: bajar su .seg para
@@ -3919,7 +3945,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             // Nunca vimos la frase (corte largo): crearla y descargarla —
             // salvo si es mía: mi propia voz no se reproduce ni se descarga
             seg = this._vozSegNuevo(m.seq, m.de, m.nombre, false, m);
-            if (m.de !== this.localParticipant.identity) this._bajarSeg(m.seq);
+            if (!this._esPropio(m.de)) this._bajarSeg(m.seq);
           }
           this._ultimoSeg = Math.max(this._ultimoSeg, m.seq);
           this.emit('seg_fin', this._segMeta(seg));
@@ -3931,7 +3957,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // contigua por HTTP (cada descarga es una conexión independiente)
           const seq = Number(m.seq) || 0;
           const de = m.de || '';
-          if (!seq || de === this.localParticipant.identity) break;
+          if (!seq || this._esPropio(de)) break;
           let seg = this._vozSegs.get(seq);
           if (!seg) {
             // La frase se conoció por 'chunk' (su seg_ini se perdió en la
@@ -4039,7 +4065,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
 
         case 'audio_share_meta': {
           const from = m.from;
-          if (!from || from === this.localParticipant.identity) break;
+          if (!from || this._esPropio(from)) break;
           const p = this.remoteParticipants.get(from);
           if (!p) break;
           if (!m.activo) {
@@ -4494,7 +4520,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const idLen = u8[1];
       if (2 + idLen > u8.length) return;
       const fromId = new TextDecoder().decode(u8.subarray(2, 2 + idLen));
-      if (!fromId || fromId === this.localParticipant.identity) return;
+      if (!fromId || this._esPropio(fromId)) return;
       const payload = u8.subarray(2 + idLen);
 
       let p = this.remoteParticipants.get(fromId);
