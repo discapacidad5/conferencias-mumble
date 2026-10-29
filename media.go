@@ -939,7 +939,13 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					// cambiado a un aid nuevo, jamás volver a tomar ni bloquear
 					// el piso por tramas atrasadas en la red.
 					if (aidTrama != 0 && aidTrama == c.aidSuelto) ||
-						(c.pisoSuelto && (aidTrama == 0 || aidTrama == c.pisoAid)) {
+						(c.pisoSuelto && (aidTrama == 0 || aidTrama == c.pisoAid)) ||
+						mr.seg.aidYaCerrado(c.identidad, aidTrama) {
+						// aidYaCerrado cubre el hueco de la reconexión: la
+						// semilla reenviada por _reenvioVozPendiente llega a
+						// una conexión nueva con aidSuelto=0 — sin la marca
+						// de la sala, el audio viejo renacía como segmento
+						// nuevo y sonaba entero otra vez, robando el piso
 						continue
 					}
 					if aidTrama != 0 && aidTrama != c.pisoAid {

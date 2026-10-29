@@ -82,9 +82,10 @@ type segStore struct {
 	mu        sync.Mutex
 	sala      string
 	proxSeq   uint32
-	abiertos  map[string]*segmento // identidad -> segmento abierto
-	cerrados  []*segmento          // ordenados por seq
-	recientes []*segmento          // cerrados aún reparables (rellenan huecos)
+	abiertos  map[string]*segmento       // identidad -> segmento abierto
+	cerrados  []*segmento                // ordenados por seq
+	recientes []*segmento                // cerrados aún reparables (rellenan huecos)
+	aidCerr   map[string]map[uint8]int64 // identidad -> aid -> cuándo cerró
 	dir       string
 	mr        *mediaRoom
 }
@@ -94,6 +95,7 @@ func nuevoSegStore(sala string, mr *mediaRoom) *segStore {
 		sala:     sala,
 		proxSeq:  1,
 		abiertos: map[string]*segmento{},
+		aidCerr:  map[string]map[uint8]int64{},
 		dir:      filepath.Join(dataDir, "audio", sala),
 		mr:       mr,
 	}
@@ -543,10 +545,39 @@ func (s *segStore) reparar(id string, payload []byte) (*segmento, [][]byte) {
 	return nil, nil
 }
 
+// aidYaCerrado responde si este aid ya tuvo un segmento cerrado para ese
+// emisor. Vive en la sala (no en la conexión): tras un corte de red el
+// cliente reenvía TODA su semilla no confirmada — sin esta marca, cada
+// trama rezagada de un audio terminado abriría un segmento NUEVO con la
+// frase completa y todos la oirían repetida en bucle (y su pisoCheck
+// robaría el piso). Dura ~5 min por aid para no descartar una frase
+// genuinamente nueva que reutilice el número tras dar la vuelta (1..15).
+func (s *segStore) aidYaCerrado(id string, aid uint8) bool {
+	if aid == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.aidCerr[id]
+	if m == nil {
+		return false
+	}
+	_, ok := m[aid]
+	return ok
+}
+
 // cerrarSeg escribe el archivo definitivo, lo mueve al historial y libera RAM.
 // Debe llamarse con s.mu tomado.
 func (s *segStore) cerrarSeg(sg *segmento, interrumpida bool) *segmento {
 	delete(s.abiertos, sg.De)
+	if sg.aid != 0 {
+		m := s.aidCerr[sg.De]
+		if m == nil {
+			m = map[uint8]int64{}
+			s.aidCerr[sg.De] = m
+		}
+		m[sg.aid] = ahora()
+	}
 	sg.Abierto = false
 	sg.Cortado = sg.Cortado || interrumpida
 	if sg.DurMs <= 0 {
@@ -655,6 +686,18 @@ func (s *segStore) tick() {
 			}
 		}
 		s.recientes = vivos
+	}
+	// marcas aidCerr de más de ~5 min expiran: pasado ese tiempo un aid
+	// reutilizado (da la vuelta 1..15) vuelve a ser una frase legítima
+	for id, m := range s.aidCerr {
+		for aid, ts := range m {
+			if ahoraMs-ts > 300_000 {
+				delete(m, aid)
+			}
+		}
+		if len(m) == 0 {
+			delete(s.aidCerr, id)
+		}
 	}
 	// purga por antigüedad + tope de bytes por sala
 	limite := ahoraMs - segRetencionMs
@@ -1238,7 +1281,8 @@ func hAudioSubir(w http.ResponseWriter, r *http.Request, cl *Claims) {
 			}
 			aidTrama := aidDeTx(txDeTrama(fr))
 			if (aidTrama != 0 && aidTrama == c.aidSuelto) ||
-				(c.pisoSuelto && (aidTrama == 0 || aidTrama == c.pisoAid)) {
+				(c.pisoSuelto && (aidTrama == 0 || aidTrama == c.pisoAid)) ||
+				mr.seg.aidYaCerrado(c.identidad, aidTrama) {
 				continue
 			}
 			if aidTrama != 0 && aidTrama != c.pisoAid {
