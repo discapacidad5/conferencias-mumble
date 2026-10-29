@@ -2189,6 +2189,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         seg = {
           seq, de: de || '', nombre: nombre || de || '',
           abierto: !!abierto, completo: !abierto, finLocal: !abierto,
+          propio: !!de && de === this.localParticipant.identity,
           pseudo: false,
           durMs: (meta && meta.durMs) || 0,
           interrumpida: !!(meta && (meta.interrumpida || meta.cortado)),
@@ -2204,6 +2205,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         this._vozOrden.splice(i, 0, seg);
       } else {
         if (de && !seg.de) seg.de = de;
+        if (de) seg.propio = de === this.localParticipant.identity;
         if (nombre) seg.nombre = nombre;
         // el servidor la da por cerrada: también el borde local, o la frase
         // queda abierta bloqueando la cabeza de la cola en vivo para siempre
@@ -2258,7 +2260,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let i = seg.bloques.length;
       while (i > 0 && (((seg.bloques[i - 1].tx & 0x0fff) - idx) & 0x0fff) < 2048) i--;
       seg.bloques.splice(i, 0, bl);
-      if (i < seg.alimentado) seg.alimentado++;
+      if (i < seg.alimentado) {
+        seg.alimentado++;
+      } else if (seg.reproducido &&
+                 performance.now() - (seg._finT || 0) < 45000) {
+        // Frase marcada "reproducida" cuyo seg_fin llegó por WS antes que
+        // sus últimos trozos por HTTP: la pieza tardía cae al borde aún
+        // no escuchado → se reabre para terminar de sonar. Los huecos
+        // internos rellenados después quedan atrás y no repiten audio
+        seg.reproducido = false;
+        seg.finAvisado = false;
+      }
     }
 
     _programarReparacion(seg) {
@@ -2492,7 +2504,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // cubre los siguientes baches.
       let seg = null;
       for (const s of this._vozOrden) {
-        if (s.saltado || s.reproducido) continue;
+        // la frase propia se archiva en el chat pero jamás suena en vivo
+        if (s.saltado || s.reproducido || s.propio) continue;
         seg = s;
         break;
       }
@@ -2547,6 +2560,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               (seg.completo || seg.finLocal) && !seg.finAvisado) {
             seg.finAvisado = true;
             seg.reproducido = true;
+            seg._finT = ahoraMs; // ventana para que una cola tardía reabra
             this._marcarOido(seg.seq);
             this.emit('seg_reproducido', this._segMeta(seg));
           }
@@ -2600,11 +2614,12 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         // baja la racha contigua cada ~700 ms aunque el aviso 'chunk' se
         // haya perdido en la red — el orden lo impone siempre el cliente
         if (!s.saltado && !s.reproducido && !s.completo &&
-            !s.pseudo && s.seq > 0 &&
+            !s.pseudo && !s.propio && s.seq > 0 &&
             ahoraPerf - (s._ultTramoT || 0) > 700) {
           this._bajarTramos(s);
         }
-        if ((s.reproducido || s.saltado) && s.inicio < viejo && s.bloques.length) {
+        if ((s.reproducido || s.saltado || s.propio) &&
+            s.inicio < viejo && s.bloques.length) {
           s.bloques = [];
           s.vistos.clear();
         }
@@ -2699,7 +2714,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         const sg = seg || this._vozSegNuevo(
           parsed.sg.seq, parsed.sg.de, parsed.sg.nombre, parsed.sg.abierto, parsed.sg);
         if (parsed.sg.de && parsed.sg.abierto) this._segPorHablante.set(parsed.sg.de, sg.seq);
-        const nuevos = await this._decodificarFramesSeg(parsed.frames, sg);
+        // La frase propia solo se archiva (raw + IndexedDB): no se decodifica
+        // a la cola en vivo para no oírme a mí mismo con retraso
+        const nuevos = sg.propio ? [] : await this._decodificarFramesSeg(parsed.frames, sg);
         for (const b of nuevos) {
           if (typeof b.tx === 'number' && b.tx >= 0) {
             if (sg.vistos.has(b.tx)) continue;
@@ -2751,8 +2768,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (!seg || seg._tramoRetryT) return;
       seg._tramoRetryT = setTimeout(() => {
         seg._tramoRetryT = null;
-        if (!seg.saltado && !seg.reproducido &&
-            this._vozSegs.get(seg.seq) === seg) {
+        // se sigue re-pidiendo aunque ya esté "reproducida": el audio que
+        // llegue tarde reabre la frase en _insertarBloque y suena completo
+        if (!seg.saltado && this._vozSegs.get(seg.seq) === seg) {
           this._bajarTramos(seg);
         }
       }, ms || 1500);
@@ -2785,6 +2803,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
         const u8 = new Uint8Array(await r.arrayBuffer());
         if (u8.length < 8 || u8[0] !== 1) return;
+        seg._tramoFails = 0;
         const flags = u8[1];
         const n = (u8[6] << 8) | u8[7];
         let o = 8;
@@ -2836,7 +2855,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           seg._tramoCerrReintentos = 0;
         }
       } catch {
-        // conexión caída a media descarga: re-pedir por otra
+        // conexión caída a media descarga: re-pedir por otra — con tope si
+        // la frase ya cerró, para no sondear de por vida una seg "oída"
+        if (seg.completo && (seg._tramoFails = (seg._tramoFails || 0) + 1) > 8) return;
         this._programarRetryTramo(seg, 1200);
       } finally {
         seg._tramoBusy = false;
@@ -2862,7 +2883,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         const miId = this.localParticipant.identity;
         for (const meta of man.segmentos || []) {
           vivos.add(meta.seq);
-          if (meta.de === miId) continue; // mi propia voz no entra a la cola en vivo
+          // las mías también se bajan: _vozSegNuevo las marca 'propio' —
+          // no entran a la cola en vivo, pero quedan guardadas en el chat
           const seg = this._vozSegs.get(meta.seq);
           if (seg) {
             // Ya existía en mi sesión: actualizar su cierre y rellenar si tuvo huecos
@@ -3586,7 +3608,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           for (const ant of this._vozOrden) {
             if (!ant.completo && !ant.finLocal && ant.seq !== cur) {
               ant.finLocal = true;
-              if (!ant.bloques.length && !ant.bajando) ant.saltado = true;
+              // no darla por muerta si aún hay una descarga en vuelo: en
+              // red lenta su primer trozo puede tardar más que el piso
+              if (!ant.bloques.length && !ant.bajando && !ant._tramoBusy)
+                ant.saltado = true;
             }
           }
           let seg;
@@ -3624,6 +3649,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // La frase terminó (EOS): el segmento es una nota de voz cerrada
           if (m.de === this.localParticipant.identity) {
             this._ultimoSeg = Math.max(this._ultimoSeg, m.seq || 0);
+            // Mi propia frase no suena en vivo, pero sí se queda guardada
+            // en el chat igual que la de los demás: bajar su .seg para
+            // archivarla en IndexedDB (datosSeg la expone a idbGuardarSeg)
+            if (m.seq) this._bajarSeg(m.seq);
             this.emit('seg_fin', {
               seq: m.seq, de: m.de, nombre: m.nombre || m.de,
               durMs: m.durMs || 0, inicio: Date.now() - (m.durMs || 0),
