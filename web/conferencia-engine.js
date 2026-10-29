@@ -2778,8 +2778,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         if (!parsed.sg.abierto) sg.huecos = false;
         // El archivo completo llegó del servidor: avisar para que la app
         // persista la nota en IndexedDB — en el seg_fin la cola aún podía
-        // estar en vuelo e idbGuardarSeg descartaba la copia incompleta
+        // estar en vuelo e idbGuardarSeg descartaba la copia incompleta.
+        // Y toda frase descargada deja su nota en el chat aunque su
+        // seg_ini/seg_fin por WS se hayan perdido en un corte.
         if (sg.descargado) this.emit('seg_archivado', seq);
+        this.emit(parsed.sg.abierto ? 'seg_ini' : 'seg_fin', this._segMeta(sg));
         sg.ultRxT = performance.now(); // si sigue abierta, re-sondear en ~4 s
         if (!parsed.sg.abierto) { sg.completo = true; sg.finLocal = true; }
         if (parsed.sg.durMs) sg.durMs = parsed.sg.durMs;
@@ -2968,14 +2971,18 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             }
           } else if (meta.seq > base) {
             // Frase nueva ocurrida después de que entré y perdida durante el corte
-            this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
+            const ns = this._vozSegNuevo(meta.seq, meta.de, meta.nombre, false, meta);
+            // El audio recuperado por manifiesto también deja su nota en el
+            // chat: sin este evento suena pero jamás aparece en el historial
+            this.emit('seg_ini', this._segMeta(ns));
             this._bajarSeg(meta.seq);
           }
         }
         if (man.abierto && man.abierto.de !== miId) {
           vivos.add(man.abierto.seq);
           if (!this._vozSegs.get(man.abierto.seq) && man.abierto.seq > base) {
-            this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
+            const ns = this._vozSegNuevo(man.abierto.seq, man.abierto.de, man.abierto.nombre, true, man.abierto);
+            this.emit('seg_ini', this._segMeta(ns));
             this._bajarSeg(man.abierto.seq);
           }
         }

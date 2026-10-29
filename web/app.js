@@ -1839,7 +1839,21 @@ function wireGestoGlobal() {
     if (S.ptt._gesto) { e.preventDefault(); e.stopPropagation(); }
   }, true);
   window.addEventListener('blur', () => {
-    if (S.ptt.quiero && S.ptt.modo === 'hold' && !S.ptt._bloqueado && !tengoPalabra()) pttOff();
+    // La ventana pierde foco en medio del gesto (gesto del sistema al
+    // arrastrar cerca del borde, barra de notificaciones): el dedo no se
+    // levantó — no es soltar. El PTT queda mantenido como candado y el
+    // próximo toque al botón lo suelta limpio.
+    if (S.ptt.quiero && S.ptt.modo === 'hold' && !S.ptt._bloqueado &&
+        !tengoPalabra() && S.ptt._gesto) {
+      const g = S.ptt._gesto;
+      if (g && g.el.style.transform) g.el.style.transform = '';
+      S.ptt._gesto = null;
+      ocultarGestosPtt();
+      S.ptt._bloqueado = true;
+      S.ptt._tragarClick = true;
+      toast('📌 PTT mantenido — toca el botón para soltar');
+      renderControles();
+    }
   });
 }
 
@@ -4753,7 +4767,10 @@ function agregarNotaPropiaPendiente(inicio) {
 // El provisional de mi nota "grabando" adopta el seq real del servidor.
 // Devuelve true si adoptó (la nota ya existe bajo la nueva llave).
 function adoptarSeqPropia(meta) {
-  if (!meta || meta.de !== S.identidad || meta.seq <= 0) return false;
+  const miIdSala = S.room && S.room.localParticipant && S.room.localParticipant.identity;
+  // la app y el engine pueden referirme distinto (claims.sub vs nombre):
+  // cualquiera de las dos identidades cuenta como "mi" voz
+  if (!meta || (meta.de !== S.identidad && meta.de !== miIdSala) || meta.seq <= 0) return false;
   const prov = _nvMiaPend;
   if (!prov || prov === meta.seq) return false;
   const el = S._nvEls.get(prov);
@@ -4797,6 +4814,7 @@ function agregarNotaVozEnVivo(meta) {
   // sin ⋮ mientras graba: no hay nada que seleccionar/descargar/borrar
   insertarNotaOrdenada(lista, el, meta.seq);
   lista.scrollTop = lista.scrollHeight;
+  el._nvIni = Date.now(); // cuánto lleva "grabando" local (limpieza de fantasmas)
   S._nvEls.set(meta.seq, el);
   S._nvSeqs.push(meta.seq);
   S._nvSeqs.sort((a, b) => a - b);
@@ -4858,14 +4876,19 @@ async function sincronizarNotas() {
     if (man.abierto && man.abierto.seq && !S._nvEls.has(man.abierto.seq) && !nvBorrados().has(man.abierto.seq))
       agregarNotaVozEnVivo({ seq: man.abierto.seq, de: man.abierto.de, nombre: man.abierto.nombre, inicio: man.abierto.inicio });
     // Fantasmas: notas "grabando" que el servidor ya no tiene ni abiertas
-    // ni archivadas (su seg_fin se perdió en un corte). Se eliminan.
+    // ni archivadas (su seg_fin se perdió en un corte). Se eliminan SOLO
+    // tras ~90 s sin cierre: una frase abierta reciente aún puede estar
+    // viajando, y si el filtro de grupo del manifiesto no coincide no hay
+    // que arrasar con notas que el servidor sí tiene.
     const vivos = new Set((man.segmentos || []).map(m => m.seq));
     if (man.abierto && man.abierto.seq) vivos.add(man.abierto.seq);
     S._nvEls.forEach((el, seq) => {
       // las provisionales (mi frase en curso, seq aún sin asignar por el
       // servidor) no son fantasmas: adoptan su seq al llegar seg_ini/fin
       if (seq >= 2e9) return;
-      if (el.classList.contains('grabando') && !vivos.has(seq))
+      const edad = Date.now() - (+el._nvIni || +el._recIni || 0);
+      if (el.classList.contains('grabando') && !vivos.has(seq) &&
+          el._nvIni && edad > 90000)
         marcarNotaVoz(seq, 'perdida');
     });
     if (man.ultimo) S._ultimoSeg = Math.max(S._ultimoSeg || 0, man.ultimo);
