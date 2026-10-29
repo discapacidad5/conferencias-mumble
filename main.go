@@ -159,9 +159,12 @@ func spaHandler(fsys fs.FS) http.Handler {
 		w.Write(indexVerzado)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
 		p := strings.TrimPrefix(r.URL.Path, "/")
 		if p == "" || p == "index.html" {
+			// index.html siempre se revalida: es el que descubre si hay
+			// una versión nueva (los ?v=<hash> de dentro ya apuntan al
+			// contenido nuevo)
+			w.Header().Set("Cache-Control", "no-cache")
 			if errIdx == nil {
 				servirIndex(w)
 				return
@@ -171,9 +174,21 @@ func spaHandler(fsys fs.FS) http.Handler {
 		}
 		if f, err := fsys.Open(p); err == nil {
 			f.Close()
+			if r.URL.Query().Get("v") != "" {
+				// La URL lleva huella de contenido (?v=hash): si el archivo
+				// cambia, la URL cambia — el navegador puede guardarla para
+				// siempre sin volver a descargar ni revalidar. Carga
+				// instantánea de la PWA + actualización garantizada.
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				// Sin huella (iconos, sw.js, manifest): revalidar — son
+				// pequeños y deben refrescarse cuando cambian
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			fh.ServeHTTP(w, r)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-cache")
 		if errIdx == nil {
 			servirIndex(w)
 			return
