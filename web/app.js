@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v209 (2.1.9)';
+const CONF_BUILD = 'v210 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -144,16 +144,24 @@ function limpiarVideoEls(track) {
 }
 
 /* ---------- utilidades ---------- */
-function toast(msg, ms = 5000, cls = '') {
+function toast(msg, ms = 5000, cls = '', id = '') {
   // duración legible: piso 4s + ~55ms por carácter — los mensajes largos
   // antes desaparecían antes de poder leerlos. Tocarlo lo cierra ya.
   ms = Math.max(ms, 4000 + String(msg).length * 55);
+  // con id: reemplaza al toast anterior del mismo tema y se puede quitar
+  // programado (p.ej. el aviso "toca para soltar" muere al soltar el PTT)
+  if (id) { const v = $('#toast-' + id); if (v) v.remove(); }
   const t = document.createElement('div');
   t.className = ('toast ' + cls).trim(); t.textContent = msg;
+  if (id) t.id = 'toast-' + id;
   t.title = 'Toca para cerrar';
   t.onclick = () => t.remove();
   $('#toast-wrap').appendChild(t);
   setTimeout(() => t.remove(), ms);
+}
+function quitarToast(id) {
+  const t = $('#toast-' + id);
+  if (t) t.remove();
 }
 function cerrarModal(id) {
   document.getElementById(id).classList.add('oculto');
@@ -1725,6 +1733,9 @@ async function pttOff(inmediato) {
   S.ptt._bloqueado = false;
   S.ptt.desde = 0;
   ocultarGestosPtt();
+  // el aviso "toca para soltar" muere con el botón — antes seguía visible
+  // sus segundos restantes aunque ya no hubiera nada que soltar
+  quitarToast('ptt-hold');
   // Soltar localmente DE INMEDIATO sin esperar al servidor:
   // 1) apagar mi propio indicador de hablando y limpiar mi piso local,
   // 2) pintar el botón suelto al instante antes de cualquier await.
@@ -1891,7 +1902,7 @@ function wireGestoGlobal() {
       if (g.lock || g.auto || S.ptt.modo === 'lock' || S.ptt._bloqueado) return;
       S.ptt._bloqueado = true;
       S.ptt._tragarClick = true;
-      toast('📌 PTT mantenido — toca el botón para soltar');
+      toast('📌 PTT mantenido — toca el botón para soltar', 5000, '', 'ptt-hold');
       renderControles();
       return;
     }
@@ -1901,7 +1912,7 @@ function wireGestoGlobal() {
       // tragárselo: si no, desbloquea al instante de bloquear.
       S.ptt._bloqueado = true;
       S.ptt._tragarClick = true;
-      toast('🔒 Bloqueado — toca el botón de nuevo para soltar');
+      toast('🔒 Bloqueado — toca el botón de nuevo para soltar', 5000, '', 'ptt-hold');
       renderControles();
       return;
     }
@@ -1972,7 +1983,7 @@ function wireGestoGlobal() {
       ocultarGestosPtt();
       S.ptt._bloqueado = true;
       S.ptt._tragarClick = true;
-      toast('📌 PTT mantenido — toca el botón para soltar');
+      toast('📌 PTT mantenido — toca el botón para soltar', 5000, '', 'ptt-hold');
       renderControles();
     }
   });
