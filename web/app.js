@@ -1673,14 +1673,15 @@ function wirePttButton(el, gate) {
     // si quedó bloqueado, un toque lo desbloquea y suelta
     if (S.ptt._bloqueado) { S.ptt._bloqueado = false; pttOff(); return; }
     pttOn();
-    // Capturar el puntero + el arrastre se sigue en WINDOW: en móvil la
-    // captura a veces falla o el navegador manda pointerleave/cancel al
-    // cruzar el borde — con el seguimiento global el gesto no se pierde.
+    // Sin setPointerCapture a propósito: el seguimiento ya es global en
+    // window, y capturar contra un elemento de asiento (que renderAsientos
+    // destruye en cada re-render) disparaba pointercancel y soltaba el PTT
+    // a mitad de la frase. El gesto vive en _gesto + pid, no en el nodo.
     // Los asientos llevan sinGesto (no arrastran 🔒/A, usan esquinas fijas)
     // pero IGUAL necesitan seguimiento en window para soltar al levantar.
-    try { el.setPointerCapture(e.pointerId); } catch {}
     wireGestoGlobal();
-    S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, sinGesto: !!el._pttSinGesto, lock: false, auto: false };
+    S.ptt._gesto = { x0: e.clientX, y0: e.clientY, el, pid: e.pointerId,
+      sinGesto: !!el._pttSinGesto, lock: false, auto: false };
     if (!el._pttSinGesto) mostrarGestosPtt(el);
   });
   el.addEventListener('click', (e) => {
@@ -1728,17 +1729,34 @@ function wireGestoGlobal() {
     g.el.style.transform = `${base}translate(${vx}px, ${vy}px)`;
     marcarGestosPtt(g);
   };
-  window.addEventListener('pointermove', (e) => seguir(e.clientX, e.clientY));
+  const esMio = (e) => {
+    const g = S.ptt._gesto;
+    return !g || g.pid == null || e.pointerId == null || e.pointerId === g.pid;
+  };
+  window.addEventListener('pointermove', (e) => {
+    if (esMio(e)) seguir(e.clientX, e.clientY);
+  });
   // pointerrawupdate: en Android Chrome sigue llegando aunque el gesto
   // nativo del sistema "congele" los pointermove al arrastrar desde abajo.
-  window.addEventListener('pointerrawupdate', (e) => seguir(e.clientX, e.clientY));
-  // Respaldo táctil: algunos WebViews solo entregan touchmove durante el arrastre.
+  window.addEventListener('pointerrawupdate', (e) => {
+    if (esMio(e)) seguir(e.clientX, e.clientY);
+  });
+  // Respaldo táctil: algunos WebViews solo entregan touchmove durante el
+  // arrastre. Mientras el gesto PTT vive se bloquea el scroll aunque el
+  // dedo salga del botón: la pulsación solo termina al LEVANTAR el dedo,
+  // en cualquier punto de la pantalla — los micro-movimientos no sueltan.
   window.addEventListener('touchmove', (e) => {
+    if (!S.ptt._gesto) return;
+    e.preventDefault();
     const t = e.touches && e.touches[0];
     if (t) seguir(t.clientX, t.clientY);
-  }, { passive: true });
+  }, { passive: false });
   const fin = (e) => {
     const g = S.ptt._gesto;
+    // pointerup/cancel de OTRO dedo no suelta el gesto; un touchend solo
+    // cuenta cuando ya no queda ningún dedo apoyado en la pantalla
+    if (g && !esMio(e)) return;
+    if (g && e.type && e.type.startsWith('touch') && e.touches && e.touches.length > 0) return;
     if (g) e.stopPropagation();
     ocultarGestosPtt();
     if (g && g.el.style.transform) g.el.style.transform = ''; // soltar el arrastre
@@ -1769,6 +1787,11 @@ function wireGestoGlobal() {
   window.addEventListener('pointercancel', fin);
   window.addEventListener('touchend', fin, { passive: true });
   window.addEventListener('touchcancel', fin, { passive: true });
+  // El dedo salió del botón y hace long-press sobre otro elemento: su
+  // menú contextual dispararía pointercancel del gesto — se ahoga aquí
+  window.addEventListener('contextmenu', (e) => {
+    if (S.ptt._gesto) { e.preventDefault(); e.stopPropagation(); }
+  }, true);
   window.addEventListener('blur', () => {
     if (S.ptt.quiero && S.ptt.modo === 'hold' && !S.ptt._bloqueado && !tengoPalabra()) pttOff();
   });
