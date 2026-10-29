@@ -919,51 +919,19 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					continue
 				}
 				rc := payload[0]
-				// Función auxiliar que empaqueta y entrega en secuencia
-				// estricta un slice de tramas contiguas a todos los oyentes
-				difundirTramas := func(tramas [][]byte) {
-					if len(tramas) == 0 {
-						return
-					}
-					mr.mu.RLock()
-					defer mr.mu.RUnlock()
-					for _, pl := range tramas {
-						if len(pl) == 0 {
-							continue
-						}
-						rCode := pl[0]
-						pkt := make([]byte, 2+len(idBytes)+len(pl))
-						pkt[0] = frameTipoAudio
-						pkt[1] = byte(len(idBytes))
-						copy(pkt[2:], idBytes)
-						copy(pkt[2+len(idBytes):], pl)
-						for _, otro := range mr.clientes {
-							if otro == c || otro.grupo != c.grupo {
-								continue
-							}
-							if rCode >= 10 && rCode <= 19 && !otro.opusRx {
-								continue
-							}
-							if rCode >= 30 && rCode <= 39 && otro.opusRx {
-								continue
-							}
-							otro.enviarBinarioAudio(pkt)
-						}
-					}
-				}
 				// Reparación anti-pérdida: si esta trama pertenece por su aid
 				// a un segmento ya cerrado (rellena un hueco o completa su cola
 				// mientras el emisor ya empezó un aid nuevo), se archiva en su
-				// propio segmento y destraba las tramas consecutivas.
+				// propio segmento y se avisa a los oyentes que la descarguen.
 				if len(payload) >= 3 {
 					aidTrama := aidDeTx(txDeTrama(payload))
-					if sgR, listosR := mr.seg.reparar(c.identidad, payload); sgR != nil {
-						difundirTramas(listosR)
+					if sgR, _ := mr.seg.reparar(c.identidad, payload); sgR != nil {
 						mr.seg.pedirFaltantes(sgR)
 						mr.seg.ackSegSiCompleto(sgR)
 						if (rc == 0 || len(sgR.faltan) == 0) && sgR.DurMs >= 700 {
 							mr.notificarSegFin(sgR)
 						}
+						mr.seg.notificarChunk(sgR)
 						continue
 					}
 					// Si esta trama lleva el aid de un PTT que el cliente YA
@@ -992,18 +960,21 @@ func hMediaWS(w http.ResponseWriter, r *http.Request, cl *Claims) {
 					mr.difundirEstadoPeers(c.grupo)
 				}
 
-				// Ensamblado en orden estricto (estilo P2P): el servidor
-				// verifica la secuencia tx de cada trama; si falta una pieza
-				// anterior, retiene las posteriores y se la pide de inmediato
-				// al emisor ({t:'falta'}). Solo cuando la secuencia está
-				// completa sin huecos la envía a los oyentes (listos).
-				nuevo, cerrado, faltan, listos := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
+				// El servidor archiva la trama en su .seg y avisa a los
+				// oyentes con un control diminuto ('chunk') para que la bajen
+				// por HTTP en orden — la voz ya NO se empuja por el WS, así
+				// el canal de señalización jamás se congestiona con audio y
+				// una descarga atascada no frena a ninguna otra (modelo pull).
+				nuevo, cerrado, faltan, _ := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, payload, false)
 				if nuevo != nil {
 					mr.seg.notificarSegIni(nuevo)
 				}
-				difundirTramas(listos)
+				if sg := mr.seg.abiertoDe(c.identidad); sg != nil {
+					mr.seg.notificarChunk(sg)
+				}
 				if cerrado != nil {
 					mr.notificarSegFin(cerrado)
+					mr.seg.notificarChunk(cerrado)
 				}
 				mr.seg.ackSegSiCompleto(cerrado)
 				if len(faltan) > 0 {

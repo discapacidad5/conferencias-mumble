@@ -6,8 +6,8 @@ Edición ultraligera de la plataforma de conferencias diseñada para funcionar s
 
 1. **Servidor de voz propio (un solo binario Go)**:
    - No depende de ningún servicio externo: el mismo proceso sirve la web, el WebSocket y el historial de audio.
-   - Protocolo propio sobre **WebSocket binario sobre HTTPS**: tramas de voz (Opus/ADPCM), video ligero y compartición de pantalla/documentos.
-   - **Voz confiable estilo nota de voz**: cada frase se archiva en el servidor como segmento recuperable (`DATA_DIR/audio/<sala>/`); si el cliente tiene microcortes o se desconecta, al volver descarga por HTTP las frases que le faltan — nada se pierde.
+   - **Voz por ráfagas HTTP (modelo pull, anti Head-of-Line)**: el micrófono se sube en trozos de ~1 s por `POST /api/salas/{sala}/audio/subir` — cada trozo viaja por su propia conexión, así un trozo atascado se reintenta por otra sin frenar a los demás. El servidor archiva todo en orden por número de trama (`tx`) y solo avisa por el WebSocket con mensajes diminutos (`seg_ini`, `chunk`, `seg_fin`, `falta`); los oyentes descargan la racha contigua por `GET /api/salas/{sala}/audio/{seq}/tramos?desde=N` y la reproducen en orden estricto — si llega el trozo 3 antes que el 2, el 3 espera al 2. Video ligero y compartición siguen por el WebSocket binario.
+   - **Voz confiable estilo nota de voz**: cada frase se archiva en el servidor como segmento recuperable (`DATA_DIR/audio/<sala>/`); las piezas faltantes se re-piden al emisor (`falta`) que las re-sube por otro POST, y el cliente vuelve a pedir cualquier tramo que no llegue — el audio llega siempre, aunque tarde.
    - **Piso exclusivo (PTT)**: solo una persona habla a la vez, con tiempos de interrupción configurables por rol (administrador, anfitrión, La Palabra, usuario).
    - **Historial de voz en el chat**: cada intervención queda como nota de voz re-escuchable, con retención configurable.
 2. **Cero fallos ICE/TURN en datos móviles**:

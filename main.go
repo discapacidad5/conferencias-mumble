@@ -87,7 +87,9 @@ func main() {
 	// --- participante (Bearer o query token HMAC) ---
 	mux.HandleFunc("GET /api/salas/{sala}/media", conParticipante(hMediaWS))
 	mux.HandleFunc("GET /api/salas/{sala}/audio", conParticipante(hAudioManifiesto))
+	mux.HandleFunc("POST /api/salas/{sala}/audio/subir", conParticipante(hAudioSubir))
 	mux.HandleFunc("GET /api/salas/{sala}/audio/{seq}", conParticipante(hAudioSegmento))
+	mux.HandleFunc("GET /api/salas/{sala}/audio/{seq}/tramos", conParticipante(hAudioTramos))
 	mux.HandleFunc("GET /api/salas/{sala}/estado", conParticipante(hEstado))
 	mux.HandleFunc("GET /api/salas/{sala}/eventos", conParticipante(hEventos))
 	mux.HandleFunc("POST /api/salas/{sala}/accion", conParticipante(hAccion))

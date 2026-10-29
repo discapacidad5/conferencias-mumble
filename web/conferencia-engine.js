@@ -891,20 +891,6 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       // codificado — imposible desalinear etiquetas con el audio como pasaba
       // con la cola paralela opusTags/opusPending.
       const opusPares = new Map(); // tag -> [chunk20ms, ...]
-      // Redundancia inmediata: cada emisión va acompañada de la copia de los
-      // paquetes anteriores de la misma familia — si un envío se pierde en la
-      // red móvil, el siguiente ya trae su repuesto. El servidor deduplica
-      // por (aid, idx) así que nunca se arma ni reenvía dos veces.
-      // VOZ_REDUNDANCIA=2 = doble envío; si aún se pierden, subir a 3.
-      const VOZ_REDUNDANCIA = 2;
-      const prevOpusPkts = [], prevAdpcmPkts = [];
-      // Redundancia solo con holgura: si la cola TCP ya va llena (>16 KB)
-      // duplicar paquetes ahoga la subida y la voz llega tarde — el hueco
-      // lo repara el servidor pidiendo 'falta' desde la semilla _vozTxPend.
-      const txHolgado = () => {
-        const w = this._room && this._room._ws;
-        return !w || w.bufferedAmount < 16 * 1024;
-      };
       const emitirOpusPkt = (tag, partes) => {
         if (!this._room || !partes || !partes.length) return;
         const s = tag & 0xffff;
@@ -926,10 +912,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           pkt[o + 1] = (b2.length >> 8) & 0xff;
           pkt.set(b2, o + 2);
         }
-        this._room._enviarFrame(pkt);
-        if (txHolgado()) for (const p of prevOpusPkts) this._room._enviarFrame(p); // copias redundantes
-        prevOpusPkts.push(pkt);
-        if (prevOpusPkts.length > VOZ_REDUNDANCIA - 1) prevOpusPkts.shift();
+        // Sube por HTTP en trozos (~1 s): cada POST es una conexión
+        // independiente — la fiabilidad la da el reintento del trozo y la
+        // re-petición 'falta' del servidor, no la redundancia en el mismo
+        // stream (que era lo que ahogaba la subida móvil).
+        this._room._subirAudioPkt(pkt);
       };
       const emitirOpusParesRestantes = () => {
         for (const [t, p] of opusPares) emitirOpusPkt(t, p);
@@ -1061,16 +1048,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         enFrase = false;
         const s = txSeq & 0xffff;
         const eos = new Uint8Array([FRAME_AUDIO, 0, s & 0xff, (s >> 8) & 0xff]);
-        this._room._enviarFrame(eos);
-        // La cola del audio viaja duplicada de inmediato: la última trama
-        // queda cubierta sin esperar a la siguiente frase, y la propia
-        // marca EOS también se envía dos veces (cerrar es idempotente).
-        // Las copias se saltan si la subida ya va llena (holgura baja).
-        if (txHolgado()) {
-          for (const p of prevOpusPkts) this._room._enviarFrame(p);
-          for (const p of prevAdpcmPkts) this._room._enviarFrame(p);
-        }
-        this._room._enviarFrame(eos);
+        // El EOS cierra el trozo en armado y sale en su propio POST al
+        // instante — el servidor cierra la frase sin esperar más tramas
+        this._room._subirAudioPkt(eos);
+        this._room._flushChunk();
       };
 
       // Enviar un bloque de 40 ms (1920 muestras @ 48 kHz). Si empieza un
@@ -1124,10 +1105,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             sub[i] = acc / decim;
           }
           const pkt = codificarBloqueADPCM(sub, adpcmState, rateCode, txSeq);
-          this._room._enviarFrame(pkt);
-          if (txHolgado()) for (const p of prevAdpcmPkts) this._room._enviarFrame(p); // copias redundantes
-          prevAdpcmPkts.push(pkt);
-          if (prevAdpcmPkts.length > VOZ_REDUNDANCIA - 1) prevAdpcmPkts.shift();
+          this._room._subirAudioPkt(pkt);
         }
       };
 
@@ -1692,6 +1670,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._vozTxFases = [];         // [[clave,...], ...] últimas 2 frases
       this._vozTxFaseAct = null;     // claves de la frase abierta
       this._vozTxBytes = 0;
+      // Subida de voz por HTTP en trozos independientes (~1 s): cada POST es
+      // una conexión aparte — un trozo atascado se reintenta por otra
+      // conexión y jamás frena a los demás (cero bloqueo head-of-line).
+      this._chunkTx = [];            // payloads de trama del trozo en armado
+      this._chunkFlushT = null;      // cierre de trozo por tiempo
+      this._chunkPend = [];          // bodies binarios esperando POST
+      this._chunkEnVuelo = 0;        // POSTs activos (máx. 4)
+      this._chunkRetryT = null;
       // Piso exclusivo (PTT): el servidor garantiza un solo hablante
       this._quieroPiso = false;
       this._tengoPiso = false;
@@ -1910,17 +1896,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     }
 
     // El servidor pide los txs que le faltan: se reenvían desde el buffer
+    // por su propio POST (al frente de la cola — destraban la frase)
     _reenviosVoz(txs) {
       if (!Array.isArray(txs)) return;
+      const lista = [];
       let n = 0;
       for (const t of txs) {
         const tx = Number(t) & 0xffff;
         for (let fam = 0; fam < 2; fam++) {
           const pkt = this._vozTxPend.get((tx << 1) | fam);
-          if (pkt) this._enviarFrame(pkt);
+          if (pkt) lista.push(pkt);
         }
         if (++n >= 96) break;
       }
+      this._postVozFrames(lista);
     }
 
     // El servidor confirma ({t:'seg_ack'}) que recibió completo ese audio
@@ -1944,6 +1933,28 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._vozTxFases = this._vozTxFases.filter(f => f.length);
     }
 
+    // ACK parcial por trozo ({contig} en la respuesta del POST): el servidor
+    // ya archivó contiguas las tramas 0..contigIdx de ese aid — no las va a
+    // volver a pedir, así que se sueltan de la semilla de retransmisión
+    _soltarSemillaHasta(aid, contigIdx) {
+      aid = Number(aid) & 0x0f;
+      if (!aid || !this._vozTxPend.size) return;
+      for (const [k, p] of this._vozTxPend) {
+        const tx = k >> 1;
+        if (((tx >> 12) & 0x0f) === aid && (tx & 0x0fff) <= contigIdx) {
+          this._vozTxPend.delete(k);
+          this._vozTxBytes -= p.length;
+        }
+      }
+      for (const fase of this._vozTxFases) {
+        for (let i = fase.length - 1; i >= 0; i--) {
+          const tx = fase[i] >> 1;
+          if (((tx >> 12) & 0x0f) === aid && (tx & 0x0fff) <= contigIdx) fase.splice(i, 1);
+        }
+      }
+      this._vozTxFases = this._vozTxFases.filter(f => f.length);
+    }
+
     // Tras reconectar, TODO lo enviado que el servidor no llegó a confirmar
     // puede haber muerto en el socket anterior — se reenvía completo; él
     // deduplica por tx e inserta en orden, así no hay dobles ni desorden
@@ -1953,7 +1964,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         const ta = a >> 1, tb = b >> 1;
         return (((ta - tb) & 0xffff) < 30000) ? -1 : 1;
       });
-      for (const c of claves) this._enviarFrame(this._vozTxPend.get(c));
+      this._postVozFrames(claves.map((c) => this._vozTxPend.get(c)));
     }
 
     _drenarTx() {
@@ -1974,6 +1985,144 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         }
       }
       if (this._txCola.length) this._programarFlushTx();
+    }
+
+    // ---------- subida de voz por HTTP en trozos independientes ----------
+    // La voz del emisor viaja en ráfagas de ~1 s, cada una por su propio POST:
+    // si una conexión se atasca o muere, solo ese trozo espera y se reintenta
+    // por otra conexión. El servidor las archiva en orden por su número tx y
+    // las piezas que falten las re-pide con {t:'falta'} — la voz llega siempre.
+    _subirAudioPkt(pkt) {
+      if (!pkt || pkt[0] !== 0x01 || pkt.length < 2) return;
+      this._registrarVozTx(pkt);
+      // en el body viaja el payload sin el byte inicial de tipo de trama
+      this._chunkTx.push(pkt.subarray(1));
+      if (this._chunkTx.length >= 25) { // ~1 s de voz (25 x 40 ms)
+        this._flushChunk();
+      } else if (!this._chunkFlushT) {
+        this._chunkFlushT = setTimeout(() => {
+          this._chunkFlushT = null;
+          this._flushChunk();
+        }, 1100);
+      }
+    }
+
+    // Arma el cuerpo binario de un POST: [u8 ver=1][u16 n][u16 len][trama]*n
+    // Acepta paquetes completos (con el byte 0x01 inicial) o payloads sueltos.
+    _armarBodyVoz(pkts) {
+      const fr = [];
+      let total = 3;
+      for (const p of pkts) {
+        const f = (p.length > 1 && p[0] === 0x01) ? p.subarray(1) : p;
+        fr.push(f);
+        total += 2 + f.length;
+      }
+      const body = new Uint8Array(total);
+      body[0] = 1;
+      body[1] = (fr.length >> 8) & 0xff;
+      body[2] = fr.length & 0xff;
+      let o = 3;
+      for (const f of fr) {
+        body[o] = (f.length >> 8) & 0xff;
+        body[o + 1] = f.length & 0xff;
+        body.set(f, o + 2);
+        o += 2 + f.length;
+      }
+      return body;
+    }
+
+    _flushChunk() {
+      if (this._chunkFlushT) {
+        clearTimeout(this._chunkFlushT);
+        this._chunkFlushT = null;
+      }
+      if (!this._chunkTx.length) return;
+      const frames = this._chunkTx;
+      this._chunkTx = [];
+      this._encolarSubida(this._armarBodyVoz(frames));
+    }
+
+    // Reenvío de tramas sueltas que el servidor pide por 'falta': van al
+    // FRENTE de la cola de subida — rellenar el hueco destraba la frase.
+    _postVozFrames(pkts) {
+      if (!pkts || !pkts.length) return;
+      let lote = [];
+      let bytes = 3;
+      const emitir = () => {
+        if (lote.length) this._encolarSubida(this._armarBodyVoz(lote), true);
+        lote = [];
+        bytes = 3;
+      };
+      for (const p of pkts) {
+        if (bytes + 2 + p.length > 3 * 1024 * 1024) emitir();
+        lote.push(p);
+        bytes += 2 + p.length;
+      }
+      emitir();
+    }
+
+    _encolarSubida(body, alFrente) {
+      if (!body || !body.length) return;
+      // tope defensivo ~4 MB en cola (≈7 min de voz a 10 kbps)
+      let bytes = 0;
+      for (const b of this._chunkPend) bytes += b.length;
+      while (bytes > 4 * 1024 * 1024 && this._chunkPend.length) {
+        bytes -= this._chunkPend[0].length;
+        this._chunkPend.shift();
+      }
+      if (alFrente) this._chunkPend.unshift(body); else this._chunkPend.push(body);
+      this._lanzarSubida();
+    }
+
+    _lanzarSubida() {
+      const sala = (window.S && window.S.sala) || '';
+      const tok = (window.S && window.S.token) || '';
+      if (!sala || !tok) {
+        this._programarRetrySubida();
+        return;
+      }
+      while (this._chunkEnVuelo < 4 && this._chunkPend.length) {
+        const body = this._chunkPend.shift();
+        this._chunkEnVuelo++;
+        fetch(`/api/salas/${encodeURIComponent(sala)}/audio/subir`, {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer ' + tok,
+            'Content-Type': 'application/octet-stream',
+          },
+          body,
+        }).then(async (r) => {
+          this._chunkEnVuelo--;
+          // 409 (socket de medios aún no conectado) y 5xx: reintentar el
+          // trozo por otra conexión; el resto de 4xx es permanente y se suelta
+          if (r.status === 409 || r.status >= 500) {
+            this._chunkPend.unshift(body);
+            this._programarRetrySubida();
+          } else if (r.ok) {
+            // ACK del trozo: el servidor confirma hasta qué índice contiguo
+            // ya archivó — esa parte de la semilla jamás se vuelve a pedir
+            try {
+              const j = await r.json();
+              if (j && j.aid && j.contig >= 0) {
+                this._soltarSemillaHasta(j.aid, j.contig);
+              }
+            } catch {}
+          }
+          this._lanzarSubida();
+        }).catch(() => {
+          this._chunkEnVuelo--;
+          this._chunkPend.unshift(body);
+          this._programarRetrySubida();
+        });
+      }
+    }
+
+    _programarRetrySubida() {
+      if (this._chunkRetryT) return;
+      this._chunkRetryT = setTimeout(() => {
+        this._chunkRetryT = null;
+        this._lanzarSubida();
+      }, 900);
     }
 
     // ---------- piso exclusivo (PTT) ----------
@@ -1998,6 +2147,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._marcarHablandoLocal(false);
       if (this._pisoHoldT) { clearInterval(this._pisoHoldT); this._pisoHoldT = null; }
       this._enviarJson({ t: 'piso_soltar', aid: aidSuelto }, true);
+      this._flushChunk(); // lo que quede en el trozo en armado sale ya por POST
     }
 
     // Latido mientras se tiene el piso: el watchdog del servidor lo suelta a
@@ -2446,6 +2596,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             if (this._segPorHablante.get(s.de) === s.seq) this._segPorHablante.delete(s.de);
           }
         }
+        // Sondeo de tramos: mientras la frase siga abierta en el servidor se
+        // baja la racha contigua cada ~700 ms aunque el aviso 'chunk' se
+        // haya perdido en la red — el orden lo impone siempre el cliente
+        if (!s.saltado && !s.reproducido && !s.completo &&
+            !s.pseudo && s.seq > 0 &&
+            ahoraPerf - (s._ultTramoT || 0) > 700) {
+          this._bajarTramos(s);
+        }
         if ((s.reproducido || s.saltado) && s.inicio < viejo && s.bloques.length) {
           s.bloques = [];
           s.vistos.clear();
@@ -2542,7 +2700,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           parsed.sg.seq, parsed.sg.de, parsed.sg.nombre, parsed.sg.abierto, parsed.sg);
         if (parsed.sg.de && parsed.sg.abierto) this._segPorHablante.set(parsed.sg.de, sg.seq);
         const nuevos = await this._decodificarFramesSeg(parsed.frames, sg);
-        for (const b of nuevos) this._insertarBloque(sg, b);
+        for (const b of nuevos) {
+          if (typeof b.tx === 'number' && b.tx >= 0) {
+            if (sg.vistos.has(b.tx)) continue;
+            sg.vistos.add(b.tx);
+          }
+          this._insertarBloque(sg, b);
+        }
+        this._avanzarProxIdx(sg);
         if (parsed.frames && parsed.frames.length) {
           sg.raw = parsed.frames.map(f => f.slice());
           sg.rawBytes = sg.raw.reduce((a, u) => a + u.length, 0);
@@ -2562,6 +2727,119 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         if (seg) seg.bajando = false;
       } finally {
         this._fetchSegs.delete(seq);
+      }
+    }
+
+    // Avanza el cursor de descarga contigua del segmento: solo salta los
+    // índices que YA están en bloques — si falta una pieza el cursor se
+    // queda en ella y la próxima bajada la re-pide hasta que llegue.
+    _avanzarProxIdx(seg) {
+      if (seg.proxIdxDesc == null) seg.proxIdxDesc = 0;
+      const idxs = new Set();
+      for (const b of seg.bloques) {
+        if (typeof b.tx === 'number' && b.tx >= 0) idxs.add(b.tx & 0x0fff);
+      }
+      let guard = 0;
+      while (idxs.has(seg.proxIdxDesc & 0x0fff) && guard++ < 4096) {
+        seg.proxIdxDesc = (seg.proxIdxDesc + 1) & 0x0fff;
+      }
+    }
+
+    // Reintento diferido de una bajada fallida: el trozo se vuelve a pedir
+    // por otra conexión hasta que llegue (o el segmento se cierre/oiga).
+    _programarRetryTramo(seg, ms) {
+      if (!seg || seg._tramoRetryT) return;
+      seg._tramoRetryT = setTimeout(() => {
+        seg._tramoRetryT = null;
+        if (!seg.saltado && !seg.reproducido &&
+            this._vozSegs.get(seg.seq) === seg) {
+          this._bajarTramos(seg);
+        }
+      }, ms || 1500);
+    }
+
+    // Descarga por HTTP la racha contigua de tramas del segmento desde
+    // proxIdxDesc (modelo pull): cada petición es una conexión independiente
+    // — una descarga atascada no frena a las demás y el audio jamás se
+    // reproduce desordenado: si llega el trozo 3 antes que el 2, el 3 espera.
+    async _bajarTramos(seg) {
+      if (!seg || seg.pseudo || seg.seq <= 0 || seg._tramoBusy) return;
+      if (!window.S || !window.S.sala) return;
+      this._programarFeedOn(); // mantiene vivo el sondeo aunque aún no haya audio
+      seg._tramoBusy = true;
+      seg._ultTramoT = performance.now();
+      try {
+        const desde = seg.proxIdxDesc || 0;
+        const r = await fetch(
+          `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seg.seq}/tramos?desde=${desde}`,
+          { headers: { Authorization: 'Bearer ' + (window.S.token || '') } });
+        if (!r.ok) {
+          if (r.status === 404 && !seg.bloques.length && !seg.completo) {
+            seg.completo = true;
+            seg.finLocal = true;
+            seg.saltado = true;
+          } else {
+            this._programarRetryTramo(seg, 1500);
+          }
+          return;
+        }
+        const u8 = new Uint8Array(await r.arrayBuffer());
+        if (u8.length < 8 || u8[0] !== 1) return;
+        const flags = u8[1];
+        const n = (u8[6] << 8) | u8[7];
+        let o = 8;
+        const frames = [];
+        for (let k = 0; k < n && o + 2 <= u8.length; k++) {
+          const l = (u8[o] << 8) | u8[o + 1];
+          o += 2;
+          if (o + l > u8.length) break;
+          frames.push(u8.subarray(o, o + l));
+          o += l;
+        }
+        if (frames.length) {
+          const nuevos = await this._decodificarFramesSeg(frames, seg);
+          let sum = 0, cnt = 0;
+          for (const b of nuevos) {
+            if (typeof b.tx === 'number' && b.tx >= 0) {
+              if (seg.vistos.has(b.tx)) continue;
+              seg.vistos.add(b.tx);
+            }
+            this._insertarBloque(seg, { tx: b.tx, pcm: b.pcm });
+            for (let i = 0; i < b.pcm.length; i += 8) { sum += b.pcm[i] * b.pcm[i]; cnt++; }
+          }
+          // nivel RMS para el marcador de "hablando" (mismo umbral que en vivo)
+          if (cnt && Math.sqrt(sum / cnt) > 0.006) {
+            this._speakers.set(seg.de, Date.now() + 650);
+            this._actualizarSpeakers();
+          }
+          for (const fr of frames) {
+            if (seg.rawBytes < 4194304) {
+              seg.raw.push(fr.slice());
+              seg.rawBytes += fr.length;
+            }
+          }
+          this._avanzarProxIdx(seg);
+          seg.ultRxT = performance.now();
+          this._programarFeedOn();
+          // Racha llena del servidor: pedir de inmediato lo que sigue
+          if (n >= 60) setTimeout(() => this._bajarTramos(seg), 0);
+        }
+        if (flags & 1) {
+          // El servidor ya cerró la frase: queda completa localmente, pero
+          // se agenda otra pasada — las piezas rezagadas que rellenen su
+          // archivo después llegan igualmente por esa conexión nueva
+          seg.completo = true;
+          if ((seg._tramoCerrReintentos = (seg._tramoCerrReintentos || 0) + 1) < 20) {
+            this._programarRetryTramo(seg, 2500);
+          }
+        } else {
+          seg._tramoCerrReintentos = 0;
+        }
+      } catch {
+        // conexión caída a media descarga: re-pedir por otra
+        this._programarRetryTramo(seg, 1200);
+      } finally {
+        seg._tramoBusy = false;
       }
     }
 
@@ -3335,6 +3613,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           if (this._autoPresente && this._retrasoMs() > 5000) {
             this.saltarAlPresente();
           }
+          // Empezar a bajar la frase por HTTP de inmediato: el sondeo
+          // periódico y los avisos 'chunk' la mantienen al día en orden
+          this._bajarTramos(seg);
           this.emit('seg_ini', this._segMeta(seg));
           break;
         }
@@ -3361,8 +3642,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             if (this._segPorHablante.get(m.de) === m.seq) {
               this._segPorHablante.delete(m.de);
             }
-            // Huecos detectados en vivo: descargar el segmento completo para
-            // rellenar las tramas que el micro-corte se llevó
+            // Cola final de la frase + huecos: la racha contigua primero y,
+            // si quedaron huecos en vivo, el .seg completo los rellena
+            this._bajarTramos(seg);
             if (seg.huecos && !seg.descargado) this._bajarSeg(m.seq);
           } else {
             // Nunca vimos la frase (corte largo): crearla y descargarla —
@@ -3372,6 +3654,20 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           }
           this._ultimoSeg = Math.max(this._ultimoSeg, m.seq);
           this.emit('seg_fin', this._segMeta(seg));
+          break;
+        }
+
+        case 'chunk': {
+          // El servidor archivó tramas nuevas de un segmento: bajar la racha
+          // contigua por HTTP (cada descarga es una conexión independiente)
+          const seq = Number(m.seq) || 0;
+          const de = m.de || '';
+          if (!seq || de === this.localParticipant.identity) break;
+          let seg = this._vozSegs.get(seq);
+          if (!seg) seg = this._vozSegNuevo(seq, de, m.nombre || de, !m.cerr, m);
+          if (m.cerr) seg.completo = true;
+          if (m.nombre) seg.nombre = m.nombre;
+          this._bajarTramos(seg);
           break;
         }
 

@@ -61,18 +61,19 @@ type segmento struct {
 	// aid (4 bits altos de tx: 1..15) y su contador de trama desde 0 (12 bits
 	// bajos: 0..4095). Al soltar el PTT y volver a pisar cambia aid y la
 	// trama vuelve a 0, separando sin ambigüedad el audio viejo del nuevo.
-	aid        uint8               // identificador de audio del emisor (1..15)
-	vistos     map[uint32]struct{} // (tx<<1 | familia) ya archivados
-	porTx      map[uint32][]byte   // (tx<<1 | familia) -> payload retenido hasta estar en secuencia
-	faltan     map[uint16]struct{} // txs detectados como perdidos
-	faltaDesde map[uint16]int64    // cuándo se detectó cada faltante (el vivo espera máx ~4 s)
-	ackOk      bool                // ya se confirmó al emisor la recepción completa
-	ultTx      uint16              // tx más alto visto en este aid
-	proxEnvTx  uint16              // siguiente tx que toca liberar en secuencia hacia los oyentes
-	tieneTx    bool                // ya llegó al menos una trama numerada
-	ultFalta   int64               // último aviso "falta" enviado al emisor
-	reparaH    int64               // >0: cerrado pero reparable hasta este instante
-	eosVisto   bool                // cerrado por EOS del emisor (no por corte)
+	aid           uint8               // identificador de audio del emisor (1..15)
+	vistos        map[uint32]struct{} // (tx<<1 | familia) ya archivados
+	porTx         map[uint32][]byte   // (tx<<1 | familia) -> payload retenido hasta estar en secuencia
+	faltan        map[uint16]struct{} // txs detectados como perdidos
+	faltaDesde    map[uint16]int64    // cuándo se detectó cada faltante (el vivo espera máx ~4 s)
+	ackOk         bool                // ya se confirmó al emisor la recepción completa
+	ultTx         uint16              // tx más alto visto en este aid
+	proxEnvTx     uint16              // siguiente tx que toca liberar en secuencia hacia los oyentes
+	tieneTx       bool                // ya llegó al menos una trama numerada
+	ultFalta      int64               // último aviso "falta" enviado al emisor
+	reparaH       int64               // >0: cerrado pero reparable hasta este instante
+	eosVisto      bool                // cerrado por EOS del emisor (no por corte)
+	ultChunkNotif int64               // último aviso 'chunk' enviado (rate-limit ~400 ms)
 }
 
 type segStore struct {
@@ -943,6 +944,118 @@ func (s *segStore) ackSegSiCompleto(sg *segmento) {
 	c.enviarCtrl(append([]byte{1}, msg...))
 }
 
+// abiertoDe devuelve el segmento actualmente abierto de un hablante.
+func (s *segStore) abiertoDe(id string) *segmento {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abiertos[id]
+}
+
+// notificarChunk avisa a los oyentes del grupo que el segmento tiene tramas
+// nuevas disponibles para descarga. En el modelo pull el servidor NO empuja
+// voz por el WebSocket: cada oyente baja las tramas por HTTP en orden
+// estricto, así una conexión TCP atascada no frena a ninguna otra.
+func (s *segStore) notificarChunk(sg *segmento) {
+	if sg == nil {
+		return
+	}
+	s.mu.Lock()
+	if ahora()-sg.ultChunkNotif < 400 && sg.Abierto {
+		s.mu.Unlock()
+		return
+	}
+	sg.ultChunkNotif = ahora()
+	seq, de, aid, g := sg.Seq, sg.De, int(sg.aid), sg.Grupo
+	nombre := sg.Nombre
+	ult := -1
+	if sg.tieneTx {
+		ult = int(idxDeTx(sg.ultTx))
+	}
+	cerr := !sg.Abierto
+	s.mu.Unlock()
+	msg, _ := json.Marshal(map[string]any{
+		"t": "chunk", "seq": seq, "de": de, "aid": aid, "ult": ult, "cerr": cerr,
+		"nombre": nombre,
+	})
+	s.mr.enviarCtrlGrupo(g, append([]byte{1}, msg...))
+}
+
+// contigHasta devuelve el aid del audio del segmento y el mayor idx tal que
+// TODAS las tramas 0..idx ya están archivadas (-1 si aún falta la 0).
+// Es el "ACK de recepción" que el emisor usa para soltar su semilla.
+func (s *segStore) contigHasta(sg *segmento) (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sg == nil || !sg.tieneTx || sg.aid == 0 {
+		return 0, -1
+	}
+	idx := 0
+	for idx < 4096 {
+		tx := uint32(armarTx(sg.aid, uint16(idx)))
+		_, a := sg.vistos[tx<<1|0]
+		_, b := sg.vistos[tx<<1|1]
+		if !a && !b {
+			break
+		}
+		idx++
+	}
+	return int(sg.aid), idx - 1
+}
+
+// tramosDesde devuelve la racha CONTIGUA de tramas del segmento a partir del
+// índice `desde` (las dos familias Opus/ADPCM comparten idx y viajan juntas)
+// y una bandera que indica si el segmento está cerrado en el servidor. Si
+// hay un hueco justo en `desde` o más adelante, se entrega solo hasta ahí:
+// el cliente vuelve a pedir desde el mismo índice hasta que la pieza llegue.
+func (s *segStore) tramosDesde(sg *segmento, desde uint16) ([][]byte, bool) {
+	s.mu.Lock()
+	frames := sg.frames
+	if frames != nil {
+		frames = append([][]byte(nil), frames...)
+	}
+	ruta := sg.ruta
+	cerr := !sg.Abierto
+	s.mu.Unlock()
+
+	if frames == nil && ruta != "" {
+		if b, err := os.ReadFile(ruta); err == nil {
+			if _, fr, ok := parsearArchivoSeg(b); ok {
+				frames = fr
+			}
+		}
+	}
+	if len(frames) == 0 {
+		return nil, cerr
+	}
+	out := make([][]byte, 0, 128)
+	esp := int(desde & 0x0fff)
+	ultimo := -1
+	for _, fr := range frames {
+		if len(fr) < 3 {
+			continue
+		}
+		idx := int(idxDeTx(txDeTrama(fr)))
+		if ultimo >= 0 && idx == ultimo {
+			out = append(out, fr) // variante hermana del mismo idx
+			continue
+		}
+		diff := (idx - esp) & 0x0fff
+		if diff >= 2048 {
+			continue // trama anterior a 'desde'
+		}
+		if diff > 0 {
+			break // hueco: solo se entrega la racha contigua
+		}
+		out = append(out, fr)
+		ultimo = idx
+		esp = (esp + 1) & 0x0fff
+		if len(out) >= 200 {
+			break // página de ~8 s de voz: el cliente pide lo que sigue
+		}
+	}
+	return out, cerr
+}
+
 // enviarCtrlGrupo manda un mensaje de control a todos los clientes de un grupo.
 func (r *mediaRoom) enviarCtrlGrupo(grupo int, raw []byte) {
 	r.mu.RLock()
@@ -1003,6 +1116,153 @@ func hAudioSegmento(w http.ResponseWriter, r *http.Request, cl *Claims) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeFile(w, r, sg.ruta)
+}
+
+// hAudioTramos atiende GET /api/salas/{sala}/audio/{seq}/tramos?desde=N
+// Devuelve la racha contigua de tramas desde el índice N del audio (pull):
+// formato binario [u8 ver=1][u8 flags][u32 seq][u16 n][u16 len][trama]*n
+// flags bit0 = segmento cerrado en el servidor.
+func hAudioTramos(w http.ResponseWriter, r *http.Request, cl *Claims) {
+	sala := r.PathValue("sala")
+	seq, err := strconv.ParseUint(r.PathValue("seq"), 10, 32)
+	if err != nil {
+		escribirJSON(w, 400, map[string]string{"error": "seq inválido"})
+		return
+	}
+	mr := media.room(sala)
+	sg := mr.seg.buscar(uint32(seq))
+	if sg == nil {
+		escribirJSON(w, 404, map[string]string{"error": "segmento no encontrado"})
+		return
+	}
+	desde := uint16(0)
+	if v := r.URL.Query().Get("desde"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 16); err == nil {
+			desde = uint16(n)
+		}
+	}
+	frames, cerr := mr.seg.tramosDesde(sg, desde)
+	flags := byte(0)
+	if cerr {
+		flags |= 1
+	}
+	out := make([]byte, 0, 8+len(frames)*96)
+	out = append(out, 1, flags)
+	var f4 [4]byte
+	binary.BigEndian.PutUint32(f4[:], uint32(seq))
+	out = append(out, f4[:]...)
+	var f2 [2]byte
+	binary.BigEndian.PutUint16(f2[:], uint16(len(frames)))
+	out = append(out, f2[:]...)
+	for _, fr := range frames {
+		binary.BigEndian.PutUint16(f2[:], uint16(len(fr)))
+		out = append(out, f2[:]...)
+		out = append(out, fr...)
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write(out)
+}
+
+// hAudioSubir atiende POST /api/salas/{sala}/audio/subir — cuerpo binario:
+// [u8 ver=1][u16 n][u16 len][trama]*n donde cada trama es el mismo payload
+// que antes viajaba dentro del mensaje binario del WS (rateCode + txLE +
+// datos). Cada trozo viaja por su propia conexión HTTP: un trozo atascado
+// se reintenta por otra conexión sin frenar a los demás, y el servidor
+// archiva todo en su .seg y avisa a los oyentes con un control diminuto
+// ('chunk'/'falta') para que descarguen la racha contigua por HTTP.
+func hAudioSubir(w http.ResponseWriter, r *http.Request, cl *Claims) {
+	sala := r.PathValue("sala")
+	mr := media.room(sala)
+	c := mr.clienteDe(cl.Identity)
+	if c == nil {
+		// Sin el socket de medios no hay grupo/piso que arbitrar: el cliente
+		// reintenta el trozo tras reconectarse (la cola conserva la voz).
+		escribirJSON(w, 409, map[string]string{"error": "socket de medios no conectado"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if r.Body != nil {
+		r.Body.Close()
+	}
+	if err != nil || len(body) < 3 || body[0] != 1 {
+		escribirJSON(w, 400, map[string]string{"error": "cuerpo de trozo inválido"})
+		return
+	}
+	n := int(binary.BigEndian.Uint16(body[1:3]))
+	i := 3
+	var cerrados []*segmento
+	for k := 0; k < n && i+2 <= len(body); k++ {
+		l := int(binary.BigEndian.Uint16(body[i : i+2]))
+		i += 2
+		if l < 1 || i+l > len(body) {
+			break
+		}
+		fr := body[i : i+l]
+		i += l
+		rc := fr[0]
+
+		// Igual que en el WS: primero reparar (puede ser una pieza rezagada
+		// de un audio ya cerrado con el mismo aid)
+		if len(fr) >= 3 {
+			if sgR, _ := mr.seg.reparar(c.identidad, fr); sgR != nil {
+				mr.seg.pedirFaltantes(sgR)
+				mr.seg.ackSegSiCompleto(sgR)
+				if (rc == 0 || len(sgR.faltan) == 0) && sgR.DurMs >= 700 {
+					mr.notificarSegFin(sgR)
+				}
+				mr.seg.notificarChunk(sgR)
+				continue
+			}
+			aidTrama := aidDeTx(txDeTrama(fr))
+			if (aidTrama != 0 && aidTrama == c.aidSuelto) ||
+				(c.pisoSuelto && (aidTrama == 0 || aidTrama == c.pisoAid)) {
+				continue
+			}
+			if aidTrama != 0 && aidTrama != c.pisoAid {
+				c.pisoAid = aidTrama
+				c.pisoSuelto = false
+			}
+		}
+		// Piso exclusivo por trama, igual que en el WS
+		if !mr.pisoCheck(c, rc) {
+			continue
+		}
+		if !c.micOn {
+			mr.mu.Lock()
+			c.micOn = true
+			mr.mu.Unlock()
+			mr.difundirEstadoPeers(c.grupo)
+		}
+		nuevo, cerrado, faltan, _ := mr.seg.appendFrame(c.identidad, c.nombre, c.grupo, fr, false)
+		if nuevo != nil {
+			mr.seg.notificarSegIni(nuevo)
+		}
+		if cerrado != nil {
+			mr.notificarSegFin(cerrado)
+			mr.seg.ackSegSiCompleto(cerrado)
+			cerrados = append(cerrados, cerrado)
+		}
+		if len(faltan) > 0 {
+			msg, _ := json.Marshal(map[string]any{"t": "falta", "txs": faltan})
+			c.enviarCtrl(append([]byte{1}, msg...))
+		}
+	}
+	// Avisar a los oyentes que hay tramas nuevas para bajar por HTTP y
+	// responder al emisor con su ACK: el seq abierto y hasta qué índice
+	// contiguo tiene archivado el servidor (puede soltar su semilla hasta ahí)
+	resp := map[string]any{"ok": true, "contig": -1}
+	if sg := mr.seg.abiertoDe(c.identidad); sg != nil {
+		mr.seg.notificarChunk(sg)
+		aid, contig := mr.seg.contigHasta(sg)
+		resp["seq"] = sg.Seq
+		resp["aid"] = aid
+		resp["contig"] = contig
+	}
+	for _, sg := range cerrados {
+		mr.seg.notificarChunk(sg)
+	}
+	escribirJSON(w, 200, resp)
 }
 
 // barrerSegmentos corre cada segundo: cierra frases sin EOS (WiFi muerto a
