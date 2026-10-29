@@ -2130,6 +2130,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     // y tanto piso_tomar como piso_soltar llevan ese mismo aid para que el
     // servidor nunca confunda el soltar del audio 1 con el pisar del audio 2.
     tomarPiso() {
+      // Un soltar diferido quedaba en camino: se cancela — sigo hablando
+      if (this._sueltaProgT) { clearTimeout(this._sueltaProgT); this._sueltaProgT = null; }
       this._quieroPiso = true;
       this._vozAid = (((this._vozAid || 0) % 15) + 1);
       this._pisoAidAct = this._vozAid;
@@ -2139,7 +2141,26 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
     }
 
     soltarPiso() {
-      const aidSuelto = this._pisoAidAct || this._vozAid || 0;
+      this.soltarPisoAid(this._pisoAidAct || this._vozAid || 0);
+    }
+
+    // Soltar diferido (~1 s por defecto): el dedo ya se levantó pero el
+    // micro sigue capturando — la frase no queda cortada al ras del gesto
+    // y la cola del audio gana margen para entrar en los receptores antes
+    // de que llegue el seg_fin. Si vuelvo a pisar antes de que venza, se
+    // cancela solo (tomarPiso limpia el timer y _quieroPiso queda true).
+    programarSoltarPiso(ms) {
+      if (this._sueltaProgT) return;
+      const aid = this._pisoAidAct || this._vozAid || 0;
+      this._sueltaProgT = setTimeout(() => {
+        this._sueltaProgT = null;
+        if (this._quieroPiso) return; // repisé antes de soltar: no suelto nada
+        this.soltarPisoAid(aid);
+      }, ms == null ? 1000 : ms);
+    }
+
+    soltarPisoAid(aidSuelto) {
+      if (this._sueltaProgT) { clearTimeout(this._sueltaProgT); this._sueltaProgT = null; }
       this._ultAidSuelto = aidSuelto;
       this._pisoAidPend = 0;
       this._quieroPiso = false;

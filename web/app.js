@@ -1603,6 +1603,9 @@ async function pttOn() {
   }
   S.ptt.quiero = true;
   S.ptt.desde = Date.now(); // mientras quiero y !tengo el pulsador gira "conectando"
+  // Repisé dentro del colchón de soltado: el retiro diferido del micro se
+  // cancela (el de piso lo cancela tomarPiso en el engine)
+  if (S.ptt._sueltaMicT) { clearTimeout(S.ptt._sueltaMicT); S.ptt._sueltaMicT = null; }
   S.room.tomarPiso();
   try {
     if (!S.audio.pub) {
@@ -1630,10 +1633,12 @@ async function pttOff(inmediato) {
   S.ptt.desde = 0;
   ocultarGestosPtt();
   // Soltar localmente DE INMEDIATO sin esperar al servidor:
-  // 1) mutear el micrófono ya mismo para no grabar ni una trama más,
-  // 2) apagar mi propio indicador de hablando y limpiar mi piso local,
-  // 3) pintar el botón suelto al instante antes de cualquier await.
-  if (S.ptt.modo !== 'auto' && S.audio.pub && !S.audio.pub.isMuted) {
+  // 1) apagar mi propio indicador de hablando y limpiar mi piso local,
+  // 2) pintar el botón suelto al instante antes de cualquier await.
+  // Solo en soltar INMEDIATO (interrupción) se muta el micro al instante;
+  // en el soltar normal el micro sigue ~1 s capturando ambiente para que
+  // la frase no quede cortada al ras del gesto en el otro lado.
+  if (inmediato && S.ptt.modo !== 'auto' && S.audio.pub && !S.audio.pub.isMuted) {
     try { S.audio.pub.mute().catch(() => {}); } catch {}
   }
   if (S.activo === S.identidad) S.activo = null;
@@ -1641,16 +1646,32 @@ async function pttOff(inmediato) {
     S.estado.piso = '';
     S.estado.pisoNombre = '';
   }
-  if (S.room) S.room.soltarPiso();
+  if (S.room) {
+    // Colchón de ~1,1 s antes del piso_soltar real: la cola del audio
+    // llega completa al servidor y el receptor tiene margen para drenarla.
+    // Si vuelvo a pisar dentro del margen, tomarPiso cancela el timer.
+    if (!inmediato && S.room.programarSoltarPiso) S.room.programarSoltarPiso(1100);
+    else S.room.soltarPiso();
+  }
   renderControles();
   renderAsientos();
   if (S.ptt.modo === 'auto') {
     // el micro sigue abierto en local para que el VAD siga escuchando
     S.audio.on = true;
-  } else {
+  } else if (inmediato) {
     // manual: liberar el hardware del micrófono de inmediato
     await retirarMic();
     S.audio.liberar = true;
+  } else {
+    // El micro se retira tras el colchón (~1,1 s): durante ese margen sigue
+    // mandando ambiente — la cola que remata la frase en el otro lado
+    if (S.ptt._sueltaMicT) clearTimeout(S.ptt._sueltaMicT);
+    S.ptt._sueltaMicT = setTimeout(async () => {
+      S.ptt._sueltaMicT = null;
+      if (S.ptt.quiero || S.ptt._bloqueado) return; // repisé: no retiro nada
+      await retirarMic();
+      S.audio.liberar = true;
+    }, 1100);
   }
   renderControles();
 }
