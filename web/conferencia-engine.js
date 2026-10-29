@@ -2846,6 +2846,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       while (idxs.has(seg.proxIdxDesc & 0x0fff) && guard++ < 4096) {
         seg.proxIdxDesc = (seg.proxIdxDesc + 1) & 0x0fff;
       }
+      // si el cursor ya alcanzó todo lo recibido, los huecos viejos se
+      // rellenaron — limpiar la marca para que la nota pueda persistirse
+      if (!this._segTieneHuecos(seg)) seg.huecos = false;
     }
 
     // Reintento diferido de una bajada fallida: el trozo se vuelve a pedir
@@ -2957,19 +2960,40 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       }
     }
 
-    // Respaldo post-cierre: pasados unos segundos baja el .seg COMPLETO.
-    // Lo que el sondeo de tramos no alcanzó a traer (la última palabra que
-    // aún viajaba cuando llegó seg_fin) se inserta por _insertarBloque en
-    // el borde no escuchado y termina de sonar — jamás se corta en vivo.
+    // Respaldo post-cierre: solo se baja el .seg COMPLETO si el segmento
+    // quedó con huecos reales. Con los tramos confirmados por el servidor
+    // el respaldo ciego era una segunda descarga del mismo audio por cada
+    // frase — desperdicio puro de datos en el oyente.
     _programarBajadaArchivo(seg) {
       if (!seg || seg._archT || seg.descargado || seg.propio) return;
       seg._archT = setTimeout(() => {
         seg._archT = null;
         if (!seg.saltado && !seg.descargado &&
-            this._vozSegs.get(seg.seq) === seg) {
+            this._vozSegs.get(seg.seq) === seg &&
+            this._segTieneHuecos(seg)) {
           this._bajarSeg(seg.seq);
         }
       }, 3500);
+    }
+
+    // ¿Quedaron piezas sin rellenar? Se compara el cursor contiguo de
+    // descarga (proxIdxDesc) con la trama más alta recibida: si hay
+    // bloques más allá del cursor, falta al menos una pieza intermedia.
+    // Si no llegó ninguna trama y la frase cerró, el audio entero falta.
+    _segTieneHuecos(seg) {
+      if (!seg || seg.descargado) return false;
+      let maxIdx = -1;
+      for (const b of seg.bloques) {
+        if (typeof b.tx === 'number' && b.tx >= 0) {
+          const i = b.tx & 0x0fff;
+          if (maxIdx < 0 || ((i - maxIdx) & 0x0fff) < 2048) maxIdx = i;
+        }
+      }
+      if (maxIdx >= 0) {
+        const d = (maxIdx - (seg.proxIdxDesc || 0)) & 0x0fff;
+        return d > 0 && d < 2048;
+      }
+      return seg.completo || !!seg.huecos;
     }
 
     // Tras una reconexión: pide al servidor el manifiesto de segmentos que
