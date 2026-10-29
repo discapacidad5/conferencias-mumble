@@ -2268,6 +2268,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         // sus últimos trozos por HTTP: la pieza tardía cae al borde aún
         // no escuchado → se reabre para terminar de sonar. Los huecos
         // internos rellenados después quedan atrás y no repiten audio
+        console.log('[voz] seg', seg.seq, 'REABIERTA por trama tardía idx',
+          bl.tx & 0x0fff);
         seg.reproducido = false;
         seg.finAvisado = false;
       }
@@ -2516,6 +2518,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             seg.bajando = false;
             seg.perdido = true;
             seg.saltado = true;
+            console.log('[voz] seg', seg.seq, 'PERDIDA: bajando >8s, alimentado',
+              seg.alimentado, '/', seg.bloques.length);
             this.emit('seg_perdido', seg.seq);
           }
         } else {
@@ -2561,6 +2565,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             seg.finAvisado = true;
             seg.reproducido = true;
             seg._finT = ahoraMs; // ventana para que una cola tardía reabra
+            console.log('[voz] seg', seg.seq, 'marcada reproducida: alimentado',
+              seg.alimentado, '/', seg.bloques.length);
             this._marcarOido(seg.seq);
             this.emit('seg_reproducido', this._segMeta(seg));
           }
@@ -2582,6 +2588,8 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       const vacio = !seg && !this._replayQ.length && !this._replayProg.length;
       if (vacio && !pipe.eosSent) {
         pipe.eosSent = true;
+        console.log('[voz] cola vacía → eos al worklet (bufMs=' +
+          Math.round(this._vozBufMs) + ')');
         if (pipe.worklet) {
           try { pipe.worklet.port.postMessage({ t: 'eos' }); } catch {}
         } else {
@@ -2686,11 +2694,16 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       if (seq <= 0 || this._fetchSegs.has(seq) || !window.S || !window.S.sala) return;
       this._fetchSegs.add(seq);
       const seg = this._vozSegs.get(seq);
-      if (seg) { seg.bajando = true; seg.bajaDesde = performance.now(); }
+      // Solo se pausa el vivo esperando frases AÚN abiertas; una cerrada
+      // rellena en segundo plano sin bloquear la cola que está sonando
+      if (seg && !seg.completo) { seg.bajando = true; seg.bajaDesde = performance.now(); }
+      const ctrl = new AbortController();
+      const ctrlT = setTimeout(() => { try { ctrl.abort(); } catch {} }, 12000);
       try {
         const r = await fetch(
           `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seq}`,
-          { headers: { Authorization: 'Bearer ' + (window.S.token || '') } });
+          { headers: { Authorization: 'Bearer ' + (window.S.token || '') },
+            signal: ctrl.signal });
         if (!r.ok) {
           if (seg) {
             seg.bajando = false;
@@ -2717,6 +2730,11 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         // La frase propia solo se archiva (raw + IndexedDB): no se decodifica
         // a la cola en vivo para no oírme a mí mismo con retraso
         const nuevos = sg.propio ? [] : await this._decodificarFramesSeg(parsed.frames, sg);
+        if (nuevos.length || (parsed.frames && parsed.frames.length)) {
+          console.log('[voz] .seg bajado', seq, ':', (parsed.frames || []).length,
+            'tramas →', nuevos.length, 'nuevas | alimentado',
+            sg.alimentado, '/', sg.bloques.length, 'reproducido', sg.reproducido);
+        }
         for (const b of nuevos) {
           if (typeof b.tx === 'number' && b.tx >= 0) {
             if (sg.vistos.has(b.tx)) continue;
@@ -2743,6 +2761,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       } catch {
         if (seg) seg.bajando = false;
       } finally {
+        clearTimeout(ctrlT);
         this._fetchSegs.delete(seq);
       }
     }
@@ -2786,11 +2805,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._programarFeedOn(); // mantiene vivo el sondeo aunque aún no haya audio
       seg._tramoBusy = true;
       seg._ultTramoT = performance.now();
+      const ctrl = new AbortController();
+      const ctrlT = setTimeout(() => { try { ctrl.abort(); } catch {} }, 9000);
       try {
         const desde = seg.proxIdxDesc || 0;
         const r = await fetch(
           `/api/salas/${encodeURIComponent(window.S.sala)}/audio/${seg.seq}/tramos?desde=${desde}`,
-          { headers: { Authorization: 'Bearer ' + (window.S.token || '') } });
+          { headers: { Authorization: 'Bearer ' + (window.S.token || '') },
+            signal: ctrl.signal });
         if (!r.ok) {
           if (r.status === 404 && !seg.bloques.length && !seg.completo) {
             seg.completo = true;
@@ -2848,6 +2870,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           // se agenda otra pasada — las piezas rezagadas que rellenen su
           // archivo después llegan igualmente por esa conexión nueva
           seg.completo = true;
+          console.log('[voz] tramos', seg.seq, 'cerrada desde', desde,
+            'trajeron', n, 'tramas | bloques', seg.bloques.length,
+            'alimentado', seg.alimentado);
+          this._programarBajadaArchivo(seg); // respaldo: el .seg completo
           if ((seg._tramoCerrReintentos = (seg._tramoCerrReintentos || 0) + 1) < 20) {
             this._programarRetryTramo(seg, 2500);
           }
@@ -2855,13 +2881,29 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           seg._tramoCerrReintentos = 0;
         }
       } catch {
-        // conexión caída a media descarga: re-pedir por otra — con tope si
-        // la frase ya cerró, para no sondear de por vida una seg "oída"
+        // conexión caída o colgada a media descarga: re-pedir por otra —
+        // con tope si la frase ya cerró, para no sondear de por vida
         if (seg.completo && (seg._tramoFails = (seg._tramoFails || 0) + 1) > 8) return;
         this._programarRetryTramo(seg, 1200);
       } finally {
+        clearTimeout(ctrlT);
         seg._tramoBusy = false;
       }
+    }
+
+    // Respaldo post-cierre: pasados unos segundos baja el .seg COMPLETO.
+    // Lo que el sondeo de tramos no alcanzó a traer (la última palabra que
+    // aún viajaba cuando llegó seg_fin) se inserta por _insertarBloque en
+    // el borde no escuchado y termina de sonar — jamás se corta en vivo.
+    _programarBajadaArchivo(seg) {
+      if (!seg || seg._archT || seg.descargado || seg.propio) return;
+      seg._archT = setTimeout(() => {
+        seg._archT = null;
+        if (!seg.saltado && !seg.descargado &&
+            this._vozSegs.get(seg.seq) === seg) {
+          this._bajarSeg(seg.seq);
+        }
+      }, 3500);
     }
 
     // Tras una reconexión: pide al servidor el manifiesto de segmentos que
@@ -3671,9 +3713,14 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             if (this._segPorHablante.get(m.de) === m.seq) {
               this._segPorHablante.delete(m.de);
             }
-            // Cola final de la frase + huecos: la racha contigua primero y,
-            // si quedaron huecos en vivo, el .seg completo los rellena
+            console.log('[voz] seg_fin', m.seq, 'de', m.de,
+              'alimentado', seg.alimentado, '/', seg.bloques.length,
+              'reproducido', seg.reproducido, 'saltado', seg.saltado);
+            // Cola final de la frase + huecos: la racha contigua primero;
+            // el .seg completo unos segundos después, como respaldo — lo
+            // que aún viajaba cuando llegó seg_fin llega igual y suena
             this._bajarTramos(seg);
+            this._programarBajadaArchivo(seg);
             if (seg.huecos && !seg.descargado) this._bajarSeg(m.seq);
           } else {
             // Nunca vimos la frase (corte largo): crearla y descargarla —
@@ -3694,7 +3741,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           if (!seq || de === this.localParticipant.identity) break;
           let seg = this._vozSegs.get(seq);
           if (!seg) seg = this._vozSegNuevo(seq, de, m.nombre || de, !m.cerr, m);
-          if (m.cerr) seg.completo = true;
+          if (m.cerr) { seg.completo = true; this._programarBajadaArchivo(seg); }
           if (m.nombre) seg.nombre = m.nombre;
           this._bajarTramos(seg);
           break;
