@@ -321,16 +321,18 @@ label.check input { width: auto; }
 #vista-sala.sin-panel { grid-template-columns: 1fr; }
 #vista-sala.sin-panel #panel-lateral { display: none; }
 #barra-top {
-  grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center;
-  background: var(--bg2); border-bottom: 1px solid var(--borde); padding: .5rem 1rem; gap: 1rem;
-  flex-wrap: wrap; position: relative;
+  grid-column: 1 / -1; display: flex; flex-direction: column;
+  background: var(--bg2); border-bottom: 1px solid var(--borde); padding: .5rem 1rem;
+  position: relative; gap: .2rem;
 }
-/* avisos dentro de la barra (escritorio): mano/lobby son lo primero que se
-   ve; en móvil vuelven a flotar bajo la barra por falta de espacio */
-#st-avisos { display: flex; gap: .3rem; z-index: 45; flex-shrink: 0; }
+/* la fila de avisos es fija: los chips aparecen y desaparecen dentro de una
+   línea reservada, sin empujar el título ni el resto de la barra */
+#st-avisos { display: flex; gap: .3rem; z-index: 45; flex-shrink: 0; min-height: 26px; align-items: center; }
+/* título + vistas + acciones comparten la segunda línea, que no se mueve */
+.top-fila { display: flex; justify-content: space-between; align-items: center; gap: .5rem; flex-wrap: wrap; }
 /* topbar compacto: seis vistas + acciones tienen que caber en la barra
    completa sin comérsela entera — botones pequeños y gaps cortos */
-#barra-top { padding: .35rem .75rem; gap: .5rem; }
+#barra-top { padding: .35rem .75rem; }
 #st-vistas { gap: .3rem; flex-wrap: wrap; }
 #st-vistas .btn, .top-acciones .btn { padding: .3rem .6rem; font-size: .8rem; }
 /* mano levantada y sala de espera: ámbar para que el aviso salte a la vista */
@@ -880,12 +882,15 @@ body.compartiendo .asiento-pin, body.compartiendo .tile-pin { display: none; }
     grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto;
   }
   #barra-top {
-    display: grid; grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas: "identidad acciones"; gap: .25rem .4rem;
-    padding: .35rem .55rem; flex-wrap: nowrap; min-height: 52px;
+    display: flex; flex-direction: column; gap: .15rem;
+    padding: .3rem .55rem;
   }
-  .top-identidad { grid-area: identidad; min-width: 0; margin: 0; }
-  .top-acciones { grid-area: acciones; margin: 0; gap: .35rem; }
+  /* fila de avisos reservada también en móvil: los chips ya no flotan
+     sobre el contenido — ocupan su propia línea que no empuja el título */
+  #st-avisos { position: static; min-height: 38px; gap: .35rem; }
+  .top-fila { flex-wrap: nowrap; gap: .4rem; }
+  .top-identidad { min-width: 0; margin: 0; }
+  .top-acciones { margin: 0; gap: .35rem; }
   #st-nombre-sala { display: block; font-size: .95rem; max-width: 54vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #st-vistas-toggle, #st-panel-admin, #st-salir { min-width: 46px; min-height: 46px; padding: .4rem; }
   #st-panel-admin, #st-salir { font-size: 0; }
@@ -902,7 +907,6 @@ body.compartiendo .asiento-pin, body.compartiendo .tile-pin { display: none; }
   #st-vistas.abierto { display: flex; }
   #st-vistas .btn { width: 100%; min-height: 48px; font-size: 1rem; text-align: left; }
   #st-vistas .btn.activo { text-align: left; }
-  #st-avisos { position: absolute; left: .45rem; top: calc(100% + 3px); gap: .35rem; }
   .chip-ico { min-width: 40px; min-height: 38px; font-size: 1rem; }
 
   #zona-principal { min-width: 0; min-height: 0; }
