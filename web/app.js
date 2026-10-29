@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v221 (2.1.10)';
+const CONF_BUILD = 'v222 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -1681,7 +1681,11 @@ async function prepararMicPtt() {
   if (S.ptt.modo !== 'auto') return;
   try {
     const track = await construirMicTrack();
+    // el modo pudo cambiar a manual mientras getUserMedia abría: en manual
+    // el micro no se queda abierto — se libera el hardware completo
+    if (S.ptt.modo !== 'auto' || S.audio.pub) { await desecharMic(track); return; }
     S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+    if (S.ptt.modo !== 'auto') { await retirarMic(); return; }
     S.audio.on = true; // intención: auto activo (reconexiones repúblican)
   } catch {}
 }
@@ -1716,11 +1720,12 @@ async function pttOn() {
   try {
     if (!S.audio.pub && !pisoAjeno) {
       const track = await construirMicTrack();
-      // Soltó el PTT mientras getUserMedia abría el micro: no publicarlo —
-      // si se publica ya nadie lo retira y queda clavado impidiendo usar
-      // el micrófono en otra app
-      if (!S.ptt.quiero) { try { track.stop(); } catch {} }
-      else S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+      // Soltó el PTT mientras getUserMedia abría el micro: no publicarlo y
+      // cerrar el pipeline crudo — track.stop() solo no basta (el stream
+      // real vive en S.audio.rawStream). Si se publica y nadie lo retira
+      // queda clavado impidiendo usar el micrófono en otra app
+      if (!S.ptt.quiero) await desecharMic(track);
+      else if (!S.audio.pub) S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
     }
     if (S.audio.pub && !S.ptt.quiero) {
       // soltó durante la publicación: retiro ya
@@ -1733,6 +1738,9 @@ async function pttOn() {
   } catch (e) {
     S.ptt.quiero = false;
     if (S.room && S.room.soltarPiso) S.room.soltarPiso();
+    // si el fallo fue publicar pero el getUserMedia sí abrió, el stream
+    // crudo queda capturando: cerrarlo siempre al salir con error
+    if (!S.audio.pub) cerrarPipeline();
     toast('No se pudo hablar: ' + e.message);
   }
   renderControles();
@@ -2158,10 +2166,10 @@ async function chequearGrupo() {
         if (modoPtt() && S.ptt.quiero) {
           if (!S.audio.pub) {
             const track = await construirMicTrack();
-            if (S.ptt.quiero) {
+            if (S.ptt.quiero && !S.audio.pub) {
               S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
-            } else {
-              try { track.stop(); } catch {}
+            } else if (!S.ptt.quiero) {
+              await desecharMic(track);
             }
           }
           if (S.ptt.quiero) {
@@ -2543,21 +2551,25 @@ function cablearRoom(room) {
       S.ptt.tengo = true;
       // Pedí el piso estando ocupado por otro: el micro no se abrió (para
       // no cortar la escucha si me lo negaban). Ya es mío — se abre ahora.
-      if (S.ptt.quiero && !S.audio.pub) {
+      if (S.ptt.quiero && !S.audio.pub && !S.audio.abriendo) {
         (async () => {
           try {
             const track = await construirMicTrack();
-            // Soltó mientras el micro abría: detener el hardware y no
-            // publicar — el retiro de pttOff ya corrió con pub aún null
-            if (!S.ptt.quiero) { try { track.stop(); } catch {} return; }
-            const pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
-            if (!S.ptt.quiero) {
-              try { await S.room.localParticipant.unpublishTrack(pub.track).catch(() => {}); } catch {}
-              try { pub.track.stop(); } catch {}
-              return;
+            // Soltó mientras el micro abría: liberar TODO el hardware —
+            // el retiro de pttOff ya corrió con pub aún null y el stream
+            // crudo queda capturando si solo se hace track.stop()
+            if (!S.ptt.quiero) { await desecharMic(track); return; }
+            if (!S.audio.pub) {
+              const pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
+              if (!S.ptt.quiero) {
+                try { await S.room.localParticipant.unpublishTrack(pub.track).catch(() => {}); } catch {}
+                try { pub.track.stop(); } catch {}
+                cerrarPipeline();
+                return;
+              }
+              S.audio.pub = pub;
+              await pub.unmute();
             }
-            S.audio.pub = pub;
-            await pub.unmute();
             S.audio.on = true;
           } catch (e) { toast('No se pudo hablar: ' + e.message); }
         })();
@@ -2746,10 +2758,10 @@ async function reconectar() {
           if (modoPtt() && S.ptt.quiero) {
             if (!S.audio.pub) {
               const track = await construirMicTrack();
-              if (S.ptt.quiero) {
+              if (S.ptt.quiero && !S.audio.pub) {
                 S.audio.pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
-              } else {
-                try { track.stop(); } catch {}
+              } else if (!S.ptt.quiero) {
+                await desecharMic(track);
               }
             }
             if (S.ptt.quiero) {
@@ -4627,7 +4639,16 @@ async function iniciarGrabacion() {
 }
 
 /* ---------- pipeline de audio: micro → ganancia → analyser → publicación ---------- */
-async function construirMicTrack() {
+// Single-flight: si dos vías piden abrir el micro a la vez (pttOn y el eco
+// 'piso' del servidor, p.ej.) ambas esperan la MISMA apertura. Sin esto cada
+// una lanzaba su propio getUserMedia y el segundo pisaba S.audio.rawStream:
+// el primer stream quedaba huérfano, vivo y sin referencia para soltarlo.
+function construirMicTrack() {
+  if (S.audio.abriendo) return S.audio.abriendo;
+  S.audio.abriendo = _construirMicTrack().finally(() => { S.audio.abriendo = null; });
+  return S.audio.abriendo;
+}
+async function _construirMicTrack() {
   // Asegurar que cualquier stream anterior quede cerrado antes de abrir otro
   if (S.audio.rawStream) {
     S.audio.rawStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
@@ -4678,6 +4699,20 @@ function cerrarPipeline() {
   detenerMedidor(); // el medidor del prejoin también captura: hay que soltarlo
 }
 
+// Soltar el micro que se abrió "de más" (soltaste el PTT mientras
+// getUserMedia estaba en vuelo). OJO: track.stop() solo no basta — el
+// getUserMedia real vive en S.audio.rawStream, no en el track publicado;
+// hay que pasar por cerrarPipeline o queda capturando siempre.
+// Si ya hay una publicación viva el pipeline compartido le pertenece a
+// ella: no se toca nada (su propio dueño la retira si corresponde).
+async function desecharMic(track) {
+  const pubViva = S.audio.pub ||
+    (S.room && S.room.localParticipant.getTrackPublication(LC.Track.Source.Microphone));
+  if (pubViva) return;
+  cerrarPipeline();
+  try { if (track) track.stop(); } catch {}
+}
+
 // preset Opus/ADPCM según el perfil de sala y la velocidad de conexión detectada
 const AUDIO_PRESETS = { telefono: 'telephone', voz: 'speech', musica: 'musicStereo' };
 function perfilAudioEfectivo() {
@@ -4726,11 +4761,17 @@ async function retirarMic() {
   } catch (e) { fallo = true; toast('No se pudo retirar el micro: ' + e.message); }
   finally {
     S.audio.retirando = false;
-    if (S.room === room) {
-      S.audio.on = false; // retirar = intención de apagado (usuario o permiso perdido)
-      cerrarPipeline();
-      if (!fallo) renderControles();
-    }
+    // retirar = intención de apagado — pero si el dedo volvió a pisar el PTT
+    // a mitad del await, la intención nueva manda y no se apaga nada
+    if (!S.ptt.quiero) S.audio.on = false;
+    // cerrar el pipeline aunque haya cambiado la sala a mitad del retiro:
+    // rawStream/ctx son recursos del aparato, no de la conexión. Solo se
+    // respeta si otra vía ya dejó una publicación viva (re-publicó en el
+    // medio): cerrarPipeline mataría ESE micro
+    const pubViva = S.room && S.room.localParticipant &&
+      S.room.localParticipant.getTrackPublication(LC.Track.Source.Microphone);
+    if (!pubViva) cerrarPipeline();
+    if (!fallo && S.room === room) renderControles();
   }
 }
 
@@ -4792,7 +4833,12 @@ async function reconstruirMic() {
   await S.room.localParticipant.unpublishTrack(viejo);
   cerrarPipeline();
   if (!puedoHablar()) return;
+  // soltó el PTT o apagó el micro mientras se reconstruía: no reabrir —
+  // en modo manual el hardware solo vive mientras la intención siga
+  const sinIntencion = () => modoPtt() && !S.ptt.quiero && !S.audio.on;
+  if (sinIntencion()) return;
   const track = await construirMicTrack();
+  if (sinIntencion()) { await desecharMic(track); return; }
   const pub = await S.room.localParticipant.publishTrack(track, opcionesAudio());
   S.audio.pub = pub;
   if (!estabaOn) await pub.mute();
