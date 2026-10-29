@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v207 (2.1.7+)';
+const CONF_BUILD = 'v208 (2.1.8)';
 console.log('[conf] build', CONF_BUILD);
 const LC = window.LivekitClient;
 const $ = (s) => document.querySelector(s);
