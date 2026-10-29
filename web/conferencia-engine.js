@@ -440,7 +440,9 @@ class VozRxProcessor extends AudioWorkletProcessor {
     this.fadeInLen = Math.ceil(rate * 0.005);
     this.readRate = 1.0;
     this.velMax = 1.0;
-    this.targetSamples = Math.ceil(rate * 0.06); // arranca de inmediato (sin colchón artificial)
+    this.targetSamples = Math.ceil(rate * 0.3); // ~300 ms de colchón al arrancar:
+                                                // con menos, cualquier jitter de red
+                                                // paraba/reanudaba el reproductor (micro-cortes)
     this.capMs = 28;
     this.solaOv = Math.ceil(rate * 0.01);
     this.solaTail = new Float32Array(this.solaOv);
@@ -544,7 +546,10 @@ class VozRxProcessor extends AudioWorkletProcessor {
         if (Math.abs(this.lastOut) < 0.0001) this.lastOut = 0;
         out[i] = this.lastOut;
         this.underrunSamples++;
-        if (this.eosPending || this.underrunSamples > this.rate * 0.08) {
+        // ~400 ms de hueco tolerado con cola amortiguada antes de parar:
+        // el tope viejo de 80 ms detenía y reanudaba el reproductor en
+        // cada bache de red — cada ciclo sonaba como un micro-corte
+        if (this.eosPending || this.underrunSamples > this.rate * 0.4) {
           this.playing = false;
           this.eosPending = false;
           this.waitSamples = 0;
@@ -2421,7 +2426,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         eosPending: true, waitSamples: 0, underrunSamples: 0,
         lastOut: 0, fadeInPos: 0, fadeInLen: Math.ceil(ctxRate * 0.005),
         readRate: 1.0, velMax: 1.0, eosSent: true,
-        targetSamples: Math.ceil(ctxRate * 0.06),
+        targetSamples: Math.ceil(ctxRate * 0.3),
       };
       this._vozPipe = pipe;
 
@@ -2435,7 +2440,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
           pipe.worklet = wn;
           try {
             wn.port.postMessage({ t: 'cap', ms: 28000 });
-            wn.port.postMessage({ t: 'target', ms: 60 });
+            wn.port.postMessage({ t: 'target', ms: 300 });
           } catch {}
           if (pipe.proc) { try { pipe.proc.disconnect(); } catch {} pipe.proc = null; }
           return true;
@@ -2473,7 +2478,7 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               if (Math.abs(pipe.lastOut) < 0.0001) pipe.lastOut = 0;
               out[i] = pipe.lastOut;
               pipe.underrunSamples++;
-              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.08) {
+              if (pipe.eosPending || pipe.underrunSamples > pipe.ctxRate * 0.4) {
                 pipe.playing = false; pipe.eosPending = false;
                 pipe.waitSamples = 0; pipe.available = 0;
                 pipe.readPosF = pipe.writePos;
@@ -2525,9 +2530,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       this._vozBufMs = Math.max(0, this._vozBufMs - dt);
 
       // 1. Notas re-escuchadas tienen prioridad y suenan a velocidad 1.0x
-      while (this._replayQ.length && this._vozBufMs < 1200) {
+      while (this._replayQ.length && this._vozBufMs < 2000) {
         const rp = this._replayQ[0];
-        while (rp.alimentado < rp.bloques.length && this._vozBufMs < 1200) {
+        while (rp.alimentado < rp.bloques.length && this._vozBufMs < 2000) {
           const bl = rp.bloques[rp.alimentado++];
           this._vozEmpujar(bl.pcm);
           this._replayPendMs += (bl.pcm.length / pipe.ctxRate) * 1000;
@@ -2592,9 +2597,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
             try { pipe.gainNode.gain.value = Math.max(0, Math.min(3, vf)); } catch {}
             this.emit('seg_reproduciendo', this._segMeta(seg));
           }
-          // Mantener ~2 s alimentados en el AudioWorklet mientras el resto
-          // de la ráfaga (sean 30 s o 5 min) espera íntegro en seg.bloques
-          while (seg.alimentado < seg.bloques.length && this._vozBufMs < 2000) {
+          // Mantener ~3,5 s alimentados en el AudioWorklet mientras el resto
+          // de la ráfaga (sean 30 s o 5 min) espera íntegro en seg.bloques:
+          // colchón profundo contra el jitter de redes móviles
+          while (seg.alimentado < seg.bloques.length && this._vozBufMs < 3500) {
             const bl = seg.bloques[seg.alimentado];
             // Ensamblado en secuencia estricta desde idx=0: si falta la trama 0
             // o un idx intermedio de este audio, pedir la pieza faltante al
