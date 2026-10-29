@@ -1,5 +1,5 @@
 ﻿/* Conferencia — SPA cliente (livekit-client v2) */
-const CONF_BUILD = 'v216 (2.1.10)';
+const CONF_BUILD = 'v217 (2.1.10)';
 const CONF_VER = window.__CONF_VER || 'dev';
 console.log('[conf] build', CONF_BUILD, 'ver', CONF_VER);
 
@@ -3165,8 +3165,24 @@ function renderTodo() {
 
 function renderAsientos() {
   if ($('#z-asientos').classList.contains('oculto')) return;
-  const filas = [$('#fila-mod'), $('#fila-2'), $('#fila-3')];
-  filas.forEach(f => f.innerHTML = '');
+  // Fila 0 (fija): anfitrión + La Palabra, 2 asientos grandes a todo el
+  // ancho. Abajo: filas dinámicas de exactamente 3 asientos cada una —
+  // antes eran bloques de 4/5 sobre una grilla de 3 y se veían 3+1, 3+2
+  const filaMod = $('#fila-mod');
+  const cont = $('#filas-asientos');
+  filaMod.innerHTML = '';
+  cont.innerHTML = '';
+  const filas = [filaMod];
+  const filaPara = (i) => {
+    const r = 1 + Math.floor((i - 1) / 3);
+    while (filas.length <= r) {
+      const f = document.createElement('div');
+      f.className = 'fila-asientos';
+      cont.appendChild(f);
+      filas.push(f);
+    }
+    return filas[r];
+  };
   S.estado.asientos.forEach((a, i) => {
     // bloqueado "para nadie" = el asiento no existe para el público (como
     // eliminarlo); solo el moderador lo ve, para poder desbloquearlo
@@ -3261,7 +3277,7 @@ function renderAsientos() {
     }
     if (a.bloqueo === 1 && a.identidad) div.classList.add('b1');
     if (a.bloqueo === 2 && a.identidad) div.classList.add('b2');
-    filas[i === 0 ? 0 : i < 5 ? 1 : 2].appendChild(div);
+    (i === 0 ? filas[0] : filaPara(i)).appendChild(div);
   });
 
   // cuadro de "la palabra" junto al asiento 1: quien recibió el micro por mano aprobada
