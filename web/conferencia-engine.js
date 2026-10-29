@@ -891,11 +891,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
       let opusEncoder = null;
       let opusListo = false;
       let opusTimestampUs = 0;
-      // Pareo Opus por timestamp: la etiqueta (aid<<12|idx) viaja DENTRO del
-      // propio AudioData.timestamp (txSeq*40000) y sale intacta en el chunk
-      // codificado — imposible desalinear etiquetas con el audio como pasaba
-      // con la cola paralela opusTags/opusPending.
-      const opusPares = new Map(); // tag -> [chunk20ms, ...]
+      // Pareo Opus POR ORDEN DE SALIDA: el encoder entrega sus chunks en el
+      // mismo orden en que entraron las AudioData (FIFO garantizado), así
+      // que cada dos salidas son las dos mitades de una trama de 40 ms y el
+      // tx se toma de la cola de entrada. El timestamp del chunk NO es
+      // fiable para emparejar: algunos navegadores lo devuelven desplazado
+      // por el lookahead interno del codec — cada mitad caía en una
+      // etiqueta distinta, jamás se emparejaban (el timeout de 90 ms las
+      // liberaba como medias tramas: la "basurita" grabada; al quitarlo,
+      // todo se quedaba esperando hasta el EOS).
+      const opusTxCola = []; // txSeq de cada trama de 40 ms entregada al encoder
+      const opusPend = [];   // chunks de salida esperando su gemelo (FIFO)
       const emitirOpusPkt = (tag, partes) => {
         if (!this._room || !partes || !partes.length) return;
         const s = tag & 0xffff;
@@ -923,10 +929,17 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
         // stream (que era lo que ahogaba la subida móvil).
         this._room._subirAudioPkt(pkt);
       };
-      const emitirOpusParesRestantes = () => {
-        for (const [t, p] of opusPares) emitirOpusPkt(t, p);
-        opusPares.clear();
+      const drenarOpus = (completo) => {
+        while (opusPend.length >= 2 || (completo && opusPend.length)) {
+          const a = opusPend.shift();
+          const b = opusPend.length ? opusPend.shift() : null;
+          const tx = opusTxCola.length
+            ? opusTxCola.shift()
+            : (Math.floor(((a && a.timestamp) || 0) / 40000) & 0xffff);
+          emitirOpusPkt(tx, b ? [a.bytes, b.bytes] : [a.bytes]);
+        }
       };
+      const emitirOpusParesRestantes = () => drenarOpus(true);
       // Cada audio nuevo cambia su identificador aid (1..15) y vuelve a
       // empezar su índice de trama en 0 (0, 1, 2...): así al soltar el PTT
       // y volver a pisar, el servidor termina de recibir las tramas que
@@ -979,27 +992,9 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
                 const bytes = new Uint8Array(n);
                 chunk.copyTo(bytes);
                 opusListo = true;
-                // La etiqueta sale del timestamp del propio chunk: nunca se
-                // desalinea con el audio aunque el encoder retrase la salida
-                const tag = Math.floor((chunk.timestamp || 0) / 40000) & 0xffff;
-                const par = opusPares.get(tag);
-                if (par) {
-                  par.push(bytes);
-                  opusPares.delete(tag);
-                  // Encolado confiable: nunca se pierde la voz del emisor
-                  // ante micro-cortes — sale en ráfaga al volver el socket
-                  emitirOpusPkt(tag, par);
-                } else {
-                  // Sin timeout: la pareja espera lo que tarde su gemelo.
-                  // Emitir la mitad a los 90 ms generaba paquetes de 20 ms
-                  // que pasaban el ACK completos pero traían media trama —
-                  // un hueco de 20 ms GRABADO en la nota (la "basurita" que
-                  // sonaba igual en vivo y en el historial), y el gemelo
-                  // tardío se descartaba después como duplicado. Si el
-                  // encoder perdió el gemelo de verdad, el sobrante sale
-                  // rellenado con el EOS.
-                  opusPares.set(tag, [bytes]);
-                }
+                opusPend.push({ bytes, timestamp: chunk.timestamp });
+                // Cada dos salidas = una trama de 40 ms completa
+                drenarOpus(false);
               },
               error: () => {
                 opusListo = false;
@@ -1092,6 +1087,10 @@ registerProcessor('conferencia-tx-worklet', VozTxProcessor);
               ad.close();
             }
             enviadoOpus = true;
+            // el tx viaja en la cola de entrada: las dos salidas del
+            // encoder se emparejan por orden, sin depender del timestamp
+            opusTxCola.push(txSeq);
+            if (opusTxCola.length > 256) opusTxCola.shift(); // cota anti-deriva
           } catch {
             enviadoOpus = false;
           }
